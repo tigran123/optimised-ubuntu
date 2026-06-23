@@ -9,4 +9,4 @@ To install the system use `install.sh` script like this:
 $ ./install.sh --image Ubuntu26-Portable-16GB.img --target /dev/sda
 ```
 
-The `.img` file is distributed elsewhere -- too big to uploaded on GitHub, plus all the standard mp3, etc issues I don't want to have to deal with.
+The `.img` file is distributed elsewhere -- too big to upload on GitHub, plus all the standard mp3, etc issues I don't want to have to deal with.
