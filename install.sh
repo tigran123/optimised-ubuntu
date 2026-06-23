@@ -143,7 +143,7 @@ run sudo wipefs -q -a "$EFI" "$BOOT" "$ROOT"
 # Root inode budget: ~4M inodes per 1 TiB (one inode per 256 KiB of capacity).
 # bytes-per-inode is a ratio, so mke2fs derives the count from the real partition
 # size — this single value scales it linearly: 2M for 512 GiB, 8M for 2 TiB, etc.
-ROOT_BYTES_PER_INODE=$(( 1024**4 / (32 * 1024**2) ))   # 1 TiB / 32Mi
+ROOT_BYTES_PER_INODE=$(( 1024**4 / (4 * 1024**2) ))   # 1 TiB / 4Mi
 
 # Format target filesystems
 run sudo mkfs.fat -F32 -n EFI "$EFI" > /dev/null
