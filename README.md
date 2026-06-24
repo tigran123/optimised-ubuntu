@@ -13,7 +13,7 @@ I have made the following optimisations:
 
 * Disabled monitor scaling by default and re-enabled vector fonts so that Terminus can be used in Terminator (which is the default terminal app). If you have multiple monitors of various very different resolutions, e.g. one FullHD and another 4K, there is still no benefit in scaling, as long you remember that the window will change its dimensions when moved from one monitor to another. This is natural and the solution is simple: configure that particular application for the desired monitor. In any case, if you use some application frequently, you must have an "ideal place" for it in your multi-monitor setup and must configure this specific application (its internal font sizes, etc) for that "ideal placement" anyway. Sacrificing rendering quality for the dubious benefit of auto-scaling a window to each monitor is a _stupid_ idea.
 
-* Enabled `vi` editing mode in bash and added many useful aliases, from my experience on multiple flavours of UNIX since 1990, i.e. 30+ years of experience of UNIX/Linux kernel development.
+* Enabled `vi` editing mode in bash and added many useful aliases, from my experience on multiple flavours of UNIX since 1990s, i.e. 30+ years of experience of UNIX/Linux kernel development.
 
 * Too many (thousands of!) other optimisations to be described here. Not because they are unimportant, but because I didn't get around to documenting them all here. Please wait and re-read this README.md later.
 
