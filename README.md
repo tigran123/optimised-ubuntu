@@ -7,7 +7,7 @@ I have made the following optimisations:
 
 * Disabled auto-loading of kernel modules for ancient hardware, like serial port, parallel port, etc. Again, re-enabled by trivial editing of files in `/etc/modprobe.d` and remaking initrd
 
-* Added console boot entry in menu (boots into `multiuser.target`)
+* Added console boot entry in menu (boots into `multi-user.target`)
 
 * Console uses Terminus font (change the size with `dpkg-reconfigure console-setup` if necessary)
 
