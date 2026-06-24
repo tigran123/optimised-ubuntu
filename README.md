@@ -3,7 +3,7 @@ I have made the following optimisations:
 
 * Formatted the rootfs with `-O fast_commit,sparse_super2,orphan_file,inline_data,metadata_csum_seed` which makes use of the latest versions of Linux kernel, forsaking compatibility with the ancient versions which are, imho, no longer relevant.
 
-* Disabled WiFi, printed and many other services by default (trivially enabled by commands like `sudo systemctl unmask wpa_supplicant ; sudo systemctl enable --now wpa_supplicant`, etc.
+* Disabled WiFi, printer and many other services by default (trivially enabled by commands like `sudo systemctl unmask wpa_supplicant ; sudo systemctl enable --now wpa_supplicant`, etc.
 
 * Disabled auto-loading of kernel modules for ancient hardware, like serial port, parallel port, etc. Again, re-enabled by trivial editing of files in `/etc/modprobe.d` and remaking initrd
 
