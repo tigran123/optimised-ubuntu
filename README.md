@@ -15,7 +15,7 @@ I have made the following optimisations:
 
 * Enabled `vi` editing mode in bash and added many useful aliases, from my experience on multiple flavours of UNIX since 1990s, i.e. 30+ years of experience of UNIX/Linux kernel development.
 
-* Too many (thousands of!) other optimisations to be described here. Not because they are unimportant, but because I didn't get around to documenting them all here. Please wait and re-read this README.md later.
+* Too many (thousands!) other optimisations to be described here. Not because they are unimportant, but because I didn't get around to documenting them all here. Please wait and re-read this README.md later.
 
 To install the system use `install.sh` script like this:
 
