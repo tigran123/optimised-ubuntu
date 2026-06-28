@@ -1,5 +1,5 @@
 #!/bin/bash
-# install.sh — flash Ubuntu26-Portable-16GB.img onto a target SSD.
+# install.sh — flash Ubuntu26-Portable-13GB.img onto a target SSD.
 #
 # Reads IMAGE/TARGET/MNT/SRC from the environment (or the defaults below) so
 # this script can be driven from CI or a rescue environment without editing
