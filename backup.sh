@@ -112,6 +112,11 @@ TGT_EFI="${TGT_DISK}${TP}2"
 TGT_BOOT="${TGT_DISK}${TP}3"
 TGT_ROOT="${TGT_DISK}${TP}4"
 
+# A full disk clone reinstalls both bootloaders onto the target disk.
+TGT_GRUB_DISK="$TGT_DISK"
+INSTALL_GRUB_BIOS=1
+INSTALL_GRUB_EFI=1
+
 echo "=========================================="
 echo " Phase 1: UUID Extraction                 "
 echo "=========================================="
@@ -128,17 +133,21 @@ NEW_UUID_ROOT=$(blkid_uuid "$TGT_ROOT")
 echo "=========================================="
 echo " Phase 2: Mounting Filesystems            "
 echo "=========================================="
-# Mount Target (Read-Write)
-sudo mount "$TGT_ROOT" "$MNT"
-sudo mkdir -p "$MNT/boot"
-sudo mount "$TGT_BOOT" "$MNT/boot"
-sudo mkdir -p "$MNT/boot/efi"
-sudo mount "$TGT_EFI" "$MNT/boot/efi"
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[dry-run] would mount target ($MNT) RW and source ($SRC) RO"
+else
+    # Mount Target (Read-Write)
+    sudo mount "$TGT_ROOT" "$MNT"
+    sudo mkdir -p "$MNT/boot"
+    sudo mount "$TGT_BOOT" "$MNT/boot"
+    sudo mkdir -p "$MNT/boot/efi"
+    sudo mount "$TGT_EFI" "$MNT/boot/efi"
 
-# Mount Source (Read-Only)
-sudo mount -r -o noatime "$SRC_ROOT" "$SRC"
-sudo mount -r -o noatime "$SRC_BOOT" "$SRC/boot"
-sudo mount -r "$SRC_EFI" "$SRC/boot/efi"
+    # Mount Source (Read-Only)
+    sudo mount -r -o noatime "$SRC_ROOT" "$SRC"
+    sudo mount -r -o noatime "$SRC_BOOT" "$SRC/boot"
+    sudo mount -r "$SRC_EFI" "$SRC/boot/efi"
+fi
 
 echo "=========================================="
 echo " Phase 3: Synchronization                 "
@@ -149,27 +158,37 @@ run sudo rsync -ahqHAXS --delete --numeric-ids --exclude={"/dev/*","/proc/*","/s
 echo "=========================================="
 echo " Phase 4: Filesystem Translation (UUIDs)  "
 echo "=========================================="
-echo "Translating fstab mappings and sanitizing foreign mounts..."
-rewrite_fstab
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[dry-run] would rewrite fstab + GRUB root UUID and (re)brand the GRUB menu"
+else
+    echo "Translating fstab mappings and sanitizing foreign mounts..."
+    rewrite_fstab
 
-echo "Enforcing Root UUID mapping in GRUB default..."
-# Replace only the root=UUID=… token inside GRUB_CMDLINE_LINUX, preserving any
-# other kernel parameters (mitigations=, systemd.unified_cgroup_hierarchy=, etc.).
-if grep -q '^GRUB_CMDLINE_LINUX=' "$MNT/etc/default/grub"; then
-    run sudo sed -i -E "s|root=UUID=[a-fA-F0-9-]+|root=UUID=$NEW_UUID_ROOT|g" "$MNT/etc/default/grub"
+    echo "Enforcing Root UUID mapping in GRUB default..."
+    # Replace only the root=UUID=… token inside GRUB_CMDLINE_LINUX, preserving any
+    # other kernel parameters (mitigations=, systemd.unified_cgroup_hierarchy=, etc.).
+    if grep -q '^GRUB_CMDLINE_LINUX=' "$MNT/etc/default/grub"; then
+        sudo sed -i -E "s|root=UUID=[a-fA-F0-9-]+|root=UUID=$NEW_UUID_ROOT|g" "$MNT/etc/default/grub"
+    fi
+
+    rewrite_grub_distributor
 fi
-
-rewrite_grub_distributor
 
 echo "=========================================="
 echo " Phase 5: The Headless chroot Environment "
 echo "=========================================="
-run_chroot_block
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[dry-run] would chroot: update-grub + update-initramfs (grub-install bios=$INSTALL_GRUB_BIOS efi=$INSTALL_GRUB_EFI)"
+else
+    run_chroot_block
+fi
 
 echo "=========================================="
 echo " Phase 6: Teardown & Cleanup              "
 echo "=========================================="
-echo "[Teardown] Unmounting filesystems and releasing locks..."
-sudo umount -R -q "$SRC" "$MNT" 2>/dev/null
+if [ "$DRY_RUN" -eq 0 ]; then
+    echo "[Teardown] Unmounting filesystems and releasing locks..."
+    sudo umount -R -q "$SRC" "$MNT" 2>/dev/null || true
+fi
 
 echo "Done. Disk $TGT_DISK is now an exact, updated clone of $SRC_DISK."

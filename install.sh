@@ -1,26 +1,42 @@
 #!/bin/bash
-# install.sh — flash a portable OS image or block device onto a target SSD.
+# install.sh — flash a portable OS image or scattered partitions onto a target.
 #
-# Reads SOURCE/TARGET/MNT/SRC from the environment (or the defaults below) so
-# this script can be driven from CI or a rescue environment without editing
-# source. Run with --dry-run to print every destructive command without
-# executing it.
+# Three things can be combined freely:
+#   * a unified source: a whole block device or a disk-image file (.img);
+#   * a scattered source: independent --source-efi/--source-boot/--source-root
+#     partitions;
+#   * a unified target (--target, auto-partitioned) or independent --target-*
+#     partitions.
+#
+# Per-role rule: each --target-X defaults to its --source-X, so a role whose
+# target equals its source is left untouched (in-place), while a role whose
+# target differs is migrated (formatted + copied). This makes "move only / to a
+# new partition, keeping BIOS Boot, EFI and /boot where they are" a first-class
+# operation. See --help for examples.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=lib/portable-common.sh
 . "$SCRIPT_DIR/portable-common.sh"
 
-# -----------------------------------------------------------------------------
-# Configuration
-#
-# NOTE: TARGET has no default. install.sh is destructive — a stray /dev/sdd
-# default could silently overwrite the user's fourth disk if they ever ran
-# it without arguments. Operator must set it via flag or environment.
-# SOURCE defaults to the local image filename, which is read-only and safe.
-# -----------------------------------------------------------------------------
+# GPT type GUIDs (GUID_BIOS/GUID_EFI/GUID_LINUX) come from portable-common.sh.
+
+# Unified parameters
 SOURCE="${SOURCE:-Ubuntu26-Portable-16GB.img}"
 TARGET="${TARGET:-}"
+
+# Scattered source partitions
+SRC_EFI="${SRC_EFI:-}"
+SRC_BOOT="${SRC_BOOT:-}"
+SRC_ROOT="${SRC_ROOT:-}"
+SRC_SWAP="${SRC_SWAP:-}"
+
+# Scattered target partitions
+TGT_BIOS="${TGT_BIOS:-}"
+TGT_EFI="${TGT_EFI:-}"
+TGT_BOOT="${TGT_BOOT:-}"
+TGT_ROOT="${TGT_ROOT:-}"
+TGT_SWAP="${TGT_SWAP:-}"
+
 MNT="${MNT:-/mnt}"
 SRC="${SRC:-/altroot}"
 DRY_RUN=0
@@ -29,28 +45,74 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --image|--source) SOURCE="$2"; shift 2 ;;
         --target)         TARGET="$2"; shift 2 ;;
+
+        --source-efi)     SRC_EFI="$2";  shift 2 ;;
+        --source-boot)    SRC_BOOT="$2"; shift 2 ;;
+        --source-root)    SRC_ROOT="$2"; shift 2 ;;
+        --source-swap)    SRC_SWAP="$2"; shift 2 ;;
+
+        --target-bios-boot) TGT_BIOS="$2"; shift 2 ;;
+        --target-efi)       TGT_EFI="$2";  shift 2 ;;
+        --target-boot)      TGT_BOOT="$2"; shift 2 ;;
+        --target-root)      TGT_ROOT="$2"; shift 2 ;;
+        --target-swap)      TGT_SWAP="$2"; shift 2 ;;
+
         --mnt)            MNT="$2"; shift 2 ;;
         --src)            SRC="$2"; shift 2 ;;
         --dry-run)        DRY_RUN=1; shift ;;
         -h|--help)
             cat <<USAGE
-Usage: $0 --target DEV [--image FILE|DEV] [--mnt DIR] [--src DIR] [--dry-run]
-  --image FILE|DEV Source image or block device to flash (default: Ubuntu26-Portable-16GB.img)
-  --target DEV     Target block device                   (required)
-  --mnt DIR        Mount point for the target root       (default: /mnt)
-  --src DIR        Mount point for the source data       (default: /altroot)
-  --dry-run        Print destructive commands instead of running them
+Usage: $0 [source] [target] [options]
 
-TARGET and SOURCE may also be passed via the environment.
+Deploys a portable Ubuntu system. Each role (EFI, /boot, /, swap) is either left
+in place or migrated: a --target-X defaults to its --source-X, so a role whose
+target equals its source is left untouched, and one whose target differs is
+formatted and copied.
+
+Source (pick one form):
+  --image|--source FILE|DEV   Whole image file or block device
+                              (default: Ubuntu26-Portable-16GB.img)
+  --source-efi / --source-boot / --source-root PART
+                              Scattered source: supply all three
+  --source-swap PART          Reuse this swap as-is (NOT reformatted)
+
+Target:
+  --target DEV                Whole device: GPT-partition it and format
+  --target-bios-boot PART     Provide to (re)install the legacy BIOS bootloader
+  --target-efi PART           Defaults to --source-efi  (omit/equal = keep in place)
+  --target-boot PART          Defaults to --source-boot (omit/equal = keep in place)
+  --target-root PART          Defaults to --source-root (omit/equal = keep in place)
+  --target-swap PART          Use this swap, reformatting it (mkswap)
+
+Other:
+  --mnt DIR                   Target root mount point  (default: /mnt)
+  --src DIR                   Source root mount point  (default: /altroot)
+  --dry-run                   Print destructive commands instead of running them
+  -h, --help                  Show this help
+
+Notes:
+  * --source-swap (reuse) and --target-swap (reformat) are mutually exclusive.
+  * EFI booting uses the EFI System Partition; the BIOS Boot partition is only
+    for legacy boot and is regenerated by grub-install (when --target-bios-boot
+    is given) or left intact otherwise.
+
+Examples:
+  # Full deploy of an image onto a fresh disk:
+  $0 --image Ubuntu26-Portable-16GB.img --target /dev/sda
+
+  # Migrate ONLY the root filesystem to a new partition, keeping EFI and /boot:
+  $0 --source-efi /dev/sda2 --source-boot /dev/sda3 \\
+     --source-root /dev/sda4 --target-root /dev/nvme0n1p1
+
+Most options also read from the matching environment variable (SOURCE, TARGET,
+SRC_ROOT, TGT_ROOT, TGT_SWAP, ...).
 USAGE
             exit 0 ;;
         *) die "Unknown argument: $1 (try --help)" ;;
     esac
 done
 
-# -----------------------------------------------------------------------------
-# Dry-run wrapper — runs the actual command unless DRY_RUN=1
-# -----------------------------------------------------------------------------
+# Dry-run wrapper — print the command (properly quoted) or run it.
 run() {
     if [ "$DRY_RUN" -eq 1 ]; then
         printf '[dry-run] '
@@ -61,75 +123,77 @@ run() {
     fi
 }
 
-# -----------------------------------------------------------------------------
-# Sanity: ensure TARGET was supplied, and that the source isn't the target.
-# -----------------------------------------------------------------------------
-[ -n "$TARGET" ] || die "TARGET is required (set --target DEV or export TARGET=…)"
+# True when two paths resolve to the same device/file.
+same_dev() { [ "$(readlink -f "$1")" = "$(readlink -f "$2")" ]; }
 
-if [ -e "$TARGET" ] && [ "$(readlink -f "$SOURCE")" = "$(readlink -f "$TARGET")" ]; then
-    die "SOURCE and TARGET resolve to the same path/device: $SOURCE"
-fi
-
-TGT_INFO=$(lsblk -n -d -o SIZE,MODEL "$TARGET" 2>/dev/null | xargs || echo "Unknown")
-TGT_MODEL=$(lsblk -n -d -o MODEL "$TARGET" 2>/dev/null | xargs)
-if [ -z "$TGT_MODEL" ]; then
-    TGT_MODEL="Portable Image"
-fi
-
-echo "Installing from \"$SOURCE\" to \"$TARGET\" ($TGT_INFO)"
-echo "Using \"$MNT\" and \"$SRC\" mount points"
-if [ "$DRY_RUN" -eq 1 ]; then
-    echo "(dry-run mode — destructive commands will be printed, not executed)"
-fi
-confirm_prompt "Press any key to proceed or Ctrl+C to break"
-
-sudo mkdir -p "$MNT" "$SRC"
-
-# Determine target partition prefix
-P=$(partition_prefix "$TARGET")
-EFI="${TARGET}${P}2"
-BOOT="${TARGET}${P}3"
-SWAP="${TARGET}${P}4"
-ROOT="${TARGET}${P}5"
+# "MIGRATE" / "in-place" label for the summary.
+role_state() { if [ "$1" -eq 1 ]; then echo "MIGRATE "; else echo "in-place"; fi; }
 
 LOOP_DEV=""
+UNIFIED_TARGET=0
+
+# ---------------------------------------------------------------------------
+# Mode detection
+# ---------------------------------------------------------------------------
+SCATTERED_SOURCE=0
+if [ -n "$SRC_EFI" ] || [ -n "$SRC_BOOT" ] || [ -n "$SRC_ROOT" ]; then
+    SCATTERED_SOURCE=1
+    ns=0
+    for v in "$SRC_EFI" "$SRC_BOOT" "$SRC_ROOT"; do
+        if [ -n "$v" ]; then ns=$((ns+1)); fi
+    done
+    [ "$ns" -eq 3 ] || die "Scattered source needs all of --source-efi/--source-boot/--source-root (got $ns/3)."
+    [ -z "$TARGET" ] || die "Do not combine scattered --source-* with a unified --target."
+fi
+
+# Swap: --source-swap reuses (no mkswap); --target-swap reformats (mkswap); not both.
+SWAP_DEV=""
+DO_MKSWAP=0
+if [ -n "$SRC_SWAP" ] && [ -n "$TGT_SWAP" ]; then
+    die "Specify only one of --source-swap (reuse) or --target-swap (reformat), not both."
+elif [ -n "$TGT_SWAP" ]; then
+    SWAP_DEV="$TGT_SWAP"; DO_MKSWAP=1
+elif [ -n "$SRC_SWAP" ]; then
+    SWAP_DEV="$SRC_SWAP"; DO_MKSWAP=0
+fi
 
 echo "=========================================="
 echo " Phase 1: Resolving Source Architecture   "
 echo "=========================================="
-if [ -b "$SOURCE" ]; then
-    echo "Source detected as a physical block device: $SOURCE"
-    SP=$(partition_prefix "$SOURCE")
-    validate_disk_structure "$SOURCE" "$SP" || die "Source block device lacks required GPT layout."
-    
-    SRC_EFI="${SOURCE}${SP}2"
-    SRC_BOOT="${SOURCE}${SP}3"
-    SRC_ROOT="${SOURCE}${SP}4"
-    
-elif [ -f "$SOURCE" ]; then
-    echo "Source detected as a flat file image: $SOURCE"
-    if [ "$DRY_RUN" -eq 1 ]; then
-        LOOP_DEV="/dev/loop0"
-        echo "[dry-run] sudo losetup -P -f --show \"$SOURCE\"  # would yield: $LOOP_DEV"
-    else
-        LOOP_DEV=$(sudo losetup -P -f --show "$SOURCE")
-        echo "Image mapped to loop device: $LOOP_DEV"
-    fi
-    
-    # Loop devices always utilize the 'p' prefix
-    SRC_EFI="${LOOP_DEV}p2"
-    SRC_BOOT="${LOOP_DEV}p3"
-    SRC_ROOT="${LOOP_DEV}p4"
+if [ $SCATTERED_SOURCE -eq 1 ]; then
+    echo "Source Mode: Scattered Partitions"
+    validate_partition_type "$SRC_EFI"  "$GUID_EFI"   "Source EFI"  || die "Invalid Source EFI"
+    validate_partition_type "$SRC_BOOT" "$GUID_LINUX" "Source Boot" || die "Invalid Source Boot"
+    validate_partition_type "$SRC_ROOT" "$GUID_LINUX" "Source Root" || die "Invalid Source Root"
 else
-    die "Source '$SOURCE' is neither a valid block device nor a regular file."
+    if [ -b "$SOURCE" ]; then
+        echo "Source Mode: Unified Block Device ($SOURCE)"
+        SP=$(partition_prefix "$SOURCE")
+        SRC_EFI="${SOURCE}${SP}2"
+        SRC_BOOT="${SOURCE}${SP}3"
+        SRC_ROOT="${SOURCE}${SP}4"
+    elif [ -f "$SOURCE" ]; then
+        echo "Source Mode: Flat File Image ($SOURCE)"
+        if [ "$DRY_RUN" -eq 1 ]; then
+            LOOP_DEV="/dev/loop0"
+            echo "[dry-run] sudo losetup -P -f --show \"$SOURCE\""
+        else
+            LOOP_DEV=$(sudo losetup -P -f --show "$SOURCE")
+            echo "Image mapped to loop device: $LOOP_DEV"
+        fi
+        SRC_EFI="${LOOP_DEV}p2"
+        SRC_BOOT="${LOOP_DEV}p3"
+        SRC_ROOT="${LOOP_DEV}p4"
+    else
+        die "Source '$SOURCE' is neither a valid block device nor a regular file."
+    fi
 fi
 
-# Extract the old UUIDs from the source so we can translate them later
+# Old UUIDs from the source (translated into the target's fstab/GRUB later).
 if [ "$DRY_RUN" -eq 1 ]; then
     OLD_UUID_EFI="00000000-0000-0000-0000-000000000001"
     OLD_UUID_BOOT="00000000-0000-0000-0000-000000000002"
     OLD_UUID_ROOT="00000000-0000-0000-0000-000000000003"
-    echo "[dry-run] would read UUIDs from source partitions"
 else
     OLD_UUID_EFI=$(blkid_uuid "$SRC_EFI")
     OLD_UUID_BOOT=$(blkid_uuid "$SRC_BOOT")
@@ -139,82 +203,270 @@ fi
 echo "=========================================="
 echo " Phase 2: Target Drive Preparation        "
 echo "=========================================="
-echo "Initialising disk $TARGET: EFI=$EFI, BOOT=$BOOT, ROOT=$ROOT"
+if [ $SCATTERED_SOURCE -eq 1 ]; then
+    # Each target defaults to its source => in-place unless overridden.
+    TGT_EFI="${TGT_EFI:-$SRC_EFI}"
+    TGT_BOOT="${TGT_BOOT:-$SRC_BOOT}"
+    TGT_ROOT="${TGT_ROOT:-$SRC_ROOT}"
+    echo "Target Mode: Scattered Partitions (per-role migrate / in-place)"
+    if [ -n "$TGT_BIOS" ]; then
+        validate_partition_type "$TGT_BIOS" "$GUID_BIOS" "Target BIOS" || die "Invalid Target BIOS"
+    fi
+    validate_partition_type "$TGT_EFI"  "$GUID_EFI"   "Target EFI"  || die "Invalid Target EFI"
+    validate_partition_type "$TGT_BOOT" "$GUID_LINUX" "Target Boot" || die "Invalid Target Boot"
+    validate_partition_type "$TGT_ROOT" "$GUID_LINUX" "Target Root" || die "Invalid Target Root"
+else
+    # Unified/image source => full deploy. Target is unified or all four --target-*.
+    nt=0
+    for v in "$TGT_BIOS" "$TGT_EFI" "$TGT_BOOT" "$TGT_ROOT"; do
+        if [ -n "$v" ]; then nt=$((nt+1)); fi
+    done
+    if [ "$nt" -gt 0 ] && [ "$nt" -lt 4 ]; then
+        die "Scattered target needs all four of --target-bios-boot/--target-efi/--target-boot/--target-root (got $nt/4)."
+    fi
+    if [ "$nt" -eq 4 ]; then
+        echo "Target Mode: Scattered Partitions (full deploy)"
+        validate_partition_type "$TGT_BIOS" "$GUID_BIOS"  "Target BIOS" || die "Invalid Target BIOS"
+        validate_partition_type "$TGT_EFI"  "$GUID_EFI"   "Target EFI"  || die "Invalid Target EFI"
+        validate_partition_type "$TGT_BOOT" "$GUID_LINUX" "Target Boot" || die "Invalid Target Boot"
+        validate_partition_type "$TGT_ROOT" "$GUID_LINUX" "Target Root" || die "Invalid Target Root"
+    else
+        [ -n "$TARGET" ] || die "Specify a unified --target DEV, all four --target-* partitions, or scattered --source-* for partial migration."
+        if [ "$DRY_RUN" -eq 0 ] && [ ! -b "$TARGET" ]; then
+            die "Target '$TARGET' is not a block device."
+        fi
+        UNIFIED_TARGET=1
+        echo "Target Mode: Unified Block Device ($TARGET)"
+        P=$(partition_prefix "$TARGET")
+        TGT_BIOS="${TARGET}${P}1"
+        TGT_EFI="${TARGET}${P}2"
+        TGT_BOOT="${TARGET}${P}3"
+        TGT_ROOT="${TARGET}${P}4"
+    fi
+fi
 
-run sudo parted -s "$TARGET" mklabel gpt
-run sudo parted -s "$TARGET" mkpart primary 1MiB 2MiB
-run sudo parted -s "$TARGET" set 1 bios_grub on
-run sudo parted -s "$TARGET" mkpart primary fat32 2MiB 258MiB
-run sudo parted -s "$TARGET" set 2 esp on
-run sudo parted -s "$TARGET" mkpart primary ext4 258MiB 770MiB
-run sudo parted -s "$TARGET" mkpart primary linux-swap 770MiB 16GiB
-run sudo parted -s "$TARGET" mkpart primary ext4 16GiB 100%
+# Per-role migrate (target differs from source) vs in-place (same device).
+if same_dev "$TGT_EFI"  "$SRC_EFI";  then MIGRATE_EFI=0;  else MIGRATE_EFI=1;  fi
+if same_dev "$TGT_BOOT" "$SRC_BOOT"; then MIGRATE_BOOT=0; else MIGRATE_BOOT=1; fi
+if same_dev "$TGT_ROOT" "$SRC_ROOT"; then MIGRATE_ROOT=0; else MIGRATE_ROOT=1; fi
 
-# Erase any stale filesystem signatures
-run sudo wipefs -q -a "$EFI" "$BOOT" "$ROOT"
+# Bootloader install scope: BIOS only when a BIOS target is given, EFI when the
+# ESP is fresh. (run_chroot_block always runs update-grub + update-initramfs.)
+if [ -n "$TGT_BIOS" ]; then INSTALL_GRUB_BIOS=1; else INSTALL_GRUB_BIOS=0; fi
+INSTALL_GRUB_EFI=$MIGRATE_EFI
 
-# Root inode budget: ~4M inodes per 1 TiB (one inode per 256 KiB of capacity).
+if [ $MIGRATE_EFI -eq 0 ] && [ $MIGRATE_BOOT -eq 0 ] && [ $MIGRATE_ROOT -eq 0 ] && [ -z "$SWAP_DEV" ]; then
+    die "Nothing to do: every role resolves in-place and no swap was given."
+fi
+
+# Disk to install the legacy BIOS bootloader onto. Only meaningful when a BIOS
+# target was given; otherwise empty (grub-install --target=i386-pc is skipped).
+if [ $INSTALL_GRUB_BIOS -eq 1 ]; then
+    if [ $UNIFIED_TARGET -eq 1 ]; then
+        TGT_GRUB_DISK="$TARGET"
+    else
+        TGT_GRUB_DISK=$(get_parent_disk "$TGT_BIOS")
+        [ -n "$TGT_GRUB_DISK" ] || die "Could not resolve parent disk for BIOS partition $TGT_BIOS"
+    fi
+else
+    TGT_GRUB_DISK=""
+fi
+
+# Disk whose model brands the GRUB menu = where the rootfs (the OS) lives.
+if [ $UNIFIED_TARGET -eq 1 ]; then
+    BRAND_DISK="$TARGET"
+else
+    BRAND_DISK=$(get_parent_disk "$TGT_ROOT")
+fi
+TGT_MODEL=$(lsblk -n -d -o MODEL "${BRAND_DISK:-}" 2>/dev/null | xargs || true)
+[ -n "$TGT_MODEL" ] || TGT_MODEL="Portable Image"
+
+# Safety: a partition we are about to format must not also be a source we read.
+migrated_targets=()
+if [ $MIGRATE_EFI  -eq 1 ]; then migrated_targets+=("$TGT_EFI");  fi
+if [ $MIGRATE_BOOT -eq 1 ]; then migrated_targets+=("$TGT_BOOT"); fi
+if [ $MIGRATE_ROOT -eq 1 ]; then migrated_targets+=("$TGT_ROOT"); fi
+if [ "$DO_MKSWAP"  -eq 1 ]; then migrated_targets+=("$SWAP_DEV"); fi
+source_devs=("$SRC_EFI" "$SRC_BOOT" "$SRC_ROOT")
+if [ -n "$SRC_SWAP" ]; then source_devs+=("$SRC_SWAP"); fi
+if [ ${#migrated_targets[@]} -gt 0 ]; then
+    for t in "${migrated_targets[@]}"; do
+        for s in "${source_devs[@]}"; do
+            if same_dev "$t" "$s"; then
+                die "Refusing to format $t: it is also a source partition."
+            fi
+        done
+    done
+fi
+
+# ---- Summary + single confirmation gate (before anything destructive) ----
+echo
+echo "About to install:"
+if [ $SCATTERED_SOURCE -eq 1 ]; then
+    echo "  Source:   scattered  (efi=$SRC_EFI boot=$SRC_BOOT root=$SRC_ROOT)"
+else
+    echo "  Source:   $SOURCE${LOOP_DEV:+  (loop $LOOP_DEV)}"
+fi
+echo "  EFI:      $(role_state $MIGRATE_EFI)  $TGT_EFI"
+echo "  /boot:    $(role_state $MIGRATE_BOOT)  $TGT_BOOT"
+echo "  / (root): $(role_state $MIGRATE_ROOT)  $TGT_ROOT"
+if [ -n "$SWAP_DEV" ]; then
+    if [ "$DO_MKSWAP" -eq 1 ]; then echo "  swap:     reformat  $SWAP_DEV"; else echo "  swap:     reuse     $SWAP_DEV"; fi
+else
+    echo "  swap:     none"
+fi
+echo "  Menu:     GRUB title branded \"$TGT_MODEL\" (rootfs on ${BRAND_DISK:-?})"
+if [ $INSTALL_GRUB_BIOS -eq 1 ] && [ $INSTALL_GRUB_EFI -eq 1 ]; then
+    echo "  Bootldr:  reinstall legacy BIOS -> $TGT_GRUB_DISK, and UEFI (removable)"
+elif [ $INSTALL_GRUB_BIOS -eq 1 ]; then
+    echo "  Bootldr:  reinstall legacy BIOS -> $TGT_GRUB_DISK (UEFI left intact)"
+elif [ $INSTALL_GRUB_EFI -eq 1 ]; then
+    echo "  Bootldr:  reinstall UEFI (removable) (legacy BIOS left intact)"
+else
+    echo "  Bootldr:  kept as-is — only update-grub + update-initramfs run"
+fi
+echo "  Mounts:   target=$MNT  source=$SRC"
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo "  (dry-run mode — destructive commands will be printed, not executed)"
+fi
+echo
+confirm_prompt "Proceed? This will ERASE the migrated target partitions"
+
+# ---- Partition a unified target (only now, after confirmation) ----
+if [ $UNIFIED_TARGET -eq 1 ]; then
+    run sudo parted -s "$TARGET" mklabel gpt
+    run sudo parted -s "$TARGET" mkpart primary 1MiB 2MiB
+    run sudo parted -s "$TARGET" set 1 bios_grub on
+    run sudo parted -s "$TARGET" mkpart primary fat32 2MiB 258MiB
+    run sudo parted -s "$TARGET" set 2 esp on
+    run sudo parted -s "$TARGET" mkpart primary ext4 258MiB 770MiB
+    run sudo parted -s "$TARGET" mkpart primary ext4 770MiB 100%
+    run sudo udevadm settle
+fi
+
+# Root inode budget: ~4M inodes per 1 TiB (one inode per 4 MiB of capacity).
 ROOT_BYTES_PER_INODE=$(( 1024**4 / (4 * 1024**2) ))
 
-# Format target filesystems
-run sudo mkfs.fat -F32 -n EFI "$EFI" > /dev/null
-run sudo mkfs.ext4 -qF -L boot -i 32768 -m 0 -E lazy_itable_init=0,lazy_journal_init=0 -O sparse_super2 "$BOOT"
-run sudo mkswap -q "$SWAP"
-run sudo mkfs.ext4 -qF -m 0 -L root -i "$ROOT_BYTES_PER_INODE" -E lazy_itable_init=0,lazy_journal_init=0 -O fast_commit,sparse_super2,orphan_file,inline_data,metadata_csum_seed "$ROOT"
+# ---- Format only the migrated roles ----
+if [ $MIGRATE_EFI -eq 1 ]; then
+    run sudo wipefs -q -a "$TGT_EFI"
+    run sudo mkfs.fat -F32 -n EFI "$TGT_EFI"
+fi
+if [ $MIGRATE_BOOT -eq 1 ]; then
+    run sudo wipefs -q -a "$TGT_BOOT"
+    run sudo mkfs.ext4 -qF -L boot -i 32768 -m 0 -E lazy_itable_init=0,lazy_journal_init=0 -O sparse_super2 "$TGT_BOOT"
+fi
+if [ $MIGRATE_ROOT -eq 1 ]; then
+    run sudo wipefs -q -a "$TGT_ROOT"
+    run sudo mkfs.ext4 -qF -m 0 -L root -i "$ROOT_BYTES_PER_INODE" -E lazy_itable_init=0,lazy_journal_init=0 -O fast_commit,sparse_super2,orphan_file,inline_data,metadata_csum_seed "$TGT_ROOT"
+fi
+if [ "$DO_MKSWAP" -eq 1 ]; then
+    run sudo wipefs -q -a "$SWAP_DEV"
+    run sudo mkswap -q "$SWAP_DEV"
+fi
 
-# Capture the new target UUIDs
-NEW_UUID_EFI=$(blkid_uuid "$EFI")
-NEW_UUID_BOOT=$(blkid_uuid "$BOOT")
-NEW_UUID_ROOT=$(blkid_uuid "$ROOT")
+# ---- New UUIDs: fresh for migrated roles, unchanged for in-place ----
+if [ "$DRY_RUN" -eq 0 ]; then
+    if [ $MIGRATE_EFI  -eq 1 ]; then NEW_UUID_EFI=$(blkid_uuid "$TGT_EFI");   else NEW_UUID_EFI="$OLD_UUID_EFI";   fi
+    if [ $MIGRATE_BOOT -eq 1 ]; then NEW_UUID_BOOT=$(blkid_uuid "$TGT_BOOT"); else NEW_UUID_BOOT="$OLD_UUID_BOOT"; fi
+    if [ $MIGRATE_ROOT -eq 1 ]; then NEW_UUID_ROOT=$(blkid_uuid "$TGT_ROOT"); else NEW_UUID_ROOT="$OLD_UUID_ROOT"; fi
+    if [ -n "$SWAP_DEV" ]; then NEW_UUID_SWAP=$(blkid_uuid "$SWAP_DEV"); fi
+else
+    if [ $MIGRATE_EFI  -eq 1 ]; then NEW_UUID_EFI="dry-run-new-efi";   else NEW_UUID_EFI="$OLD_UUID_EFI";   fi
+    if [ $MIGRATE_BOOT -eq 1 ]; then NEW_UUID_BOOT="dry-run-new-boot"; else NEW_UUID_BOOT="$OLD_UUID_BOOT"; fi
+    if [ $MIGRATE_ROOT -eq 1 ]; then NEW_UUID_ROOT="dry-run-new-root"; else NEW_UUID_ROOT="$OLD_UUID_ROOT"; fi
+    if [ -n "$SWAP_DEV" ]; then NEW_UUID_SWAP="dry-run-new-swap"; fi
+fi
 
 echo "=========================================="
 echo " Phase 3: Mounting & Data Synchronization "
 echo "=========================================="
-# Mount Target
-sudo mount "$ROOT" "$MNT"
-sudo mkdir -p "$MNT/boot"
-sudo mount "$BOOT" "$MNT/boot"
-sudo mkdir -p "$MNT/boot/efi"
-sudo mount "$EFI" "$MNT/boot/efi"
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[dry-run] would mount the target tree and rsync the migrated filesystems"
+else
+    # Mount the target tree (the partitions the installed system will use).
+    sudo mount "$TGT_ROOT" "$MNT"
+    sudo mkdir -p "$MNT/boot"
+    sudo mount "$TGT_BOOT" "$MNT/boot"
+    sudo mkdir -p "$MNT/boot/efi"
+    sudo mount "$TGT_EFI" "$MNT/boot/efi"
 
-# Mount Source (dynamically routed from Block or Loop)
-sudo mkdir -p "$SRC"
-sudo mount -r -o noatime "$SRC_ROOT" "$SRC"
-sudo mount -r -o noatime "$SRC_BOOT" "$SRC/boot"
-sudo mount -r "$SRC_EFI" "$SRC/boot/efi"
-
-echo "Rsyncing filesystems. This will take a moment..."
-run sudo rsync -ahqHAXS --numeric-ids --exclude={"/dev/*","/proc/*","/sys/*","/tmp/*","/run/*","/media/*","/mnt/*","/lost+found"} "$SRC/" "$MNT/"
+    sudo mkdir -p "$SRC"
+    # Source root is the rsync base; -x keeps each rsync on its own filesystem so
+    # in-place /boot and /boot/efi are never copied onto themselves.
+    sudo mount -r -o noatime "$SRC_ROOT" "$SRC"
+    if [ $MIGRATE_ROOT -eq 1 ]; then
+        echo "Rsyncing root filesystem..."
+        sudo rsync -ahqHAXS --numeric-ids -x \
+            --exclude={"/dev/*","/proc/*","/sys/*","/tmp/*","/run/*","/media/*","/mnt/*","/lost+found"} \
+            "$SRC/" "$MNT/"
+    fi
+    if [ $MIGRATE_BOOT -eq 1 ]; then
+        sudo mount -r -o noatime "$SRC_BOOT" "$SRC/boot"
+        echo "Rsyncing /boot filesystem..."
+        sudo rsync -ahqHAXS --numeric-ids -x "$SRC/boot/" "$MNT/boot/"
+    fi
+    if [ $MIGRATE_EFI -eq 1 ]; then
+        sudo mount -r "$SRC_EFI" "$SRC/boot/efi"
+        echo "Rsyncing EFI filesystem..."
+        sudo rsync -ahqHAXS --numeric-ids -x "$SRC/boot/efi/" "$MNT/boot/efi/"
+    fi
+fi
 
 echo "=========================================="
 echo " Phase 4: Filesystem Translation (UUIDs)  "
 echo "=========================================="
-echo "Translating fstab mappings from source UUIDs to physical target UUIDs..."
-run sudo sed -i "s/$OLD_UUID_EFI/$NEW_UUID_EFI/g" "$MNT/etc/fstab"
-run sudo sed -i "s/$OLD_UUID_BOOT/$NEW_UUID_BOOT/g" "$MNT/etc/fstab"
-run sudo sed -i "s/$OLD_UUID_ROOT/$NEW_UUID_ROOT/g" "$MNT/etc/fstab"
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[dry-run] would rewrite fstab + GRUB root UUID and (re)brand the GRUB menu"
+else
+    rewrite_fstab
 
-echo "Enforcing Root UUID mapping in GRUB default..."
-if grep -q '^GRUB_CMDLINE_LINUX=' "$MNT/etc/default/grub"; then
-    run sudo sed -i -E "s|root=UUID=[a-fA-F0-9-]+|root=UUID=$NEW_UUID_ROOT|g" "$MNT/etc/default/grub"
+    echo "Enforcing Root UUID mapping in GRUB default..."
+    if grep -q '^GRUB_CMDLINE_LINUX=' "$MNT/etc/default/grub"; then
+        sudo sed -i -E "s|root=UUID=[a-fA-F0-9-]+|root=UUID=$NEW_UUID_ROOT|g" "$MNT/etc/default/grub"
+    fi
+
+    if [ -n "$SWAP_DEV" ]; then
+        echo "Adding swap entry to fstab ($SWAP_DEV)..."
+        echo "/dev/disk/by-uuid/$NEW_UUID_SWAP none swap sw 0 0" | sudo tee -a "$MNT/etc/fstab" >/dev/null
+    fi
+
+    rewrite_grub_distributor
 fi
-
-rewrite_grub_distributor
 
 echo "=========================================="
 echo " Phase 5: The Headless chroot Environment "
 echo "=========================================="
-run_chroot_block
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[dry-run] would chroot: update-grub + update-initramfs (grub-install bios=$INSTALL_GRUB_BIOS efi=$INSTALL_GRUB_EFI)"
+else
+    run_chroot_block
+fi
 
 echo "=========================================="
 echo " Phase 6: Teardown & Cleanup              "
 echo "=========================================="
-echo "[Teardown] Unmounting filesystems and releasing locks..."
-sudo umount -R -q "$SRC" "$MNT" 2>/dev/null
+if [ "$DRY_RUN" -eq 0 ]; then
+    echo "[Teardown] Unmounting filesystems and releasing locks..."
+    sudo umount -R -q "$SRC" "$MNT" 2>/dev/null || true
 
-if [ -n "${LOOP_DEV:-}" ]; then
-    echo "Detaching loop device: $LOOP_DEV"
-    sudo losetup -d "$LOOP_DEV" 2>/dev/null
+    if [ -n "${LOOP_DEV:-}" ]; then
+        echo "Detaching loop device: $LOOP_DEV"
+        sudo losetup -d "$LOOP_DEV" 2>/dev/null || true
+    fi
 fi
 
-echo "Done. Disk $TARGET is fully prepared."
+if [ $UNIFIED_TARGET -eq 1 ]; then
+    echo "Done. Disk $TARGET is fully prepared and bootable."
+else
+    roles=""
+    if [ $MIGRATE_ROOT -eq 1 ]; then roles="$roles /"; fi
+    if [ $MIGRATE_BOOT -eq 1 ]; then roles="$roles /boot"; fi
+    if [ $MIGRATE_EFI  -eq 1 ]; then roles="$roles EFI"; fi
+    if [ -n "$SWAP_DEV" ]; then roles="$roles swap"; fi
+    if [ $INSTALL_GRUB_BIOS -eq 1 ] || [ $INSTALL_GRUB_EFI -eq 1 ]; then
+        echo "Done. Migrated:${roles:- (none)}. Bootloader reinstalled (bios=$INSTALL_GRUB_BIOS efi=$INSTALL_GRUB_EFI)."
+    else
+        echo "Done. Migrated:${roles:- (none)}. Existing bootloader kept; GRUB menu + initramfs regenerated."
+    fi
+fi
