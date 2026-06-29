@@ -143,7 +143,7 @@ sudo mount -r "$SRC_EFI" "$SRC/boot/efi"
 echo "=========================================="
 echo " Phase 3: Synchronization                 "
 echo "=========================================="
-echo "Rsyncing filesystems. This will take a moment..."
+echo "Rsyncing filesystems: \"$SRC\" => \"$MNT\" This will take a moment..."
 run sudo rsync -ahqHAXS --delete --numeric-ids --exclude={"/dev/*","/proc/*","/sys/*","/tmp/*","/run/*","/media/*","/mnt/*","/lost+found"} "$SRC/" "$MNT/"
 
 echo "=========================================="
