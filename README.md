@@ -24,3 +24,22 @@ $ ./install.sh --image Ubuntu26-Portable-16GB.img --target /dev/sda
 ```
 
 The `.img` file is distributed elsewhere -- too big to upload on GitHub, plus all the standard mp3, etc issues I don't want to have to deal with.
+
+`install.sh` is the single entry point for every flavour of deployment. Besides flashing a whole image/device, it can take a *scattered* source whose partitions live on different disks (`--source-efi` / `--source-boot` / `--source-root`) and write to either a whole device or individual `--target-*` partitions. Each role is independently left in place, migrated (reformatted + copied), or — with `--update` — **synced** onto its existing filesystem with `rsync --delete` (no reformat), so refreshing an already-installed clone is fast instead of a full rebuild. For example, to incrementally sync a system whose `/boot/efi` and `/boot` are on `sda` and whose root is on an NVMe drive onto an already-prepared disk `sdb`:
+
+```
+$ ./install.sh \
+    --source-efi /dev/sda2 --source-boot /dev/sda3 --source-root /dev/nvme0n1p1 \
+    --target-bios-boot /dev/sdb1 --target-efi /dev/sdb2 \
+    --target-boot /dev/sdb3 --target-root /dev/sdb4 --update
+```
+
+To produce an *impersonal* clone (stripped of personal data), pass `--exclude-from FILE`, which hands the file to `rsync --exclude-from`. List one path per line (see the included `exclude.txt` for the kind of thing I strip — caches, histories, credentials, downloads, etc.):
+
+```
+$ ./install.sh --image Ubuntu26-Portable-16GB.img --target /dev/sda --exclude-from exclude.txt
+```
+
+This works with or without `--update`. On an `--update` re-sync it additionally passes `--delete-excluded`, so any listed paths that already exist on the target are *removed* (rsync otherwise protects excluded files from deletion, which would leave stale personal data behind).
+
+Always preview a run with `--dry-run` first; it prints every destructive command instead of executing it. See `./install.sh --help` for the full set of options.

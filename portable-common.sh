@@ -5,9 +5,9 @@
 #   die(), info(), confirm_prompt()
 #   partition_prefix()
 #   validate_partition_type()
+#   validate_disk_structure()
 #   get_parent_disk()
 #   blkid_uuid()
-#   mount_target_and_source()
 #   rewrite_fstab()
 #   rewrite_grub_distributor()
 #   run_chroot_block()
@@ -94,7 +94,7 @@ validate_disk_structure() {
 }
 
 # -----------------------------------------------------------------------------
-# UUID & Mount Operations
+# UUID Operations
 # -----------------------------------------------------------------------------
 blkid_uuid() {
     local dev=$1
@@ -103,19 +103,6 @@ blkid_uuid() {
         die "Could not determine UUID for $dev (unformatted or missing?)"
     [ -n "$uuid" ] || die "Empty UUID for $dev (unformatted?)"
     printf '%s' "$uuid"
-}
-
-mount_target_and_source() {
-    sudo mount "$TGT_ROOT" "$MNT"
-    sudo mkdir -p "$MNT/boot"
-    sudo mount "$TGT_BOOT" "$MNT/boot"
-    sudo mkdir -p "$MNT/boot/efi"
-    sudo mount "$TGT_EFI" "$MNT/boot/efi"
-
-    sudo mkdir -p "$SRC"
-    sudo mount -r -o noatime "$SRC_ROOT" "$SRC"
-    sudo mount -r -o noatime "$SRC_BOOT" "$SRC/boot"
-    sudo mount -r "$SRC_EFI" "$SRC/boot/efi"
 }
 
 # -----------------------------------------------------------------------------

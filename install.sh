@@ -13,6 +13,11 @@
 # target differs is migrated (formatted + copied). This makes "move only / to a
 # new partition, keeping BIOS Boot, EFI and /boot where they are" a first-class
 # operation. See --help for examples.
+#
+# With --update, a differing role is *synced* instead of migrated: the target
+# filesystem is kept as-is (no mkfs) and rsync runs with --delete, so an
+# existing clone is refreshed in place rather than rebuilt from scratch. This
+# subsumes the old backup.sh disk-to-disk clone.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,7 +44,9 @@ TGT_SWAP="${TGT_SWAP:-}"
 
 MNT="${MNT:-/mnt}"
 SRC="${SRC:-/altroot}"
+EXCLUDE_FROM="${EXCLUDE_FROM:-}"
 DRY_RUN=0
+UPDATE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -59,7 +66,9 @@ while [ $# -gt 0 ]; do
 
         --mnt)            MNT="$2"; shift 2 ;;
         --src)            SRC="$2"; shift 2 ;;
+        --exclude-from)   EXCLUDE_FROM="$2"; shift 2 ;;
         --dry-run)        DRY_RUN=1; shift ;;
+        --update)         UPDATE=1; shift ;;
         -h|--help)
             cat <<USAGE
 Usage: $0 [source] [target] [options]
@@ -78,6 +87,8 @@ Source (pick one form):
 
 Target:
   --target DEV                Whole device: GPT-partition it and format
+                              (with --update: treat as already-partitioned and
+                              sync onto its existing filesystems instead)
   --target-bios-boot PART     Provide to (re)install the legacy BIOS bootloader
   --target-efi PART           Defaults to --source-efi  (omit/equal = keep in place)
   --target-boot PART          Defaults to --source-boot (omit/equal = keep in place)
@@ -85,6 +96,14 @@ Target:
   --target-swap PART          Use this swap, reformatting it (mkswap)
 
 Other:
+  --update                    Sync onto already-formatted target partitions:
+                              skip mkfs and rsync with --delete, refreshing an
+                              existing clone in place instead of reformatting it
+  --exclude-from FILE         Pass FILE to rsync as --exclude-from, so the listed
+                              paths are omitted from the copy (e.g. to produce an
+                              impersonal clone). Works with or without --update;
+                              under --update the listed paths are also purged from
+                              the target (rsync --delete-excluded).
   --mnt DIR                   Target root mount point  (default: /mnt)
   --src DIR                   Source root mount point  (default: /altroot)
   --dry-run                   Print destructive commands instead of running them
@@ -104,13 +123,32 @@ Examples:
   $0 --source-efi /dev/sda2 --source-boot /dev/sda3 \\
      --source-root /dev/sda4 --target-root /dev/nvme0n1p1
 
+  # Incrementally sync a split-disk source onto an already-formatted disk
+  # (no reformat — rsync --delete refreshes the existing clone). Replaces the
+  # old backup.sh disk-to-disk clone:
+  $0 --source-efi /dev/sda2 --source-boot /dev/sda3 \\
+     --source-root /dev/nvme0n1p1 \\
+     --target-bios-boot /dev/sdb1 --target-efi /dev/sdb2 \\
+     --target-boot /dev/sdb3 --target-root /dev/sdb4 --update
+
+  # Impersonal clone: deploy minus the personal paths listed in exclude.txt:
+  $0 --image Ubuntu26-Portable-16GB.img --target /dev/sda \\
+     --exclude-from exclude.txt
+
 Most options also read from the matching environment variable (SOURCE, TARGET,
-SRC_ROOT, TGT_ROOT, TGT_SWAP, ...).
+SRC_ROOT, TGT_ROOT, TGT_SWAP, EXCLUDE_FROM, ...).
 USAGE
             exit 0 ;;
         *) die "Unknown argument: $1 (try --help)" ;;
     esac
 done
+
+# An --exclude-from file is read by rsync on this host (not in the chroot).
+# Validate it early and make it absolute so sudo's working directory is moot.
+if [ -n "$EXCLUDE_FROM" ]; then
+    [ -f "$EXCLUDE_FROM" ] || die "--exclude-from file not found: $EXCLUDE_FROM"
+    EXCLUDE_FROM=$(readlink -f "$EXCLUDE_FROM")
+fi
 
 # Dry-run wrapper — print the command (properly quoted) or run it.
 run() {
@@ -126,8 +164,14 @@ run() {
 # True when two paths resolve to the same device/file.
 same_dev() { [ "$(readlink -f "$1")" = "$(readlink -f "$2")" ]; }
 
-# "MIGRATE" / "in-place" label for the summary.
-role_state() { if [ "$1" -eq 1 ]; then echo "MIGRATE "; else echo "in-place"; fi; }
+# Summary label for a role: SYNC when --update keeps the target filesystem and
+# rsyncs --delete onto it, MIGRATE when the target is reformatted, in-place when
+# target equals source (untouched).
+role_state() {
+    if [ "$1" -ne 1 ]; then echo "in-place"
+    elif [ "$UPDATE" -eq 1 ]; then echo "SYNC    "
+    else echo "MIGRATE "; fi
+}
 
 LOOP_DEV=""
 UNIFIED_TARGET=0
@@ -242,6 +286,12 @@ else
         TGT_EFI="${TARGET}${P}2"
         TGT_BOOT="${TARGET}${P}3"
         TGT_ROOT="${TARGET}${P}4"
+        # --update trusts the existing layout (we won't repartition or format
+        # it), so the disk must already carry our BIOS/EFI/boot/root layout.
+        if [ $UPDATE -eq 1 ]; then
+            validate_disk_structure "$TARGET" "$P" || \
+                die "Target $TARGET lacks the expected BIOS/EFI/boot/root layout (required for --update)."
+        fi
     fi
 fi
 
@@ -293,7 +343,7 @@ if [ ${#migrated_targets[@]} -gt 0 ]; then
     for t in "${migrated_targets[@]}"; do
         for s in "${source_devs[@]}"; do
             if same_dev "$t" "$s"; then
-                die "Refusing to format $t: it is also a source partition."
+                die "Refusing to write to $t: it is also a source partition."
             fi
         done
     done
@@ -326,14 +376,26 @@ else
     echo "  Bootldr:  kept as-is — only update-grub + update-initramfs run"
 fi
 echo "  Mounts:   target=$MNT  source=$SRC"
+if [ -n "$EXCLUDE_FROM" ]; then
+    if [ $UPDATE -eq 1 ]; then
+        echo "  Excludes: --exclude-from=$EXCLUDE_FROM (listed paths purged from target via --delete-excluded)"
+    else
+        echo "  Excludes: --exclude-from=$EXCLUDE_FROM (listed paths not copied)"
+    fi
+fi
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "  (dry-run mode — destructive commands will be printed, not executed)"
 fi
 echo
-confirm_prompt "Proceed? This will ERASE the migrated target partitions"
+if [ $UPDATE -eq 1 ]; then
+    confirm_prompt "Proceed? This will OVERWRITE files on the target partitions (rsync --delete, no reformat)"
+else
+    confirm_prompt "Proceed? This will ERASE the migrated target partitions"
+fi
 
 # ---- Partition a unified target (only now, after confirmation) ----
-if [ $UNIFIED_TARGET -eq 1 ]; then
+# Skipped under --update: the disk is already partitioned and we keep it.
+if [ $UNIFIED_TARGET -eq 1 ] && [ $UPDATE -eq 0 ]; then
     run sudo parted -s "$TARGET" mklabel gpt
     run sudo parted -s "$TARGET" mkpart primary 1MiB 2MiB
     run sudo parted -s "$TARGET" set 1 bios_grub on
@@ -347,18 +409,23 @@ fi
 # Root inode budget: ~4M inodes per 1 TiB (one inode per 4 MiB of capacity).
 ROOT_BYTES_PER_INODE=$(( 1024**4 / (4 * 1024**2) ))
 
-# ---- Format only the migrated roles ----
-if [ $MIGRATE_EFI -eq 1 ]; then
-    run sudo wipefs -q -a "$TGT_EFI"
-    run sudo mkfs.fat -F32 -n EFI "$TGT_EFI"
-fi
-if [ $MIGRATE_BOOT -eq 1 ]; then
-    run sudo wipefs -q -a "$TGT_BOOT"
-    run sudo mkfs.ext4 -qF -L boot -i 32768 -m 0 -E lazy_itable_init=0,lazy_journal_init=0 -O sparse_super2 "$TGT_BOOT"
-fi
-if [ $MIGRATE_ROOT -eq 1 ]; then
-    run sudo wipefs -q -a "$TGT_ROOT"
-    run sudo mkfs.ext4 -qF -m 0 -L root -i "$ROOT_BYTES_PER_INODE" -E lazy_itable_init=0,lazy_journal_init=0 -O fast_commit,sparse_super2,orphan_file,inline_data,metadata_csum_seed "$TGT_ROOT"
+# ---- Format the migrated roles ----
+# Skipped entirely under --update, which keeps each target filesystem intact and
+# only rsyncs --delete onto it. (--target-swap reformatting is independent: it is
+# an explicit opt-in and still honoured below.)
+if [ $UPDATE -eq 0 ]; then
+    if [ $MIGRATE_EFI -eq 1 ]; then
+        run sudo wipefs -q -a "$TGT_EFI"
+        run sudo mkfs.fat -F32 -n EFI "$TGT_EFI"
+    fi
+    if [ $MIGRATE_BOOT -eq 1 ]; then
+        run sudo wipefs -q -a "$TGT_BOOT"
+        run sudo mkfs.ext4 -qF -L boot -i 32768 -m 0 -E lazy_itable_init=0,lazy_journal_init=0 -O sparse_super2 "$TGT_BOOT"
+    fi
+    if [ $MIGRATE_ROOT -eq 1 ]; then
+        run sudo wipefs -q -a "$TGT_ROOT"
+        run sudo mkfs.ext4 -qF -m 0 -L root -i "$ROOT_BYTES_PER_INODE" -E lazy_itable_init=0,lazy_journal_init=0 -O fast_commit,sparse_super2,orphan_file,inline_data,metadata_csum_seed "$TGT_ROOT"
+    fi
 fi
 if [ "$DO_MKSWAP" -eq 1 ]; then
     run sudo wipefs -q -a "$SWAP_DEV"
@@ -382,7 +449,11 @@ echo "=========================================="
 echo " Phase 3: Mounting & Data Synchronization "
 echo "=========================================="
 if [ "$DRY_RUN" -eq 1 ]; then
-    echo "[dry-run] would mount the target tree and rsync the migrated filesystems"
+    if [ $UPDATE -eq 1 ]; then
+        echo "[dry-run] would mount the target tree and rsync --delete the differing filesystems (no mkfs)"
+    else
+        echo "[dry-run] would mount the target tree and rsync the migrated filesystems"
+    fi
 else
     # Mount the target tree (the partitions the installed system will use).
     sudo mount "$TGT_ROOT" "$MNT"
@@ -395,21 +466,39 @@ else
     # Source root is the rsync base; -x keeps each rsync on its own filesystem so
     # in-place /boot and /boot/efi are never copied onto themselves.
     sudo mount -r -o noatime "$SRC_ROOT" "$SRC"
+
+    # Base rsync options.
+    #   --delete (mirror the source, removing stale target files) is added only
+    #     under --update, where we refresh an existing clone in place; a plain
+    #     migrate writes onto a freshly-formatted target, so nothing to delete.
+    #   --exclude-from (e.g. an impersonal clone) applies to every transfer; its
+    #     paths are anchored to each transfer root, so the personal "/..." paths
+    #     in the file only match during the root rsync.
+    #   --delete-excluded is added when both apply, so a re-sync also PURGES any
+    #     excluded paths already on the target — rsync otherwise protects
+    #     excluded files from --delete, which would leave personal data behind.
+    RSYNC_OPTS=(-ahqHAXS --numeric-ids -x)
+    if [ $UPDATE -eq 1 ]; then
+        RSYNC_OPTS+=(--delete)
+        if [ -n "$EXCLUDE_FROM" ]; then RSYNC_OPTS+=(--delete-excluded); fi
+    fi
+    if [ -n "$EXCLUDE_FROM" ]; then RSYNC_OPTS+=(--exclude-from="$EXCLUDE_FROM"); fi
+
     if [ $MIGRATE_ROOT -eq 1 ]; then
         echo "Rsyncing root filesystem..."
-        sudo rsync -ahqHAXS --numeric-ids -x \
+        sudo rsync "${RSYNC_OPTS[@]}" \
             --exclude={"/dev/*","/proc/*","/sys/*","/tmp/*","/run/*","/media/*","/mnt/*","/lost+found"} \
             "$SRC/" "$MNT/"
     fi
     if [ $MIGRATE_BOOT -eq 1 ]; then
         sudo mount -r -o noatime "$SRC_BOOT" "$SRC/boot"
         echo "Rsyncing /boot filesystem..."
-        sudo rsync -ahqHAXS --numeric-ids -x "$SRC/boot/" "$MNT/boot/"
+        sudo rsync "${RSYNC_OPTS[@]}" "$SRC/boot/" "$MNT/boot/"
     fi
     if [ $MIGRATE_EFI -eq 1 ]; then
         sudo mount -r "$SRC_EFI" "$SRC/boot/efi"
         echo "Rsyncing EFI filesystem..."
-        sudo rsync -ahqHAXS --numeric-ids -x "$SRC/boot/efi/" "$MNT/boot/efi/"
+        sudo rsync "${RSYNC_OPTS[@]}" "$SRC/boot/efi/" "$MNT/boot/efi/"
     fi
 fi
 
@@ -457,16 +546,21 @@ if [ "$DRY_RUN" -eq 0 ]; then
 fi
 
 if [ $UNIFIED_TARGET -eq 1 ]; then
-    echo "Done. Disk $TARGET is fully prepared and bootable."
+    if [ $UPDATE -eq 1 ]; then
+        echo "Done. Disk $TARGET synced (existing filesystems refreshed) and bootable."
+    else
+        echo "Done. Disk $TARGET is fully prepared and bootable."
+    fi
 else
     roles=""
     if [ $MIGRATE_ROOT -eq 1 ]; then roles="$roles /"; fi
     if [ $MIGRATE_BOOT -eq 1 ]; then roles="$roles /boot"; fi
     if [ $MIGRATE_EFI  -eq 1 ]; then roles="$roles EFI"; fi
     if [ -n "$SWAP_DEV" ]; then roles="$roles swap"; fi
+    verb="Migrated"; [ $UPDATE -eq 1 ] && verb="Synced"
     if [ $INSTALL_GRUB_BIOS -eq 1 ] || [ $INSTALL_GRUB_EFI -eq 1 ]; then
-        echo "Done. Migrated:${roles:- (none)}. Bootloader reinstalled (bios=$INSTALL_GRUB_BIOS efi=$INSTALL_GRUB_EFI)."
+        echo "Done. $verb:${roles:- (none)}. Bootloader reinstalled (bios=$INSTALL_GRUB_BIOS efi=$INSTALL_GRUB_EFI)."
     else
-        echo "Done. Migrated:${roles:- (none)}. Existing bootloader kept; GRUB menu + initramfs regenerated."
+        echo "Done. $verb:${roles:- (none)}. Existing bootloader kept; GRUB menu + initramfs regenerated."
     fi
 fi
