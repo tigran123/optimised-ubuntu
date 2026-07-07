@@ -7,6 +7,12 @@ I have made the following optimisations:
 
 * Disabled auto-loading of kernel modules for ancient hardware, like serial port, parallel port, etc. Again, re-enabled by trivial editing of files in `/etc/modprobe.d` and remaking initrd
 
+* Disabled AppArmor, apport, snapd, localsearch and dozens of other useless services that eat CPU cycles and/or spy on your activities under the pretense of "security and convenience".
+
+* Disabled CPU bugfixes `mitigations=off` in the kernel -- use this only if your machine is not running untrusted code. If it does (or if it is exposed to the Internet), then remove `mitigations=off` from `/etc/default/grub` and `/etc/grub.d/09-console` files. Note that you will lose 30% performance by enabling these so-called `mitigations`.
+
+* Enabled lots of things that Ubuntu has disabled by default (see `/etc/sysctl.d/*` files)
+
 * Added console boot entry in menu (boots into `multi-user.target`)
 
 * Console uses Terminus font (change the size with `dpkg-reconfigure console-setup` if necessary)
