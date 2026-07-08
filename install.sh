@@ -101,6 +101,52 @@ validate_disk_structure() {
     return 0
 }
 
+# resolve_source_roles <disk>
+#   Scan a unified source disk (or attached loop device) and assign its EFI,
+#   /boot and root partitions into SRC_EFI/SRC_BOOT/SRC_ROOT by GPT type and
+#   filesystem label, rather than assuming fixed partition numbers. This lets a
+#   source that carries an inline swap partition (so root is not partition 4) —
+#   or any other non-canonical ordering — resolve correctly. EFI is the ESP;
+#   /boot and root are the Linux-filesystem partitions, told apart by their
+#   "boot"/"root" labels and otherwise by on-disk order. Dies if a role is
+#   missing so an unexpected layout fails here rather than at mount time.
+resolve_source_roles() {
+    local disk=$1
+    local dev ptype fstype label
+    local -a linux_parts=()
+    SRC_EFI=""; SRC_BOOT=""; SRC_ROOT=""
+
+    while read -r dev; do
+        [ "$dev" = "$disk" ] && continue
+        ptype=$(lsblk -dno PARTTYPE "$dev" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+        case "$ptype" in
+            "$GUID_EFI")
+                SRC_EFI="$dev" ;;
+            "$GUID_LINUX")
+                fstype=$(lsblk -dno FSTYPE "$dev" 2>/dev/null)
+                [ "$fstype" = swap ] && continue   # a Linux-typed swap: not /boot or /
+                label=$(lsblk -dno LABEL "$dev" 2>/dev/null)
+                case "$label" in
+                    boot) SRC_BOOT="$dev" ;;
+                    root) SRC_ROOT="$dev" ;;
+                    *)    linux_parts+=("$dev") ;;
+                esac ;;
+        esac
+    done < <(lsblk -lnpo NAME "$disk")
+
+    # Any Linux-fs partitions we could not tell apart by label fall back to
+    # on-disk order: the first unclaimed one is /boot, the next is root.
+    for dev in "${linux_parts[@]}"; do
+        if   [ -z "$SRC_BOOT" ]; then SRC_BOOT="$dev"
+        elif [ -z "$SRC_ROOT" ]; then SRC_ROOT="$dev"
+        fi
+    done
+
+    [ -n "$SRC_EFI" ]  || die "Source $disk has no EFI System partition."
+    [ -n "$SRC_BOOT" ] || die "Source $disk has no Linux /boot partition."
+    [ -n "$SRC_ROOT" ] || die "Source $disk has no Linux root partition."
+}
+
 # -----------------------------------------------------------------------------
 # UUID Operations
 # -----------------------------------------------------------------------------
@@ -393,22 +439,23 @@ if [ $SCATTERED_SOURCE -eq 1 ]; then
 else
     if [ -b "$SOURCE" ]; then
         echo "Source Mode: Unified Block Device ($SOURCE)"
-        SP=$(partition_prefix "$SOURCE")
-        SRC_EFI="${SOURCE}${SP}2"
-        SRC_BOOT="${SOURCE}${SP}3"
-        SRC_ROOT="${SOURCE}${SP}4"
+        resolve_source_roles "$SOURCE"
     elif [ -f "$SOURCE" ]; then
         echo "Source Mode: Flat File Image ($SOURCE)"
         if [ "$DRY_RUN" -eq 1 ]; then
+            # No loop device is attached in dry-run, so fall back to the toolkit's
+            # canonical partition numbers just for the printed summary.
             LOOP_DEV="/dev/loop0"
             echo "[dry-run] sudo losetup -P -f --show \"$SOURCE\""
+            SRC_EFI="${LOOP_DEV}p2"
+            SRC_BOOT="${LOOP_DEV}p3"
+            SRC_ROOT="${LOOP_DEV}p4"
         else
             LOOP_DEV=$(sudo losetup -P -f --show "$SOURCE")
             echo "Image mapped to loop device: $LOOP_DEV"
+            sudo udevadm settle
+            resolve_source_roles "$LOOP_DEV"
         fi
-        SRC_EFI="${LOOP_DEV}p2"
-        SRC_BOOT="${LOOP_DEV}p3"
-        SRC_ROOT="${LOOP_DEV}p4"
     else
         die "Source '$SOURCE' is neither a valid block device nor a regular file."
     fi
@@ -610,8 +657,8 @@ if [ $UNIFIED_TARGET -eq 1 ] && [ $UPDATE -eq 0 ]; then
     run sudo udevadm settle
 fi
 
-# Root inode budget: ~4M inodes per 1 TiB (one inode per 4 MiB of capacity).
-ROOT_BYTES_PER_INODE=$(( 1024**4 / (4 * 1024**2) ))
+# Root inode budget: ~8M inodes per 1 TiB
+ROOT_BYTES_PER_INODE=$(( 1024**4 / (8 * 1024**2) ))
 
 # ---- Format the migrated roles ----
 # Skipped entirely under --update, which keeps each target filesystem intact and
@@ -620,7 +667,7 @@ ROOT_BYTES_PER_INODE=$(( 1024**4 / (4 * 1024**2) ))
 if [ $UPDATE -eq 0 ]; then
     if [ $MIGRATE_EFI -eq 1 ]; then
         run sudo wipefs -q -a "$TGT_EFI"
-        run sudo mkfs.fat -F32 -n EFI "$TGT_EFI"
+        run sudo mkfs.fat -F32 -n EFI "$TGT_EFI" > /dev/null
     fi
     if [ $MIGRATE_BOOT -eq 1 ]; then
         run sudo wipefs -q -a "$TGT_BOOT"
