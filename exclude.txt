@@ -1,5 +1,7 @@
 /Books/
 /usr/local/Wolfram/
+/opt/Wolfram/
+/usr/share/Wolfram/
 /usr/local/texlive/
 /home/tigran/C/
 /home/tigran/VirtualBox/
