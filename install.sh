@@ -657,9 +657,6 @@ if [ $UNIFIED_TARGET -eq 1 ] && [ $UPDATE -eq 0 ]; then
     run sudo udevadm settle
 fi
 
-# Root inode budget: ~8M inodes per 1 TiB
-ROOT_BYTES_PER_INODE=$(( 1024**4 / (8 * 1024**2) ))
-
 # ---- Format the migrated roles ----
 # Skipped entirely under --update, which keeps each target filesystem intact and
 # only rsyncs --delete onto it. (--target-swap reformatting is independent: it is
@@ -675,7 +672,14 @@ if [ $UPDATE -eq 0 ]; then
     fi
     if [ $MIGRATE_ROOT -eq 1 ]; then
         run sudo wipefs -q -a "$TGT_ROOT"
-        run sudo mkfs.ext4 -qF -m 0 -L root -i "$ROOT_BYTES_PER_INODE" -E lazy_itable_init=0,lazy_journal_init=0 -O fast_commit,sparse_super2,orphan_file,inline_data,metadata_csum_seed "$TGT_ROOT"
+
+        TGT_BYTES=$(sudo blockdev --getsize64 "$TGT_ROOT")
+        ROOT_BYTES_PER_INODE=$(( 1024**4 / (4 * 1024**2) ))
+        CALC_INODES=$(( TGT_BYTES / ROOT_BYTES_PER_INODE ))
+        MIN_INODES=$(( 1024**2 ))
+        TARGET_INODES=$(( CALC_INODES < MIN_INODES ? MIN_INODES : CALC_INODES ))
+
+        run sudo mkfs.ext4 -qF -m 0 -L root -N "$TARGET_INODES" -E lazy_itable_init=0,lazy_journal_init=0 -O fast_commit,sparse_super2,orphan_file,inline_data,metadata_csum_seed "$TGT_ROOT"
     fi
 fi
 if [ "$DO_MKSWAP" -eq 1 ]; then
