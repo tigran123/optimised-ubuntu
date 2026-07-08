@@ -676,7 +676,7 @@ if [ $UPDATE -eq 0 ]; then
         TGT_BYTES=$(sudo blockdev --getsize64 "$TGT_ROOT")
         ROOT_BYTES_PER_INODE=$(( 1024**4 / (4 * 1024**2) ))
         CALC_INODES=$(( TGT_BYTES / ROOT_BYTES_PER_INODE ))
-        MIN_INODES=$(( 1024**2 ))
+        MIN_INODES=$(( 3*1024**2/2 )) # 1.5M inodes minimum
         TARGET_INODES=$(( CALC_INODES < MIN_INODES ? MIN_INODES : CALC_INODES ))
 
         run sudo mkfs.ext4 -qF -m 0 -L root -N "$TARGET_INODES" -E lazy_itable_init=0,lazy_journal_init=0 -O fast_commit,sparse_super2,orphan_file,inline_data,metadata_csum_seed "$TGT_ROOT"
