@@ -28,6 +28,10 @@ info() { echo "==> $*"; }
 
 confirm_prompt() {
     local msg=${1:-Press any key to proceed}
+    if [ "${ASSUME_YES:-0}" -eq 1 ]; then
+        echo "$msg -- proceeding (--yes)."
+        return 0
+    fi
     read -n 1 -s -r -p "$msg (or Ctrl+C to break)..."
     echo ""
 }
@@ -60,6 +64,64 @@ get_parent_disk() {
     else
         echo ""
     fi
+}
+
+# Wait for udev to publish a disk's partition nodes. udevadm settle watches the
+# global event queue, which a concurrent instance's partitioning storm can
+# stall; poll the one disk we care about instead. Best-effort: on timeout the
+# caller's own validation produces the precise error.
+wait_for_partitions() {
+    local disk=$1 _i
+    for _i in $(seq 1 20); do
+        if [ -n "$(lsblk -lnpo NAME "$disk" 2>/dev/null | tail -n +2)" ]; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# Cross-instance locking
+# -----------------------------------------------------------------------------
+# Several instances may run concurrently (e.g. flashing multiple disks from one
+# source). Every disk we write gets an exclusive flock, every disk we only read
+# a shared one, so instances can share a source but never write the same disk.
+# Keys are canonical parent disks, so a partition-level and a whole-disk run of
+# the same device collide. Lock files live in /run/lock (tmpfs) and are never
+# unlinked: removing a lock file another process holds open reopens the classic
+# unlink+flock race. The fds stay open for the life of the process, so locks
+# release atomically on any exit, including SIGKILL.
+declare -A LOCK_MODE=()
+
+# add_lock <device-or-file> <sh|ex> — register a lock key; ex wins over sh.
+add_lock() {
+    local key parent
+    key=$(readlink -f "$1" 2>/dev/null) || return 0
+    [ -n "$key" ] || return 0
+    if [ -b "$key" ]; then
+        parent=$(get_parent_disk "$key")
+        if [ -n "$parent" ]; then key=$parent; fi
+    fi
+    if [ "${LOCK_MODE[$key]:-}" != "ex" ]; then
+        LOCK_MODE[$key]=$2
+    fi
+}
+
+acquire_locks() {
+    local key file fd flag
+    local -a keys=()
+    [ ${#LOCK_MODE[@]} -gt 0 ] || return 0
+    mapfile -t keys < <(printf '%s\n' "${!LOCK_MODE[@]}" | sort)
+    for key in "${keys[@]}"; do
+        file="/run/lock/portable-install-$(printf '%s' "$key" | tr '/ ' '__').lock"
+        if ! exec {fd}>>"$file"; then
+            die "Cannot open lock file $file (stale file owned by another user?)"
+        fi
+        if [ "${LOCK_MODE[$key]}" = "ex" ]; then flag=-x; else flag=-s; fi
+        flock -n "$flag" "$fd" || \
+            die "Another install.sh instance is using $key (lock: $file)"
+    done
 }
 
 validate_partition_type() {
@@ -153,7 +215,9 @@ resolve_source_roles() {
 blkid_uuid() {
     local dev=$1
     local uuid
-    uuid=$(sudo blkid -s UUID -o value "$dev") || \
+    # -c /dev/null bypasses the /run/blkid cache, which can hand back a stale
+    # UUID right after a concurrent instance re-mkfs'd a device.
+    uuid=$(sudo blkid -c /dev/null -s UUID -o value "$dev") || \
         die "Could not determine UUID for $dev (unformatted or missing?)"
     [ -n "$uuid" ] || die "Empty UUID for $dev (unformatted?)"
     printf '%s' "$uuid"
@@ -269,11 +333,19 @@ TGT_BOOT="${TGT_BOOT:-}"
 TGT_ROOT="${TGT_ROOT:-}"
 TGT_SWAP="${TGT_SWAP:-}"
 
-MNT="${MNT:-/mnt}"
-SRC="${SRC:-/altroot}"
+# Empty = auto: a private per-instance temp dir, so concurrent runs never
+# stack their mounts over each other. --mnt/--src (or the env vars) pin a path.
+MNT="${MNT:-}"
+SRC="${SRC:-}"
 EXCLUDE_FROM="${EXCLUDE_FROM:-}"
 DRY_RUN=0
 UPDATE=0
+ASSUME_YES=0
+MNT_AUTO=0
+SRC_AUTO=0
+LOOP_ATTACHED=0
+MOUNTS_DONE=0
+CLEANED=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -296,6 +368,7 @@ while [ $# -gt 0 ]; do
         --exclude-from)   EXCLUDE_FROM="$2"; shift 2 ;;
         --dry-run)        DRY_RUN=1; shift ;;
         --update)         UPDATE=1; shift ;;
+        --yes|-y)         ASSUME_YES=1; shift ;;
         -h|--help)
             cat <<USAGE
 Usage: $0 [source] [target] [options]
@@ -331,8 +404,9 @@ Other:
                               impersonal clone). Works with or without --update;
                               under --update the listed paths are also purged from
                               the target (rsync --delete-excluded).
-  --mnt DIR                   Target root mount point  (default: /mnt)
-  --src DIR                   Source root mount point  (default: /altroot)
+  --mnt DIR                   Target root mount point  (default: private temp dir)
+  --src DIR                   Source root mount point  (default: private temp dir)
+  --yes, -y                   Skip the confirmation prompt (for scripted runs)
   --dry-run                   Print destructive commands instead of running them
   -h, --help                  Show this help
 
@@ -341,6 +415,10 @@ Notes:
   * EFI booting uses the EFI System Partition; the BIOS Boot partition is only
     for legacy boot and is regenerated by grub-install (when --target-bios-boot
     is given) or left intact otherwise.
+  * Multiple instances may run concurrently (e.g. flashing several disks from
+    one source). Disks are guarded by advisory locks under /run/lock: written
+    disks exclusively, source disks shared; a conflicting instance fails fast
+    before its confirmation prompt. Run each instance in its own terminal.
 
 Examples:
   # Full deploy of an image onto a fresh disk:
@@ -377,6 +455,22 @@ if [ -n "$EXCLUDE_FROM" ]; then
     EXCLUDE_FROM=$(readlink -f "$EXCLUDE_FROM")
 fi
 
+# Front-load the sudo password prompt before any resources are acquired, so it
+# cannot fire mid-rsync (sudo timestamps are per-tty and can expire mid-run).
+if [ "$DRY_RUN" -eq 0 ]; then
+    sudo -v
+fi
+
+# Auto mount points: unique per instance.
+if [ -z "$MNT" ]; then
+    MNT=$(mktemp -d /tmp/install-mnt.XXXXXX)
+    MNT_AUTO=1
+fi
+if [ -z "$SRC" ]; then
+    SRC=$(mktemp -d /tmp/install-src.XXXXXX)
+    SRC_AUTO=1
+fi
+
 # Dry-run wrapper — print the command (properly quoted) or run it.
 run() {
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -387,6 +481,32 @@ run() {
         "$@"
     fi
 }
+
+# Teardown is trap-driven so failures and Ctrl+C release everything too:
+# unmount this instance's trees, detach its loop device, remove its temp dirs.
+# Flags gate each step to what was actually acquired — in particular the fake
+# dry-run LOOP_DEV (/dev/loop0) never sets LOOP_ATTACHED and is never detached,
+# and a user-supplied --mnt is never unmounted unless we mounted onto it.
+cleanup() {
+    if [ "$CLEANED" -eq 1 ]; then return 0; fi
+    CLEANED=1
+    if [ "$MOUNTS_DONE" -eq 1 ]; then
+        sudo umount -R -q "$SRC" "$MNT" 2>/dev/null || true
+    fi
+    if [ "$LOOP_ATTACHED" -eq 1 ]; then
+        echo "Detaching loop device: $LOOP_DEV"
+        sudo losetup -d "$LOOP_DEV" 2>/dev/null || true
+    fi
+    # rmdir, never rm -rf: failing on a still-mounted/busy dir is the safety net.
+    if [ "$MNT_AUTO" -eq 1 ]; then rmdir "$MNT" 2>/dev/null || true; fi
+    if [ "$SRC_AUTO" -eq 1 ]; then rmdir "$SRC" 2>/dev/null || true; fi
+}
+trap cleanup EXIT
+# Turn fatal signals into a normal exit so the EXIT trap runs (bash does not
+# reliably run it when killed by an untrapped signal).
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # True when two paths resolve to the same device/file.
 same_dev() { [ "$(readlink -f "$1")" = "$(readlink -f "$2")" ]; }
@@ -446,14 +566,20 @@ else
             # No loop device is attached in dry-run, so fall back to the toolkit's
             # canonical partition numbers just for the printed summary.
             LOOP_DEV="/dev/loop0"
-            echo "[dry-run] sudo losetup -P -f --show \"$SOURCE\""
+            echo "[dry-run] sudo losetup -r -P -f --show \"$SOURCE\""
             SRC_EFI="${LOOP_DEV}p2"
             SRC_BOOT="${LOOP_DEV}p3"
             SRC_ROOT="${LOOP_DEV}p4"
         else
-            LOOP_DEV=$(sudo losetup -P -f --show "$SOURCE")
-            echo "Image mapped to loop device: $LOOP_DEV"
+            # Read-only: even an ro ext4 mount writes to the device (journal
+            # replay, orphan cleanup), so two instances sharing one image via
+            # separate loop devices would corrupt it. With an ro loop the
+            # kernel refuses all writes and a dirty image fails loudly instead.
+            LOOP_DEV=$(sudo losetup -r -P -f --show "$SOURCE")
+            LOOP_ATTACHED=1
+            echo "Image mapped to loop device: $LOOP_DEV (read-only)"
             sudo udevadm settle
+            wait_for_partitions "$LOOP_DEV"
             resolve_source_roles "$LOOP_DEV"
         fi
     else
@@ -551,7 +677,7 @@ if [ $UPDATE -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
         expected="${rest%%:*}"
         migrate="${rest##*:}"
         [ "$migrate" -eq 1 ] || continue
-        fstype=$(sudo blkid -o value -s TYPE "$dev" 2>/dev/null || true)
+        fstype=$(sudo blkid -c /dev/null -o value -s TYPE "$dev" 2>/dev/null || true)
         if [ -z "$fstype" ]; then
             die "--update: $label target $dev has no recognizable filesystem (unformatted?)."
         elif [ "$fstype" != "$expected" ]; then
@@ -598,6 +724,30 @@ if [ ${#migrated_targets[@]} -gt 0 ]; then
             fi
         done
     done
+fi
+
+# ---- Cross-instance locks: exclusive on written disks, shared on read ones ----
+# ALL target roles are registered, in-place ones included: update-grub and
+# update-initramfs write into the mounted /boot even when a role is not
+# migrated. A unified fresh target is keyed on the disk itself (its partitions
+# may not exist yet). An image source is keyed on the image file.
+add_lock "$SRC_EFI"  sh
+add_lock "$SRC_BOOT" sh
+add_lock "$SRC_ROOT" sh
+if [ -n "$SRC_SWAP" ]; then add_lock "$SRC_SWAP" sh; fi
+if [ $SCATTERED_SOURCE -eq 0 ] && [ -f "$SOURCE" ]; then add_lock "$SOURCE" sh; fi
+if [ $UNIFIED_TARGET -eq 1 ]; then add_lock "$TARGET" ex; fi
+add_lock "$TGT_EFI"  ex
+add_lock "$TGT_BOOT" ex
+add_lock "$TGT_ROOT" ex
+if [ -n "$TGT_GRUB_DISK" ]; then add_lock "$TGT_GRUB_DISK" ex; fi
+if [ "$DO_MKSWAP" -eq 1 ]; then add_lock "$SWAP_DEV" ex; fi
+if [ "$DRY_RUN" -eq 1 ]; then
+    for key in "${!LOCK_MODE[@]}"; do
+        echo "[dry-run] would flock (${LOCK_MODE[$key]}) $key"
+    done
+else
+    acquire_locks
 fi
 
 # ---- Summary + single confirmation gate (before anything destructive) ----
@@ -654,7 +804,9 @@ if [ $UNIFIED_TARGET -eq 1 ] && [ $UPDATE -eq 0 ]; then
     run sudo parted -s "$TARGET" set 2 esp on
     run sudo parted -s "$TARGET" mkpart primary ext4 258MiB 770MiB
     run sudo parted -s "$TARGET" mkpart primary ext4 770MiB 100%
-    run sudo udevadm settle
+    # Wait for OUR partition nodes rather than the global udev queue, which a
+    # concurrent instance can keep busy past the settle timeout.
+    run sudo udevadm wait --timeout=30 "$TGT_BIOS" "$TGT_EFI" "$TGT_BOOT" "$TGT_ROOT"
 fi
 
 # ---- Format the migrated roles ----
@@ -664,7 +816,11 @@ fi
 if [ $UPDATE -eq 0 ]; then
     if [ $MIGRATE_EFI -eq 1 ]; then
         run sudo wipefs -q -a "$TGT_EFI"
-        run sudo mkfs.fat -F32 -n EFI "$TGT_EFI" > /dev/null
+        if [ "$DRY_RUN" -eq 1 ]; then
+            run sudo mkfs.fat -F32 -n EFI "$TGT_EFI"
+        else
+            sudo mkfs.fat -F32 -n EFI "$TGT_EFI" > /dev/null
+        fi
     fi
     if [ $MIGRATE_BOOT -eq 1 ]; then
         run sudo wipefs -q -a "$TGT_BOOT"
@@ -673,7 +829,13 @@ if [ $UPDATE -eq 0 ]; then
     if [ $MIGRATE_ROOT -eq 1 ]; then
         run sudo wipefs -q -a "$TGT_ROOT"
 
-        TGT_BYTES=$(sudo blockdev --getsize64 "$TGT_ROOT")
+        TGT_BYTES=$(lsblk -dbno SIZE "$TGT_ROOT" 2>/dev/null) || TGT_BYTES=""
+        if [ -z "$TGT_BYTES" ]; then
+            # Only dry-run may proceed without a size (the partition node may
+            # not exist yet); a real run must not fabricate the inode count.
+            [ "$DRY_RUN" -eq 1 ] || die "Cannot determine size of $TGT_ROOT"
+            TGT_BYTES=$((16 * 1024**3))
+        fi
         ROOT_BYTES_PER_INODE=$(( 1024**4 / (4 * 1024**2) ))
         CALC_INODES=$(( TGT_BYTES / ROOT_BYTES_PER_INODE ))
         MIN_INODES=$(( 3*1024**2/2 )) # 1.5M inodes minimum
@@ -710,7 +872,14 @@ if [ "$DRY_RUN" -eq 1 ]; then
         echo "[dry-run] would mount the target tree and rsync the migrated filesystems"
     fi
 else
+    # Refuse to stack over an existing mount — a leftover tree from a crashed
+    # run (or a busy --mnt/--src dir) must be cleaned up, not silently shadowed.
+    if findmnt -n "$MNT" >/dev/null 2>&1; then die "$MNT is already a mountpoint."; fi
+    if findmnt -n "$SRC" >/dev/null 2>&1; then die "$SRC is already a mountpoint."; fi
+
     # Mount the target tree (the partitions the installed system will use).
+    sudo mkdir -p "$MNT"
+    MOUNTS_DONE=1
     sudo mount "$TGT_ROOT" "$MNT"
     sudo mkdir -p "$MNT/boot"
     sudo mount "$TGT_BOOT" "$MNT/boot"
@@ -720,7 +889,8 @@ else
     sudo mkdir -p "$SRC"
     # Source root is the rsync base; -x keeps each rsync on its own filesystem so
     # in-place /boot and /boot/efi are never copied onto themselves.
-    sudo mount -r -o noatime "$SRC_ROOT" "$SRC"
+    sudo mount -r -o noatime "$SRC_ROOT" "$SRC" || \
+        die "Cannot mount source root $SRC_ROOT read-only. A dirty (uncleanly unmounted) image cannot replay its journal on a read-only loop -- run e2fsck on it once and retry."
 
     # Base rsync options.
     #   --delete (mirror the source, removing stale target files) is added only
@@ -746,7 +916,8 @@ else
             "$SRC/" "$MNT/"
     fi
     if [ $MIGRATE_BOOT -eq 1 ]; then
-        sudo mount -r -o noatime "$SRC_BOOT" "$SRC/boot"
+        sudo mount -r -o noatime "$SRC_BOOT" "$SRC/boot" || \
+            die "Cannot mount source /boot $SRC_BOOT read-only (dirty journal? run e2fsck on it once and retry)."
         echo "Rsyncing /boot filesystem..."
         sudo rsync "${RSYNC_OPTS[@]}" "$SRC/boot/" "$MNT/boot/"
     fi
@@ -784,6 +955,13 @@ echo "=========================================="
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "[dry-run] would chroot: update-grub + update-initramfs (grub-install bios=$INSTALL_GRUB_BIOS efi=$INSTALL_GRUB_EFI)"
 else
+    # os-prober is inert on GRUB >= 2.06 unless explicitly enabled. If the
+    # target enables it, concurrent update-grubs probe each other's in-flight
+    # disks and can cross-pollute the generated menus.
+    if grep -qs '^[[:space:]]*GRUB_DISABLE_OS_PROBER=false' \
+            "$MNT/etc/default/grub" "$MNT"/etc/default/grub.d/*.cfg; then
+        echo "Warning: os-prober is enabled in the target's GRUB config; avoid concurrent installs (menus may pick up each other's disks)." >&2
+    fi
     run_chroot_block
 fi
 
@@ -792,13 +970,8 @@ echo " Phase 6: Teardown & Cleanup              "
 echo "=========================================="
 if [ "$DRY_RUN" -eq 0 ]; then
     echo "[Teardown] Unmounting filesystems and releasing locks..."
-    sudo umount -R -q "$SRC" "$MNT" 2>/dev/null || true
-
-    if [ -n "${LOOP_DEV:-}" ]; then
-        echo "Detaching loop device: $LOOP_DEV"
-        sudo losetup -d "$LOOP_DEV" 2>/dev/null || true
-    fi
 fi
+cleanup   # also runs from the EXIT trap on any earlier failure
 
 if [ $UNIFIED_TARGET -eq 1 ]; then
     if [ $UPDATE -eq 1 ]; then
