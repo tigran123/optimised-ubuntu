@@ -262,11 +262,14 @@ rewrite_fstab() {
 
 rewrite_grub_distributor() {
     info "Updating GRUB_DISTRIBUTOR with target model ($TGT_MODEL)..."
+    # A --brand value may contain sed-replacement metacharacters (&, /, \).
+    local model_esc
+    model_esc=$(printf '%s' "$TGT_MODEL" | sed 's/[&/\]/\\&/g')
     if [ -f "$MNT/etc/default/grub" ]; then
-        sudo sed -i -E 's/^(GRUB_DISTRIBUTOR="Desktop ).*( `\( \.)/\1'"$TGT_MODEL"'\2/' "$MNT/etc/default/grub"
+        sudo sed -i -E 's/^(GRUB_DISTRIBUTOR="Desktop ).*( `\( \.)/\1'"$model_esc"'\2/' "$MNT/etc/default/grub"
     fi
     if [ -f "$MNT/etc/grub.d/09_console" ]; then
-        sudo sed -i -E 's/^(GRUB_DISTRIBUTOR="Console ).*( `\( \.)/\1'"$TGT_MODEL"'\2/' "$MNT/etc/grub.d/09_console"
+        sudo sed -i -E 's/^(GRUB_DISTRIBUTOR="Console ).*( `\( \.)/\1'"$model_esc"'\2/' "$MNT/etc/grub.d/09_console"
     fi
 }
 
@@ -338,6 +341,7 @@ TGT_SWAP="${TGT_SWAP:-}"
 MNT="${MNT:-}"
 SRC="${SRC:-}"
 EXCLUDE_FROM="${EXCLUDE_FROM:-}"
+BRAND="${BRAND:-}"
 DRY_RUN=0
 UPDATE=0
 ASSUME_YES=0
@@ -366,6 +370,7 @@ while [ $# -gt 0 ]; do
         --mnt)            MNT="$2"; shift 2 ;;
         --src)            SRC="$2"; shift 2 ;;
         --exclude-from)   EXCLUDE_FROM="$2"; shift 2 ;;
+        --brand)          BRAND="$2"; shift 2 ;;
         --dry-run)        DRY_RUN=1; shift ;;
         --update)         UPDATE=1; shift ;;
         --yes|-y)         ASSUME_YES=1; shift ;;
@@ -404,6 +409,10 @@ Other:
                               impersonal clone). Works with or without --update;
                               under --update the listed paths are also purged from
                               the target (rsync --delete-excluded).
+  --brand NAME                Brand the GRUB menu title with NAME instead of the
+                              target disk's reported model (useful when the medium
+                              sits in a USB card reader, whose model string —
+                              e.g. "SD Transcend" — says nothing about the card)
   --mnt DIR                   Target root mount point  (default: private temp dir)
   --src DIR                   Source root mount point  (default: private temp dir)
   --yes, -y                   Skip the confirmation prompt (for scripted runs)
@@ -700,13 +709,19 @@ else
 fi
 
 # Disk whose model brands the GRUB menu = where the rootfs (the OS) lives.
+# --brand overrides the probed model (which can be a card reader's name rather
+# than the medium's).
 if [ $UNIFIED_TARGET -eq 1 ]; then
     BRAND_DISK="$TARGET"
 else
     BRAND_DISK=$(get_parent_disk "$TGT_ROOT")
 fi
-TGT_MODEL=$(lsblk -n -d -o MODEL "${BRAND_DISK:-}" 2>/dev/null | xargs || true)
-[ -n "$TGT_MODEL" ] || TGT_MODEL="Portable Image"
+if [ -n "$BRAND" ]; then
+    TGT_MODEL="$BRAND"
+else
+    TGT_MODEL=$(lsblk -n -d -o MODEL "${BRAND_DISK:-}" 2>/dev/null | xargs || true)
+    [ -n "$TGT_MODEL" ] || TGT_MODEL="Portable Image"
+fi
 
 # Safety: a partition we are about to format must not also be a source we read.
 migrated_targets=()
@@ -766,7 +781,11 @@ if [ -n "$SWAP_DEV" ]; then
 else
     echo "  swap:     none"
 fi
-echo "  Menu:     GRUB title branded \"$TGT_MODEL\" (rootfs on ${BRAND_DISK:-?})"
+if [ -n "$BRAND" ]; then
+    echo "  Menu:     GRUB title branded \"$TGT_MODEL\" (--brand override)"
+else
+    echo "  Menu:     GRUB title branded \"$TGT_MODEL\" (rootfs on ${BRAND_DISK:-?})"
+fi
 if [ $INSTALL_GRUB_BIOS -eq 1 ] && [ $INSTALL_GRUB_EFI -eq 1 ]; then
     echo "  Bootldr:  reinstall legacy BIOS -> $TGT_GRUB_DISK, and UEFI (removable)"
 elif [ $INSTALL_GRUB_BIOS -eq 1 ]; then
