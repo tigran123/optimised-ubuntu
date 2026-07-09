@@ -526,11 +526,42 @@ run() {
 # Flags gate each step to what was actually acquired — in particular the fake
 # dry-run LOOP_DEV (/dev/loop0) never sets LOOP_ATTACHED and is never detached,
 # and a user-supplied --mnt is never unmounted unless we mounted onto it.
+
+# Recursively unmount one tree, waiting out stragglers that keep it busy.
+# A Ctrl+C kills the rsync client at once, but the process writing the data
+# can be blocked in uninterruptible sleep (D state) while the kernel flushes
+# its dirty pages to a slow target; the pending signal is only honoured when
+# that write returns, and until then the tree cannot be unmounted — so retry
+# instead of bailing out and leaving the target mounted.
+umount_tree() {
+    local dir="$1" err waited=0
+    while findmnt -n "$dir" >/dev/null 2>&1; do
+        if err=$(sudo env LC_ALL=C umount -R -q "$dir" 2>&1); then break; fi
+        case "$err" in
+        *busy*)
+            if [ "$waited" -eq 0 ]; then
+                waited=1
+                echo "$dir is busy (an interrupted rsync stays until its in-flight writes are flushed) -- waiting to unmount..."
+            fi
+            sleep 2 ;;
+        *)  # Not something waiting can fix — report it and give up on this tree.
+            [ -n "$err" ] && echo "$err" >&2
+            return 1 ;;
+        esac
+    done
+    return 0
+}
+
 cleanup() {
     if [ "$CLEANED" -eq 1 ]; then return 0; fi
     CLEANED=1
+    # Once teardown starts it must run to completion: ignore further Ctrl+C
+    # (etc.) so an impatient interrupt cannot abort it halfway and leave the
+    # target mounted.
+    trap '' HUP INT TERM
     if [ "$MOUNTS_DONE" -eq 1 ]; then
-        sudo umount -R -q "$SRC" "$MNT" 2>/dev/null || true
+        umount_tree "$SRC" || true
+        umount_tree "$MNT" || true
     fi
     if [ "$LOOP_ATTACHED" -eq 1 ]; then
         echo "Detaching loop device: $LOOP_DEV"
@@ -951,7 +982,12 @@ else
     #   --delete-excluded is added when both apply, so a re-sync also PURGES any
     #     excluded paths already on the target — rsync otherwise protects
     #     excluded files from --delete, which would leave personal data behind.
-    RSYNC_OPTS=(-ahqHAXS --numeric-ids -x)
+    #   --inplace rewrites changed files in place instead of building a hidden
+    #     temp copy and renaming: a changed 50 GB VM image would otherwise need
+    #     an extra 50 GB free on the target mid-transfer. The trade-off is that
+    #     an interrupted transfer leaves such a file half-updated; the next
+    #     --update run repairs it. (Combining it with -S needs rsync >= 3.1.3.)
+    RSYNC_OPTS=(-ahqHAXS --inplace --numeric-ids -x)
     if [ $UPDATE -eq 1 ]; then
         RSYNC_OPTS+=(--delete)
         if [ -n "$EXCLUDE_FROM" ]; then RSYNC_OPTS+=(--delete-excluded); fi
