@@ -6,13 +6,15 @@
 /home/tigran/C/
 /home/tigran/VirtualBox/
 /home/tigran/Mathematica/
+/home/tigran/nanobots/
+/home/tigran/.WolframEngine/
 /home/tigran/.Mathematica/
 /home/tigran/.Wolfram/
 /home/tigran/.cache/*
 /home/tigran/amazon
-/home/tigran/u26-portable/exclude.txt
-/home/tigran/u26-portable/log
+/home/tigran/u26/
 /home/tigran/NLM
+/home/tigran/whisper/
 /home/tigran/.bash_history
 /usr/local/bin/WolframKernel
 /usr/local/bin/wolfram
@@ -23,6 +25,7 @@
 /usr/local/bin/mathematica
 /usr/local/bin/Mathematica
 /home/tigran/.nvm/
+/home/tigran/.stellarium/
 /home/tigran/.npm/
 /home/tigran/creds/
 /home/tigran/gdrive/
