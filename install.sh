@@ -229,11 +229,37 @@ blkid_uuid() {
 rewrite_fstab() {
     sudo awk -v old_efi="$OLD_UUID_EFI" -v new_efi="$NEW_UUID_EFI" \
              -v old_boot="$OLD_UUID_BOOT" -v new_boot="$NEW_UUID_BOOT" \
-             -v old_root="$OLD_UUID_ROOT" -v new_root="$NEW_UUID_ROOT" '
+             -v old_root="$OLD_UUID_ROOT" -v new_root="$NEW_UUID_ROOT" \
+             -v new_swap="${NEW_UUID_SWAP:-}" '
+    # Lines disabled by a previous run: never re-prefix them (collapse any
+    # stacked markers left by older versions), and drop disabled swap entries
+    # once a live swap entry is being written below -- otherwise every
+    # re-mkswap sync leaves one more dead line behind.
+    /^# \[PORTABLE-SYNC-DISABLED\] / {
+        payload = $0;
+        while (sub(/^# \[PORTABLE-SYNC-DISABLED\] /, "", payload)) { }
+        split(payload, f);
+        if (new_swap != "" && f[3] == "swap") next;
+        print "# [PORTABLE-SYNC-DISABLED] " payload;
+        next;
+    }
     {
         gsub(old_efi, new_efi);
         gsub(old_boot, new_boot);
         gsub(old_root, new_root);
+
+        # Retarget the existing UUID-based swap entry in place (keeping its
+        # position and column spacing) instead of disabling it and appending
+        # a duplicate. Only the first is kept: extras fall through and are
+        # disabled below. Swap-file entries (no UUID) pass through untouched.
+        if (new_swap != "" && !swap_done && $3 == "swap") {
+            if (sub(/^UUID=[^ \t]+/, "UUID=" new_swap) ||
+                sub(/^\/dev\/disk\/by-uuid\/[^ \t]+/, "/dev/disk/by-uuid/" new_swap)) {
+                swap_done = 1;
+                print $0;
+                next;
+            }
+        }
 
         if ($0 ~ /UUID=/ || $0 ~ /\/dev\/disk\/by-uuid\//) {
             if ($0 !~ new_efi && $0 !~ new_boot && $0 !~ new_root) {
@@ -253,6 +279,10 @@ rewrite_fstab() {
         }
 
         print $0;
+    }
+    END {
+        if (new_swap != "" && !swap_done)
+            print "/dev/disk/by-uuid/" new_swap " none swap sw 0 0";
     }' "$MNT/etc/fstab" | sudo tee "$MNT/etc/fstab.new" >/dev/null
 
     sudo mv "$MNT/etc/fstab.new" "$MNT/etc/fstab"
@@ -953,16 +983,13 @@ echo "=========================================="
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "[dry-run] would rewrite fstab + GRUB root UUID and (re)brand the GRUB menu"
 else
+    # rewrite_fstab also retargets (or, if absent, appends) the swap entry to
+    # NEW_UUID_SWAP when a swap device was given.
     rewrite_fstab
 
     echo "Enforcing Root UUID mapping in GRUB default..."
     if grep -q '^GRUB_CMDLINE_LINUX=' "$MNT/etc/default/grub"; then
         sudo sed -i -E "s|root=UUID=[a-fA-F0-9-]+|root=UUID=$NEW_UUID_ROOT|g" "$MNT/etc/default/grub"
-    fi
-
-    if [ -n "$SWAP_DEV" ]; then
-        echo "Adding swap entry to fstab ($SWAP_DEV)..."
-        echo "/dev/disk/by-uuid/$NEW_UUID_SWAP none swap sw 0 0" | sudo tee -a "$MNT/etc/fstab" >/dev/null
     fi
 
     rewrite_grub_distributor
