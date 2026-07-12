@@ -4,6 +4,7 @@
 /usr/share/Wolfram/
 /usr/local/texlive/
 /home/tigran/C/
+/home/tigran/*VirtualBoxVM*.log
 /home/tigran/VirtualBox/
 /home/tigran/Mathematica/
 /home/tigran/nanobots/
@@ -12,8 +13,10 @@
 /home/tigran/.Wolfram/
 /home/tigran/.cache/*
 /home/tigran/amazon
+/home/tigran/sigmaai.ai/
 /home/tigran/u26/
 /home/tigran/NLM
+/home/tigran/TODO
 /home/tigran/whisper/
 /home/tigran/.bash_history
 /usr/local/bin/WolframKernel
