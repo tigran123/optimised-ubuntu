@@ -66,6 +66,14 @@ get_parent_disk() {
     fi
 }
 
+# supports_discard <dev> — true when the device can discard blocks (SSD, SD,
+# loop); spinning disks report a zero discard granularity.
+supports_discard() {
+    local gran
+    gran=$(lsblk -bdno DISC-GRAN "$1" 2>/dev/null | xargs) || return 1
+    [ -n "$gran" ] && [ "$gran" -gt 0 ]
+}
+
 # Wait for udev to publish a disk's partition nodes. udevadm settle watches the
 # global event queue, which a concurrent instance's partitioning storm can
 # stall; poll the one disk we care about instead. Best-effort: on timeout the
@@ -365,6 +373,56 @@ update-initramfs -u -k all
 
 echo "=> Exiting chroot."
 EOF
+}
+
+# verify_install — post-install sanity checks on the still-mounted target tree:
+#   fstab and the regenerated grub.cfg must reference the new UUIDs (and no
+#   longer the old ones), and the universal EFI routing stub must be keyed to
+#   the current /boot UUID. Catches a silently broken configuration while the
+#   disk is still on the desk rather than at boot time on another machine.
+#   Reads caller globals (MNT, OLD_UUID_*/NEW_UUID_*, SWAP_DEV, NEW_UUID_SWAP).
+#   Returns non-zero if any check failed.
+verify_install() {
+    local fails=0
+    vcheck() {
+        local desc=$1; shift
+        if "$@" >/dev/null 2>&1; then
+            echo "  [PASS] $desc"
+        else
+            echo "  [FAIL] $desc"
+            fails=$((fails+1))
+        fi
+    }
+    absent() { ! sudo grep -qF "$1" "$2"; }
+
+    vcheck "fstab mounts / by the new root UUID"       sudo grep -qF "$NEW_UUID_ROOT" "$MNT/etc/fstab"
+    vcheck "fstab mounts /boot by the new boot UUID"   sudo grep -qF "$NEW_UUID_BOOT" "$MNT/etc/fstab"
+    vcheck "fstab mounts the ESP by the new EFI UUID"  sudo grep -qF "$NEW_UUID_EFI"  "$MNT/etc/fstab"
+    if [ -n "$SWAP_DEV" ]; then
+        vcheck "fstab swap entry uses the new swap UUID" sudo grep -qF "$NEW_UUID_SWAP" "$MNT/etc/fstab"
+    fi
+    [ "$OLD_UUID_ROOT" = "$NEW_UUID_ROOT" ] || \
+        vcheck "fstab carries no stale root UUID" absent "$OLD_UUID_ROOT" "$MNT/etc/fstab"
+    [ "$OLD_UUID_BOOT" = "$NEW_UUID_BOOT" ] || \
+        vcheck "fstab carries no stale boot UUID" absent "$OLD_UUID_BOOT" "$MNT/etc/fstab"
+    [ "$OLD_UUID_EFI" = "$NEW_UUID_EFI" ] || \
+        vcheck "fstab carries no stale EFI UUID"  absent "$OLD_UUID_EFI"  "$MNT/etc/fstab"
+
+    vcheck "grub.cfg boots by the new root UUID"       sudo grep -qF "$NEW_UUID_ROOT" "$MNT/boot/grub/grub.cfg"
+    vcheck "grub.cfg searches for the new boot UUID"   sudo grep -qF "$NEW_UUID_BOOT" "$MNT/boot/grub/grub.cfg"
+    [ "$OLD_UUID_ROOT" = "$NEW_UUID_ROOT" ] || \
+        vcheck "grub.cfg carries no stale root UUID" absent "$OLD_UUID_ROOT" "$MNT/boot/grub/grub.cfg"
+
+    vcheck "EFI fallback loader present (EFI/BOOT/BOOTX64.EFI)" \
+        sudo test -f "$MNT/boot/efi/EFI/BOOT/BOOTX64.EFI"
+    vcheck "EFI routing stub keyed to the new boot UUID" \
+        sudo grep -qF "$NEW_UUID_BOOT" "$MNT/boot/efi/EFI/BOOT/grub.cfg"
+
+    if [ "$fails" -gt 0 ]; then
+        echo "  $fails verification check(s) FAILED."
+        return 1
+    fi
+    return 0
 }
 
 # Unified parameters
@@ -810,6 +868,23 @@ if [ ${#migrated_targets[@]} -gt 0 ]; then
     done
 fi
 
+# Safety: refuse targets that are in use. Mounting an already-mounted
+# filesystem a second time succeeds (it shares the superblock), so the sync
+# would write into a filesystem in active use — e.g. one auto-mounted by a
+# desktop session when the disk was plugged in. Every target role gets mounted
+# RW (even in-place ones), so all of them must be unmounted first.
+if [ $UNIFIED_TARGET -eq 1 ]; then
+    busy_devs=("$TARGET")   # whole disk: lsblk reports every partition's use
+else
+    busy_devs=("$TGT_EFI" "$TGT_BOOT" "$TGT_ROOT")
+    if [ "$DO_MKSWAP" -eq 1 ]; then busy_devs+=("$SWAP_DEV"); fi
+fi
+for t in "${busy_devs[@]}"; do
+    # MOUNTPOINTS shows filesystem mounts and active swap ([SWAP]) alike.
+    in_use=$(lsblk -no MOUNTPOINTS "$t" 2>/dev/null | grep -v '^$' | head -n 1 || true)
+    [ -z "$in_use" ] || die "Target $t is in use ($in_use) -- unmount/swapoff it first."
+done
+
 # ---- Cross-instance locks: exclusive on written disks, shared on read ones ----
 # ALL target roles are registered, in-place ones included: update-grub and
 # update-initramfs write into the mounted /boot even when a role is not
@@ -1022,7 +1097,15 @@ else
     #     an extra 50 GB free on the target mid-transfer. The trade-off is that
     #     an interrupted transfer leaves such a file half-updated; the next
     #     --update run repairs it. (Combining it with -S needs rsync >= 3.1.3.)
-    RSYNC_OPTS=(-ahqHAXS --inplace --numeric-ids -x)
+    #   --info=progress2 (interactive runs only) shows a single overall
+    #     progress line — percentage, rate, ETA — instead of hours of silence
+    #     on a large root sync; redirected output stays quiet (-q) as before.
+    RSYNC_OPTS=(-ahHAXS --inplace --numeric-ids -x)
+    if [ -t 1 ]; then
+        RSYNC_OPTS+=(--info=progress2)
+    else
+        RSYNC_OPTS+=(-q)
+    fi
     if [ $UPDATE -eq 1 ]; then
         RSYNC_OPTS+=(--delete)
         if [ -n "$EXCLUDE_FROM" ]; then RSYNC_OPTS+=(--delete-excluded); fi
@@ -1083,8 +1166,25 @@ else
 fi
 
 echo "=========================================="
-echo " Phase 6: Teardown & Cleanup              "
+echo " Phase 6: Post-install Verification       "
 echo "=========================================="
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[dry-run] would verify the UUID translation in fstab/grub.cfg and the EFI routing stub"
+else
+    verify_install || die "Verification failed -- the target may not boot; inspect it before relying on it."
+fi
+
+echo "=========================================="
+echo " Phase 7: Teardown & Cleanup              "
+echo "=========================================="
+# Discard unused blocks on the filesystems we wrote: keeps flash media fast and
+# lets a loop-attached .img target shrink (hole punching). Skipped when the
+# medium cannot discard (spinning disks), so a dry run only shows trims that
+# would actually happen; a failure on discard-capable media is reported but
+# never aborts the teardown.
+if [ $MIGRATE_EFI  -eq 1 ] && supports_discard "$TGT_EFI";  then run sudo fstrim -v "$MNT/boot/efi" || true; fi
+if [ $MIGRATE_BOOT -eq 1 ] && supports_discard "$TGT_BOOT"; then run sudo fstrim -v "$MNT/boot"     || true; fi
+if [ $MIGRATE_ROOT -eq 1 ] && supports_discard "$TGT_ROOT"; then run sudo fstrim -v "$MNT"          || true; fi
 if [ "$DRY_RUN" -eq 0 ]; then
     echo "[Teardown] Unmounting filesystems and releasing locks..."
 fi
