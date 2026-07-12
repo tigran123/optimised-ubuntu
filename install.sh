@@ -290,6 +290,24 @@ rewrite_fstab() {
     sudo chmod 644 "$MNT/etc/fstab"
 }
 
+# probe_target_brand — read the brand already stamped into GRUB_DISTRIBUTOR of
+#   /etc/default/grub on the target root (TGT_ROOT) via a transient read-only
+#   mount on MNT, before rsync overwrites the file with the source's copy.
+#   Sets TGT_MODEL (empty when the mount fails or the expected
+#   "Desktop <brand> `( ." pattern is absent). Runs under --dry-run too — the
+#   one real action a dry run performs, so the summary can show the brand it
+#   would keep. The kernel replays a dirty journal even for an ro mount of a
+#   writable device; harmless, as the real mount that follows would do the same.
+probe_target_brand() {
+    TGT_MODEL=""
+    MOUNTS_DONE=1   # from here on cleanup() must sweep $MNT, interrupts included
+    if sudo mount -r -o noatime "$TGT_ROOT" "$MNT" 2>/dev/null; then
+        TGT_MODEL=$(sed -nE 's/^GRUB_DISTRIBUTOR="Desktop (.*) `\( \..*$/\1/p' \
+                        "$MNT/etc/default/grub" 2>/dev/null | head -n 1) || TGT_MODEL=""
+        sudo umount "$MNT" || true
+    fi
+}
+
 rewrite_grub_distributor() {
     info "Updating GRUB_DISTRIBUTOR with target model ($TGT_MODEL)..."
     # A --brand value may contain sed-replacement metacharacters (&, /, \).
@@ -442,7 +460,10 @@ Other:
   --brand NAME                Brand the GRUB menu title with NAME instead of the
                               target disk's reported model (useful when the medium
                               sits in a USB card reader, whose model string —
-                              e.g. "SD Transcend" — says nothing about the card)
+                              e.g. "SD Transcend" — says nothing about the card).
+                              Without it, --update keeps the brand already stamped
+                              into the target's /etc/default/grub, so a brand
+                              chosen at install time survives every sync.
   --mnt DIR                   Target root mount point  (default: private temp dir)
   --src DIR                   Source root mount point  (default: private temp dir)
   --yes, -y                   Skip the confirmation prompt (for scripted runs)
@@ -496,7 +517,9 @@ fi
 
 # Front-load the sudo password prompt before any resources are acquired, so it
 # cannot fire mid-rsync (sudo timestamps are per-tty and can expire mid-run).
-if [ "$DRY_RUN" -eq 0 ]; then
+# A dry-run needs it too when --update (without --brand) will probe the
+# target's existing GRUB brand (the transient ro mount requires root).
+if [ "$DRY_RUN" -eq 0 ] || { [ $UPDATE -eq 1 ] && [ -z "$BRAND" ]; }; then
     sudo -v
 fi
 
@@ -769,21 +792,6 @@ else
     TGT_GRUB_DISK=""
 fi
 
-# Disk whose model brands the GRUB menu = where the rootfs (the OS) lives.
-# --brand overrides the probed model (which can be a card reader's name rather
-# than the medium's).
-if [ $UNIFIED_TARGET -eq 1 ]; then
-    BRAND_DISK="$TARGET"
-else
-    BRAND_DISK=$(get_parent_disk "$TGT_ROOT")
-fi
-if [ -n "$BRAND" ]; then
-    TGT_MODEL="$BRAND"
-else
-    TGT_MODEL=$(lsblk -n -d -o MODEL "${BRAND_DISK:-}" 2>/dev/null | xargs || true)
-    [ -n "$TGT_MODEL" ] || TGT_MODEL="Portable Image"
-fi
-
 # Safety: a partition we are about to format must not also be a source we read.
 migrated_targets=()
 if [ $MIGRATE_EFI  -eq 1 ]; then migrated_targets+=("$TGT_EFI");  fi
@@ -826,6 +834,37 @@ else
     acquire_locks
 fi
 
+# ---- GRUB menu brand ----
+# Disk whose model brands the GRUB menu = where the rootfs (the OS) lives.
+# --brand always wins. Under --update the brand already stamped into the
+# target's /etc/default/grub is kept (probed now, so the summary can show it),
+# so a brand chosen at install time survives every subsequent sync. Only
+# otherwise is the model probed from the disk — which can be a card reader's
+# name rather than the medium's, hence --brand. Resolved after the locks: the
+# probe mounts the target root, which must not race a concurrent mkfs.
+if [ $UNIFIED_TARGET -eq 1 ]; then
+    BRAND_DISK="$TARGET"
+else
+    BRAND_DISK=$(get_parent_disk "$TGT_ROOT")
+fi
+TGT_MODEL=""
+if [ -n "$BRAND" ]; then
+    TGT_MODEL="$BRAND"
+    BRAND_ORIGIN="--brand override"
+elif [ $UPDATE -eq 1 ]; then
+    # Often the run's first real media access (earlier blkid probes are usually
+    # answered from the page cache), so a spun-down or slow target disk makes
+    # this pause noticeably — say what we are waiting for.
+    info "Reading current GRUB brand off $TGT_ROOT (may need to spin the disk up)..."
+    probe_target_brand
+    BRAND_ORIGIN="kept from target's GRUB_DISTRIBUTOR"
+fi
+if [ -z "$TGT_MODEL" ]; then
+    TGT_MODEL=$(lsblk -n -d -o MODEL "${BRAND_DISK:-}" 2>/dev/null | xargs || true)
+    [ -n "$TGT_MODEL" ] || TGT_MODEL="Portable Image"
+    BRAND_ORIGIN="rootfs on ${BRAND_DISK:-?}"
+fi
+
 # ---- Summary + single confirmation gate (before anything destructive) ----
 echo
 echo "About to install:"
@@ -842,11 +881,7 @@ if [ -n "$SWAP_DEV" ]; then
 else
     echo "  swap:     none"
 fi
-if [ -n "$BRAND" ]; then
-    echo "  Menu:     GRUB title branded \"$TGT_MODEL\" (--brand override)"
-else
-    echo "  Menu:     GRUB title branded \"$TGT_MODEL\" (rootfs on ${BRAND_DISK:-?})"
-fi
+echo "  Menu:     GRUB title branded \"$TGT_MODEL\" ($BRAND_ORIGIN)"
 if [ $INSTALL_GRUB_BIOS -eq 1 ] && [ $INSTALL_GRUB_EFI -eq 1 ]; then
     echo "  Bootldr:  reinstall legacy BIOS -> $TGT_GRUB_DISK, and UEFI (removable)"
 elif [ $INSTALL_GRUB_BIOS -eq 1 ]; then
@@ -1017,7 +1052,7 @@ echo "=========================================="
 echo " Phase 4: Filesystem Translation (UUIDs)  "
 echo "=========================================="
 if [ "$DRY_RUN" -eq 1 ]; then
-    echo "[dry-run] would rewrite fstab + GRUB root UUID and (re)brand the GRUB menu"
+    echo "[dry-run] would rewrite fstab + GRUB root UUID and (re)brand the GRUB menu as \"$TGT_MODEL\""
 else
     # rewrite_fstab also retargets (or, if absent, appends) the swap entry to
     # NEW_UUID_SWAP when a swap device was given.
