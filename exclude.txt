@@ -2,8 +2,16 @@
 /usr/local/Wolfram/
 /opt/Wolfram/
 /usr/share/Wolfram/
+/usr/share/ollama/
+/usr/share/stellarium/
+/usr/share/virtualbox/
+/usr/share/libreoffice/
+/usr/bin/stellarium
+/usr/local/bin/ollama
+/usr/local/lib/ollama/
 /usr/local/texlive/
 /home/tigran/C/
+/home/tigran/Music/
 /home/tigran/*VirtualBoxVM*.log
 /home/tigran/VirtualBox/
 /home/tigran/Mathematica/
