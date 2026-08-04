@@ -232,13 +232,173 @@ blkid_uuid() {
 }
 
 # -----------------------------------------------------------------------------
+# Swap files
+# -----------------------------------------------------------------------------
+# A swap FILE (as opposed to a swap partition) cannot simply be copied: rsync's
+# -S turns its multi-gigabyte run of zeros into holes, and the kernel then
+# refuses it at boot ("swapon: /var/swap: skipping - it appears to have holes").
+# So it is never transferred at all -- it is excluded from the rsync and
+# re-created on the target from scratch, which also saves shipping gigabytes of
+# zeros over a slow USB link (fallocate only touches metadata).
+
+# swapfile_entries <fstab> — print the swap FILE paths listed in an fstab, one
+#   per line. Only plain paths qualify: swap partitions (/dev/..., UUID=,
+#   LABEL=, PARTUUID=...) and zram devices are somebody else's problem.
+swapfile_entries() {
+    awk '$1 ~ /^#/ { next }
+         $3 == "swap" && $1 ~ /^\// && $1 !~ /^\/dev\// {
+             # fstab octal escapes (\040 for a space, ...) would have to be
+             # decoded to be usable as a path; such a swap file is vanishingly
+             # rare, so say so and skip it rather than mangle it.
+             if ($1 ~ /\\/) {
+                 print "Warning: swap file " $1 " has an escaped path -- not rebuilt." > "/dev/stderr";
+                 next;
+             }
+             print $1;
+         }' "$1"
+}
+
+# swapfile_excluded <path> — true when the user's --exclude-from file removes
+#   this path from the transfer. Asked of rsync itself with a one-file dry run,
+#   so wildcards, "+" include lines and rule ordering are honoured exactly as in
+#   the real transfer rather than re-implemented here: the path is excluded
+#   exactly when rsync no longer lists it. The destination is a deliberately
+#   NON-existent directory -- against the real target, rsync's quick check would
+#   skip an unchanged file already sitting there and the empty output would read
+#   as "excluded". Nothing is written: --dry-run creates neither. (Limit: a rule
+#   excluding a whole parent directory is not detected, since --relative always
+#   sends implied dirs; that only matters for an exclude file that guts /var,
+#   which could not boot anyway.)
+swapfile_excluded() {
+    local sf=$1 listed rc=0
+    [ -n "$EXCLUDE_FROM" ] || return 1
+    listed=$(sudo rsync -n --relative --exclude-from="$EXCLUDE_FROM" \
+                 --out-format='%n' "$SRC/./${sf#/}" "$MNT/.swapfile-probe" 2>/dev/null) || rc=$?
+    # A failed probe (e.g. the source file is gone) must not read as "excluded".
+    [ "$rc" -eq 0 ] || return 1
+    [[ $'\n'$listed$'\n' == *$'\n'"${sf#/}"$'\n'* ]] && return 1
+    return 0
+}
+
+# scan_swapfiles — read the source's fstab and split its swap files into the
+#   ones to rebuild (SWAPFILES) and the ones the --exclude-from file removes
+#   (SWAPFILES_DROPPED: an impersonal/minimal disk is meant to have no swap at
+#   all, so those are neither copied nor re-created, and rewrite_fstab comments
+#   their entries out). SWAP_EXCLUDES keeps every swap file out of the rsync.
+#   Reads caller globals (SRC, MNT, EXCLUDE_FROM).
+scan_swapfiles() {
+    local sf
+    local -a found=()
+    SWAPFILES=(); SWAPFILES_DROPPED=(); SWAP_EXCLUDES=(); SWAPFILE_TGT_SIZE=()
+    [ -f "$SRC/etc/fstab" ] || return 0
+    mapfile -t found < <(swapfile_entries "$SRC/etc/fstab")
+    for sf in "${found[@]}"; do
+        SWAP_EXCLUDES+=("--exclude=$sf")
+        if swapfile_excluded "$sf"; then
+            info "Swap file $sf is excluded by $EXCLUDE_FROM -- dropped (its fstab entry will be disabled)."
+            SWAPFILES_DROPPED+=("$sf")
+        else
+            info "Swap file $sf will be re-created on the target (not copied)."
+            SWAPFILES+=("$sf")
+            # Remember the size of the copy already on the target: it is the
+            # fallback when the source has no swap file, and --delete-excluded
+            # (--update plus --exclude-from) removes it during the transfer.
+            if sudo test -f "$MNT$sf"; then
+                SWAPFILE_TGT_SIZE[$sf]=$(sudo stat -c %s "$MNT$sf")
+            fi
+        fi
+    done
+}
+
+# rebuild_swapfiles — re-create every kept swap file on the freshly synced
+#   target: same size as the source's, same label/UUID, 0600 root:root, freshly
+#   mkswap'ed. Reads caller globals (SRC, MNT, SWAPFILES) and records what it
+#   did in SWAPFILES_REBUILT for verify_install().
+rebuild_swapfiles() {
+    local sf src_file tgt_file size label uuid
+    local -a mkswap_args
+    [ ${#SWAPFILES[@]} -gt 0 ] || return 0
+    for sf in "${SWAPFILES[@]}"; do
+        src_file="$SRC$sf"
+        tgt_file="$MNT$sf"
+
+        # rsync -x stays on the root filesystem, so a swap file on a separate
+        # mount was never part of this transfer and is not ours to touch.
+        if sudo test -e "$src_file" && \
+           [ "$(sudo stat -c %d "$src_file")" != "$(sudo stat -c %d "$SRC")" ]; then
+            echo "Note: swap file $sf lives outside the root filesystem -- not rebuilt." >&2
+            continue
+        fi
+
+        # Size: the source's file is the authority; fall back to the size the
+        # target's copy had before the sync, and never invent one.
+        size=""
+        if sudo test -f "$src_file"; then
+            size=$(sudo stat -c %s "$src_file")
+        else
+            size="${SWAPFILE_TGT_SIZE[$sf]:-}"
+        fi
+        if [ -z "$size" ] || [ "$size" -le 0 ]; then
+            echo "Warning: cannot determine the size of swap file $sf (missing on source and target) -- not rebuilt; 'swapon -a' will fail on the target." >&2
+            continue
+        fi
+
+        # Keep the swap area's identity, so anything referring to it by label
+        # or UUID (fstab, resume=) still resolves on the clone.
+        label=""; uuid=""
+        if sudo test -f "$src_file"; then
+            label=$(sudo blkid -p -s LABEL -o value "$src_file" 2>/dev/null || true)
+            uuid=$(sudo blkid -p -s UUID -o value "$src_file" 2>/dev/null || true)
+        fi
+        mkswap_args=(-q)
+        [ -n "$label" ] && mkswap_args+=(-L "$label")
+        [ -n "$uuid" ]  && mkswap_args+=(-U "$uuid")
+
+        info "Re-creating swap file $sf ($size bytes)..."
+        run sudo rm -f "$tgt_file"
+        run sudo fallocate -l "$size" "$tgt_file"
+        run sudo chown root:root "$tgt_file"
+        run sudo chmod 600 "$tgt_file"
+        run sudo mkswap "${mkswap_args[@]}" "$tgt_file"
+        SWAPFILES_REBUILT+=("$sf")
+    done
+}
+
+# swapfile_ok <file> — true when a swap file is usable: a regular file with no
+#   holes (the condition swapon rejects) carrying a swap signature.
+swapfile_ok() {
+    local f=$1 size blocks blocksize
+    sudo test -f "$f" || return 1
+    read -r size blocks blocksize < <(sudo stat -c '%s %b %B' "$f") || return 1
+    [ $((blocks * blocksize)) -ge "$size" ] || return 1
+    [ "$(sudo blkid -p -s TYPE -o value "$f" 2>/dev/null)" = swap ]
+}
+
+# fstab_disabled <path> <fstab> — true when <path>'s entry carries our
+#   disabled marker. Compares fields, so a path is matched literally.
+fstab_disabled() {
+    sudo awk -v p="$1" '
+        $1 == "#" && $2 == "[PORTABLE-SYNC-DISABLED]" && $3 == p { found = 1 }
+        END { exit !found }' "$2"
+}
+
+# -----------------------------------------------------------------------------
 # Translation Operations
 # -----------------------------------------------------------------------------
 rewrite_fstab() {
+    # drop_swap: swap FILES the --exclude-from file removes from the transfer.
+    # Their entries are commented out, so a disk deliberately built without swap
+    # does not boot into a failing swapon. Space-delimited, with sentinel spaces
+    # at both ends so the awk lookup below matches whole paths only.
+    local drop_swap=" "
+    if [ ${#SWAPFILES_DROPPED[@]} -gt 0 ]; then
+        drop_swap=" $(printf '%s ' "${SWAPFILES_DROPPED[@]}")"
+    fi
+
     sudo awk -v old_efi="$OLD_UUID_EFI" -v new_efi="$NEW_UUID_EFI" \
              -v old_boot="$OLD_UUID_BOOT" -v new_boot="$NEW_UUID_BOOT" \
              -v old_root="$OLD_UUID_ROOT" -v new_root="$NEW_UUID_ROOT" \
-             -v new_swap="${NEW_UUID_SWAP:-}" '
+             -v new_swap="${NEW_UUID_SWAP:-}" -v drop_swap="$drop_swap" '
     # Lines disabled by a previous run: never re-prefix them (collapse any
     # stacked markers left by older versions), and drop disabled swap entries
     # once a live swap entry is being written below -- otherwise every
@@ -255,6 +415,13 @@ rewrite_fstab() {
         gsub(old_efi, new_efi);
         gsub(old_boot, new_boot);
         gsub(old_root, new_root);
+
+        # A swap file that was deliberately left off this disk: disable its
+        # entry rather than leave systemd trying to swapon a missing file.
+        if ($3 == "swap" && index(drop_swap, " " $1 " ") > 0) {
+            print "# [PORTABLE-SYNC-DISABLED] " $0;
+            next;
+        }
 
         # Retarget the existing UUID-based swap entry in place (keeping its
         # position and column spacing) instead of disabling it and appending
@@ -418,6 +585,17 @@ verify_install() {
     vcheck "EFI routing stub keyed to the new boot UUID" \
         sudo grep -qF "$NEW_UUID_BOOT" "$MNT/boot/efi/EFI/BOOT/grub.cfg"
 
+    local sf
+    for sf in "${SWAPFILES_REBUILT[@]}"; do
+        vcheck "swap file $sf is fully allocated and formatted" swapfile_ok "$MNT$sf"
+    done
+    for sf in "${SWAPFILES_DROPPED[@]}"; do
+        vcheck "dropped swap file $sf is absent from the target" \
+            sudo test ! -e "$MNT$sf"
+        vcheck "dropped swap file $sf is disabled in fstab" \
+            fstab_disabled "$sf" "$MNT/etc/fstab"
+    done
+
     if [ "$fails" -gt 0 ]; then
         echo "  $fails verification check(s) FAILED."
         return 1
@@ -456,6 +634,14 @@ SRC_AUTO=0
 LOOP_ATTACHED=0
 MOUNTS_DONE=0
 CLEANED=0
+
+# Swap files listed in the source's fstab: to rebuild, dropped by --exclude-from,
+# actually rebuilt (verified later), and the rsync exclusions for all of them.
+SWAPFILES=()
+SWAPFILES_DROPPED=()
+SWAPFILES_REBUILT=()
+SWAP_EXCLUDES=()
+declare -A SWAPFILE_TGT_SIZE=()
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -514,7 +700,9 @@ Other:
                               paths are omitted from the copy (e.g. to produce an
                               impersonal clone). Works with or without --update;
                               under --update the listed paths are also purged from
-                              the target (rsync --delete-excluded).
+                              the target (rsync --delete-excluded). A swap file
+                              listed here is dropped rather than re-created, and
+                              its fstab entry is commented out.
   --brand NAME                Brand the GRUB menu title with NAME instead of the
                               target disk's reported model (useful when the medium
                               sits in a USB card reader, whose model string —
@@ -530,6 +718,9 @@ Other:
 
 Notes:
   * --source-swap (reuse) and --target-swap (reformat) are mutually exclusive.
+    They cover swap PARTITIONS; a swap FILE listed in the source's fstab needs no
+    option -- it is never copied (rsync -S would leave it full of holes, which
+    swapon refuses) and is re-created on the target at the source's size.
   * EFI booting uses the EFI System Partition; the BIOS Boot partition is only
     for legacy boot and is regenerated by grub-install (when --target-bios-boot
     is given) or left intact otherwise.
@@ -1061,6 +1252,11 @@ if [ "$DRY_RUN" -eq 1 ]; then
     else
         echo "[dry-run] would mount the target tree and rsync the migrated filesystems"
     fi
+    if [ $MIGRATE_ROOT -eq 1 ]; then
+        # The source is not mounted in a dry run, so its fstab (and with it the
+        # swap file paths) cannot be read here.
+        echo "[dry-run] would exclude every swap file listed in the source's fstab from the transfer and re-create it (fallocate + mkswap) on the target${EXCLUDE_FROM:+, or drop it if $EXCLUDE_FROM excludes it}"
+    fi
 else
     # Refuse to stack over an existing mount — a leftover tree from a crashed
     # run (or a busy --mnt/--src dir) must be cleaned up, not silently shadowed.
@@ -1113,10 +1309,15 @@ else
     if [ -n "$EXCLUDE_FROM" ]; then RSYNC_OPTS+=(--exclude-from="$EXCLUDE_FROM"); fi
 
     if [ $MIGRATE_ROOT -eq 1 ]; then
+        # Swap files are never transferred (rsync -S would punch them full of
+        # holes); they are re-created on the target once the sync is done.
+        scan_swapfiles
         echo "Rsyncing root filesystem..."
         sudo rsync "${RSYNC_OPTS[@]}" \
             --exclude={"/dev/*","/proc/*","/sys/*","/tmp/*","/run/*","/media/*","/mnt/*","/lost+found"} \
+            "${SWAP_EXCLUDES[@]}" \
             "$SRC/" "$MNT/"
+        rebuild_swapfiles
     fi
     if [ $MIGRATE_BOOT -eq 1 ]; then
         sudo mount -r -o noatime "$SRC_BOOT" "$SRC/boot" || \

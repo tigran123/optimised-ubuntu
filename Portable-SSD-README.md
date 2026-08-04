@@ -84,6 +84,23 @@ sudo rsync -ahvHAXS --numeric-ids --exclude={"/dev/*","/proc/*","/sys/*","/tmp/*
 
 ```
 
+**4. Re-create the swap file**
+If the system swaps to a *file* rather than a partition, add it to the exclusions above (`--exclude=/var/swap`) and build a fresh one on the target. The `-S` flag stores the swap file's gigabytes of zeros as holes, and the kernel refuses a swap area that is not fully allocated:
+
+```
+swapon: /var/swap: skipping - it appears to have holes.
+```
+
+Excluding it also saves copying all those zeros over USB, since `fallocate` costs nothing but metadata:
+
+```bash
+sudo rm -f /mnt/var/swap
+sudo fallocate -l $(stat -c %s /altroot/var/swap) /mnt/var/swap
+sudo chmod 600 /mnt/var/swap
+sudo mkswap -L swap /mnt/var/swap
+
+```
+
 ---
 
 ### Phase 3: Filesystem Translation (`fstab`)

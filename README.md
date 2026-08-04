@@ -48,4 +48,6 @@ $ ./install.sh --image Ubuntu26-Portable-16GB.img --target /dev/sda --exclude-fr
 
 This works with or without `--update`. On an `--update` re-sync it additionally passes `--delete-excluded`, so any listed paths that already exist on the target are *removed* (rsync otherwise protects excluded files from deletion, which would leave stale personal data behind).
 
+A **swap file** is never copied. `rsync -S` would turn its gigabytes of zeros into holes on the target, and the kernel then refuses it on the next boot with `swapon: /var/swap: skipping - it appears to have holes`. So every swap file listed in the source's `/etc/fstab` is excluded from the transfer and re-created on the target instead — same size, same label and UUID, `0600 root:root`, freshly `mkswap`ed — which is also much faster than shipping all those zeros over USB. If your `--exclude-from` file lists the swap file (as `exclude.txt` does), it is dropped instead: no swap file is created and its `fstab` entry is commented out, so a minimal boot disk stays swapless and does not boot into a failing `swapon`.
+
 Always preview a run with `--dry-run` first; it prints every destructive command instead of executing it. See `./install.sh --help` for the full set of options.
