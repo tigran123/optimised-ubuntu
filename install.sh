@@ -1665,15 +1665,8 @@ else
     #     an extra 50 GB free on the target mid-transfer. The trade-off is that
     #     an interrupted transfer leaves such a file half-updated; the next
     #     --update run repairs it. (Combining it with -S needs rsync >= 3.1.3.)
-    #   --info=progress2 (interactive runs only) shows a single overall
-    #     progress line — percentage, rate, ETA — instead of hours of silence
-    #     on a large root sync; redirected output stays quiet (-q) as before.
-    RSYNC_OPTS=(-ahHAXS --inplace --numeric-ids -x)
-    if [ -t 1 ]; then
-        RSYNC_OPTS+=(--info=progress2)
-    else
-        RSYNC_OPTS+=(-q)
-    fi
+    #   --verbose (show the files as they are rsync'ed)
+    RSYNC_OPTS=(-ahHAXS --inplace --numeric-ids -x --verbose)
     if [ $UPDATE -eq 1 ]; then
         RSYNC_OPTS+=(--delete)
         if [ -n "$EXCLUDE_FROM" ]; then RSYNC_OPTS+=(--delete-excluded); fi
