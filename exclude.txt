@@ -42,6 +42,7 @@
 /usr/local/bin/mathematica
 /usr/local/bin/Mathematica
 /home/tigran/.nvm/
+/home/tigran/.nv/
 /home/tigran/.stellarium/
 /home/tigran/.npm/
 /home/tigran/creds/
@@ -78,6 +79,16 @@
 /home/tigran/.cupy/
 /home/tigran/.rustup/
 /home/tigran/.ollama/
+/home/tigran/.wxMaxima
+/home/tigran/.xmaximarc
+/home/tigran/.xmaxima_history
+/home/tigran/.gitconfig
+/home/tigran/rsync_pass
+/home/tigran/greek.py
+/home/tigran/.lesshst
+/home/tigran/.wget-hsts
+/home/tigran/.tmux.conf
+/home/tigran/.starplotrc
 /home/tigran/.copilot/
 /home/tigran/.config/google-chrome/
 /opt/AmneziaVPN/
@@ -89,6 +100,7 @@
 /home/tigran/python/
 /home/tigran/Software/
 /home/tigran/Pictures/
+/home/tigran/Documents/*
 /home/tigran/Personal/
 /home/tigran/Misc/
 /var/cache/apt/*
