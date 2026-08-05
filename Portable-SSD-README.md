@@ -27,13 +27,18 @@ sudo parted -s /dev/sdb set 1 bios_grub on
 sudo parted -s /dev/sdb mkpart primary fat32 2MiB 258MiB
 sudo parted -s /dev/sdb set 2 esp on
 
-# Partition 3: Dedicated /boot (1GB)
-sudo parted -s /dev/sdb mkpart primary ext4 258MiB 1282MiB
-
-# Partition 4: Unified Root (Ext4, taking the rest of the drive)
-sudo parted -s /dev/sdb mkpart primary ext4 1282MiB 100%
+# Partition 3: Unified Root (Ext4, taking the rest of the drive)
+sudo parted -s /dev/sdb mkpart primary ext4 258MiB 100%
 
 ```
+
+There is deliberately **no separate `/boot` partition**. It only ever existed because the root filesystem carried ext4 features GRUB's primitive drivers could not parse; the root is now formatted with the same conservative `-O sparse_super2` as `/boot` used to be, so GRUB reads it directly and `/boot` is simply a directory inside `/`. You can confirm that for a given disk without booting it, using GRUB's own ext2 driver:
+
+```bash
+sudo grub-fstest /dev/sdb3 ls /boot/grub/
+```
+
+(If you are working with a drive that still has the older four-partition layout, keep its `/boot` on partition 3 and shift the root to partition 4 — everything below works either way, and `install.sh` detects which layout a disk has.)
 
 **2. Format the Filesystems**
 
@@ -41,13 +46,12 @@ sudo parted -s /dev/sdb mkpart primary ext4 1282MiB 100%
 # Format ESP
 sudo mkfs.fat -F32 -n EFI /dev/sdb2
 
-# Format /boot conservatively (GRUB-safe)
-sudo mkfs.ext4 -L boot -i 32768 -v -m 0 -E lazy_itable_init=0,lazy_journal_init=0 -O sparse_super2 /dev/sdb3
-
-# Format / hyper-optimized (Kernel 5.x features)
-sudo mkfs.ext4 -m 0 -L root -v -i 262144 -E lazy_itable_init=0,lazy_journal_init=0 -O fast_commit,sparse_super2,orphan_file,inline_data,metadata_csum_seed /dev/sdb4
+# Format / (sparse inode table; -N scales with the partition, ~4 MiB per inode)
+sudo mkfs.ext4 -vF -m 0 -L root -N 1572864 -E lazy_itable_init=0,lazy_journal_init=0 -O sparse_super2 /dev/sdb3
 
 ```
+
+`orphan_file` and `metadata_csum_seed` used to be in that `-O` list and were removed on purpose. `orphan_file` sets the *dynamic* `INCOMPAT_ORPHAN_PRESENT` superblock flag whenever the orphan file holds entries and only clears it on a clean unmount, so an unclean shutdown leaves an incompat flag set on the filesystem — recovery after power loss became measurably more destructive. Do not put them back.
 
 ---
 
@@ -58,13 +62,13 @@ By mounting our split source partitions hierarchically, `rsync` will naturally f
 **1. Mount the Target SSD (`/mnt`)**
 
 ```bash
-sudo mount /dev/sdb4 /mnt
-sudo mkdir -p /mnt/boot
-sudo mount /dev/sdb3 /mnt/boot
+sudo mount /dev/sdb3 /mnt
 sudo mkdir -p /mnt/boot/efi
 sudo mount /dev/sdb2 /mnt/boot/efi
 
 ```
+
+`/mnt/boot` is an ordinary directory on the root filesystem now, so nothing is mounted onto it — the source's separate `/boot` partition simply lands there as files, which is exactly the flattening described above.
 
 **2. Mount the Source Architecture (`/altroot`)**
 
@@ -110,8 +114,7 @@ The cloned OS currently expects to find its root on the NVMe drive and its boot 
 **1. Gather the New UUIDs**
 
 ```bash
-sudo blkid /dev/sdb4  # The Ext4       Root      UUID
-sudo blkid /dev/sdb3  # The Ext4       /boot     UUID
+sudo blkid /dev/sdb3  # The Ext4       Root      UUID (also holds /boot)
 sudo blkid /dev/sdb2  # The FAT32 EFI  /boot/efi UUID
 
 ```
@@ -123,8 +126,8 @@ sudo vi /mnt/etc/fstab
 
 ```
 
-* Update the `/` mount point with the new `sdb4` UUID.
-* Update the `/boot` mount point with the new `sdb3` UUID.
+* Update the `/` mount point with the new `sdb3` UUID.
+* **Delete or comment out the `/boot` line entirely** — that partition no longer exists, and leaving the entry behind means booting into a failing `mount`.
 * Update the `/boot/efi` mount point with the new `sdb2` UUID.
 
 ---
@@ -165,10 +168,10 @@ vi /boot/efi/EFI/BOOT/grub.cfg
 
 ```
 
-Paste the universal logic, ensuring you insert the **new `/dev/sdb3` UUID**. This script dynamically detects that it is now running on a unified filesystem and adjusts its `$prefix` automatically:
+Paste the universal logic, ensuring you insert the UUID of **whichever filesystem holds `/boot`** — that is the root partition `/dev/sdb3` on this layout, or a dedicated `/boot` partition on a disk that still has one. This script dynamically detects which of the two it landed on and adjusts its `$prefix` automatically, so the same stub works either way:
 
 ```text
-search --no-floppy --fs-uuid --set=root YOUR-SDB3-UUID
+search --no-floppy --fs-uuid --set=root YOUR-BOOT-FILESYSTEM-UUID
 
 if [ -f ($root)/boot/grub/grub.cfg ]; then
     set prefix=($root)/boot/grub
@@ -182,16 +185,16 @@ configfile $prefix/grub.cfg
 
 **3. Enforce the Root UUID Mapping**
 
-Because the bootloader's primitive drivers cannot parse the hyper-optimized features on our root partition (sdb4), grub-probe will fail to extract its UUID and may hardcode the block device path or fallback to PARTUUID. To guarantee absolute portability across any hardware, you must explicitly pass the root UUID to the kernel.
+`grub-probe` can fail to extract the root filesystem's UUID and fall back to hardcoding a block device path or a PARTUUID — neither of which survives being plugged into a different machine. To guarantee absolute portability across any hardware, pass the root UUID to the kernel explicitly.
 
 ```bash
 vi /etc/default/grub
 ```
 
-Locate the `GRUB_CMDLINE_LINUX` variable and append our new `/dev/sdb4` UUID:
+Locate the `GRUB_CMDLINE_LINUX` variable and append our new `/dev/sdb3` UUID:
 
 ```plaintext
-GRUB_CMDLINE_LINUX="root=UUID=YOUR-SDB4-UUID"
+GRUB_CMDLINE_LINUX="root=UUID=YOUR-SDB3-UUID"
 ```
 
 **4. Regenerate the Master Menu**

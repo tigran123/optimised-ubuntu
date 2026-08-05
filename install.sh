@@ -14,6 +14,14 @@
 # new partition, keeping BIOS Boot, EFI and /boot where they are" a first-class
 # operation. See --help for examples.
 #
+# /boot is OPTIONAL on both sides: no --source-boot / --target-boot (and no such
+# partition on a unified disk) means /boot is an ordinary directory inside /.
+# That is the layout a fresh unified --target now gets, since root and /boot are
+# formatted with the same ext4 feature set and GRUB reads both. An existing
+# disk's layout is detected, not assumed, so a clone that still carries a
+# separate /boot keeps working -- and either side can be converted to the other
+# just by pointing the run at a target with (or without) a /boot partition.
+#
 # With --update, a differing role is *synced* instead of migrated: the target
 # filesystem is kept as-is (no mkfs) and rsync runs with --delete, so an
 # existing clone is refreshed in place rather than rebuilt from scratch. This
@@ -53,6 +61,18 @@ partition_prefix() {
     else
         echo ""
     fi
+}
+
+# dryrun_loop_clashes <loopdev> — true when a dry run's guessed source loop
+#   device is one the user named as a target (the whole disk or a partition of
+#   it). Reads the caller-set TARGET/TGT_* globals.
+dryrun_loop_clashes() {
+    local t
+    for t in "$TARGET" "$TGT_BIOS" "$TGT_EFI" "$TGT_BOOT" "$TGT_ROOT"; do
+        [ -n "$t" ] || continue
+        case "$t" in "$1"|"$1"p*) return 0 ;; esac
+    done
+    return 1
 }
 
 get_parent_disk() {
@@ -105,6 +125,10 @@ declare -A LOCK_MODE=()
 # add_lock <device-or-file> <sh|ex> — register a lock key; ex wins over sh.
 add_lock() {
     local key parent
+    # Roles that do not exist (e.g. no separate /boot) arrive as an empty string.
+    # Check it here rather than trusting readlink: uutils' readlink resolves ""
+    # to the working directory and exits 0, which would lock the cwd.
+    [ -n "${1:-}" ] || return 0
     key=$(readlink -f "$1" 2>/dev/null) || return 0
     [ -n "$key" ] || return 0
     if [ -b "$key" ]; then
@@ -152,69 +176,109 @@ validate_partition_type() {
     return 0
 }
 
-# validate_disk_structure <disk> <part_prefix>
-#   Confirm a whole disk carries the unified 4-partition GPT layout this toolkit
-#   produces: BIOS boot (p1), EFI (p2), Linux /boot (p3), Linux root (p4).
-#   Returns non-zero (without exiting) so callers can react.
-validate_disk_structure() {
-    local disk=$1 p=$2
-    info "Validating topology of $disk..."
-    if [ ! -b "$disk" ]; then
-        echo "  [FAIL] $disk is not a valid block device."
-        return 1
-    fi
-    validate_partition_type "${disk}${p}1" "$GUID_BIOS"  "BIOS boot" || return 1
-    validate_partition_type "${disk}${p}2" "$GUID_EFI"   "EFI"       || return 1
-    validate_partition_type "${disk}${p}3" "$GUID_LINUX" "Boot"      || return 1
-    validate_partition_type "${disk}${p}4" "$GUID_LINUX" "Root"      || return 1
-    echo "  [PASS] $disk has the expected BIOS/EFI/boot/root layout."
-    return 0
-}
-
-# resolve_source_roles <disk>
-#   Scan a unified source disk (or attached loop device) and assign its EFI,
-#   /boot and root partitions into SRC_EFI/SRC_BOOT/SRC_ROOT by GPT type and
-#   filesystem label, rather than assuming fixed partition numbers. This lets a
-#   source that carries an inline swap partition (so root is not partition 4) —
-#   or any other non-canonical ordering — resolve correctly. EFI is the ESP;
-#   /boot and root are the Linux-filesystem partitions, told apart by their
-#   "boot"/"root" labels and otherwise by on-disk order. Dies if a role is
-#   missing so an unexpected layout fails here rather than at mount time.
-resolve_source_roles() {
-    local disk=$1
+# scan_disk_roles <disk> <VAR_PREFIX>
+#   Scan a whole disk (or attached loop device) and assign its BIOS Boot, EFI,
+#   /boot and root partitions into <PREFIX>_BIOS/_EFI/_BOOT/_ROOT by GPT type
+#   and filesystem label, rather than assuming fixed partition numbers. This
+#   lets a disk carrying an inline swap or data partition — or any other
+#   non-canonical ordering — resolve correctly, and it is what makes a layout
+#   *without* a separate /boot indistinguishable from one with it at the call
+#   site: _BOOT simply comes back empty.
+#
+#   Used for both sides: a unified source, and a unified --target under --update
+#   (where the existing layout must be discovered, not imposed, since we neither
+#   repartition nor reformat it).
+#
+#   EFI is the ESP; /boot and root are the Linux-filesystem partitions, told
+#   apart by their "boot"/"root" labels — which this toolkit's own mkfs always
+#   writes — and otherwise by on-disk order. Dies if the ESP or root is missing,
+#   so an unexpected layout fails here rather than at mount time; a missing
+#   /boot is legal and means /boot lives inside /.
+scan_disk_roles() {
+    local disk=$1 pfx=$2
     local dev ptype fstype label
     local -a linux_parts=()
-    SRC_EFI=""; SRC_BOOT=""; SRC_ROOT=""
+    local bios="" efi="" boot="" root=""
 
     while read -r dev; do
         [ "$dev" = "$disk" ] && continue
         ptype=$(lsblk -dno PARTTYPE "$dev" 2>/dev/null | tr '[:upper:]' '[:lower:]')
         case "$ptype" in
+            "$GUID_BIOS")
+                bios="$dev" ;;
             "$GUID_EFI")
-                SRC_EFI="$dev" ;;
+                efi="$dev" ;;
             "$GUID_LINUX")
                 fstype=$(lsblk -dno FSTYPE "$dev" 2>/dev/null)
                 [ "$fstype" = swap ] && continue   # a Linux-typed swap: not /boot or /
                 label=$(lsblk -dno LABEL "$dev" 2>/dev/null)
                 case "$label" in
-                    boot) SRC_BOOT="$dev" ;;
-                    root) SRC_ROOT="$dev" ;;
+                    boot) boot="$dev" ;;
+                    root) root="$dev" ;;
                     *)    linux_parts+=("$dev") ;;
                 esac ;;
         esac
     done < <(lsblk -lnpo NAME "$disk")
 
     # Any Linux-fs partitions we could not tell apart by label fall back to
-    # on-disk order: the first unclaimed one is /boot, the next is root.
-    for dev in "${linux_parts[@]}"; do
-        if   [ -z "$SRC_BOOT" ]; then SRC_BOOT="$dev"
-        elif [ -z "$SRC_ROOT" ]; then SRC_ROOT="$dev"
-        fi
-    done
+    # on-disk order: the first unclaimed one is /boot, the next is root. The
+    # exception is a *lone* unclaimed partition with no root yet — that is a
+    # disk whose /boot lives inside /, now the default layout, so it is root.
+    if [ ${#linux_parts[@]} -eq 1 ] && [ -z "$root" ]; then
+        root="${linux_parts[0]}"
+    else
+        for dev in "${linux_parts[@]}"; do
+            if   [ -z "$boot" ]; then boot="$dev"
+            elif [ -z "$root" ]; then root="$dev"
+            fi
+        done
+    fi
 
-    [ -n "$SRC_EFI" ]  || die "Source $disk has no EFI System partition."
-    [ -n "$SRC_BOOT" ] || die "Source $disk has no Linux /boot partition."
-    [ -n "$SRC_ROOT" ] || die "Source $disk has no Linux root partition."
+    [ -n "$efi" ]  || die "Disk $disk has no EFI System partition."
+    [ -n "$root" ] || die "Disk $disk has no Linux root partition."
+
+    printf -v "${pfx}_BIOS" '%s' "$bios"
+    printf -v "${pfx}_EFI"  '%s' "$efi"
+    printf -v "${pfx}_BOOT" '%s' "$boot"
+    printf -v "${pfx}_ROOT" '%s' "$root"
+}
+
+# scan_image_roles_dryrun <image>
+#   Role partition NUMBERS for a .img in a dry run, where no loop device is
+#   attached and lsblk therefore has nothing to scan. parted reads the partition
+#   table straight out of the file (no root, no loop needed), so the printed
+#   summary reflects the image's real layout instead of a canonical guess.
+#   Prints "<efi>:<boot>:<root>" -- colon-separated, so the empty boot field of
+#   an image with no /boot partition survives the split -- or nothing if the
+#   table could not be read.
+#   Limit: without a loop device the filesystems cannot be probed, so a
+#   Linux-typed *swap* partition is only recognised when parted names its type.
+scan_image_roles_dryrun() {
+    local img=$1 num fstype flags
+    local -a linux_nums=()
+    local efi="" boot="" root=""
+
+    while IFS=: read -r num _ _ _ fstype _ flags; do
+        case "$num" in ''|*[!0-9]*) continue ;; esac
+        flags=${flags%;}
+        case "$flags" in
+            *bios_grub*) continue ;;
+            *esp*)       efi="$num"; continue ;;
+        esac
+        case "$fstype" in linux-swap*) continue ;; esac
+        linux_nums+=("$num")
+    done < <(parted -sm "$img" unit MiB print 2>/dev/null || true)
+
+    [ -n "$efi" ] || return 0
+    if [ ${#linux_nums[@]} -eq 1 ]; then
+        root="${linux_nums[0]}"
+    elif [ ${#linux_nums[@]} -ge 2 ]; then
+        boot="${linux_nums[0]}"
+        root="${linux_nums[1]}"
+    else
+        return 0
+    fi
+    printf '%s:%s:%s\n' "$efi" "$boot" "$root"
 }
 
 # -----------------------------------------------------------------------------
@@ -395,9 +459,26 @@ rewrite_fstab() {
         drop_swap=" $(printf '%s ' "${SWAPFILES_DROPPED[@]}")"
     fi
 
+    # map_boot: only translate the /boot UUID when the source actually had a
+    # separate /boot. Without one OLD_UUID_BOOT *is* OLD_UUID_ROOT, and the boot
+    # substitution would rewrite the root entry to the target's /boot UUID
+    # before the root substitution ever saw it.
+    local map_boot=0
+    [ "$OLD_UUID_BOOT" = "$OLD_UUID_ROOT" ] || map_boot=1
+
+    # has_boot: does the (source's) fstab already carry a live /boot entry? When
+    # the target has a separate /boot and the source did not, one is inserted.
+    local has_boot=0
+    if sudo awk '$1 !~ /^#/ && $2 == "/boot" { found = 1 } END { exit !found }' \
+            "$MNT/etc/fstab"; then
+        has_boot=1
+    fi
+
     sudo awk -v old_efi="$OLD_UUID_EFI" -v new_efi="$NEW_UUID_EFI" \
              -v old_boot="$OLD_UUID_BOOT" -v new_boot="$NEW_UUID_BOOT" \
              -v old_root="$OLD_UUID_ROOT" -v new_root="$NEW_UUID_ROOT" \
+             -v map_boot="$map_boot" -v sep_boot="$TGT_SEP_BOOT" \
+             -v has_boot="$has_boot" \
              -v new_swap="${NEW_UUID_SWAP:-}" -v drop_swap="$drop_swap" '
     # Lines disabled by a previous run: never re-prefix them (collapse any
     # stacked markers left by older versions), and drop disabled swap entries
@@ -412,8 +493,17 @@ rewrite_fstab() {
         next;
     }
     {
+        # This disk keeps /boot inside /, so a /boot entry inherited from the
+        # source names a filesystem that does not exist here. Disable it before
+        # the UUID translation below, which would otherwise rewrite it into a
+        # bogus "mount the root filesystem at /boot" line.
+        if (!sep_boot && $2 == "/boot") {
+            print "# [PORTABLE-SYNC-DISABLED] " $0;
+            next;
+        }
+
         gsub(old_efi, new_efi);
-        gsub(old_boot, new_boot);
+        if (map_boot) gsub(old_boot, new_boot);
         gsub(old_root, new_root);
 
         # A swap file that was deliberately left off this disk: disable its
@@ -450,6 +540,17 @@ rewrite_fstab() {
                 next;
             }
             print "# [PORTABLE-SYNC-DISABLED] " $0;
+            next;
+        }
+
+        # This disk has a separate /boot but the source kept /boot inside /, so
+        # no entry was inherited: add one directly after the root entry. Never
+        # at the end -- mount -a walks fstab in order, and a /boot line after
+        # /boot/efi would mount the ESP onto the bare directory and then bury it.
+        if (sep_boot && !has_boot && !boot_added && $2 == "/") {
+            print $0;
+            print "/dev/disk/by-uuid/" new_boot "  /boot  ext4  defaults,noatime  0 2";
+            boot_added = 1;
             next;
         }
 
@@ -561,29 +662,51 @@ verify_install() {
         fi
     }
     absent() { ! sudo grep -qF "$1" "$2"; }
+    # Same, but blind to commented-out lines: a /boot entry disabled because
+    # this disk keeps /boot inside / legitimately still carries the old UUID.
+    absent_active() {
+        ! sudo awk -v s="$1" '$0 !~ /^[[:space:]]*#/ && index($0, s) > 0 { found = 1 }
+                              END { exit !found }' "$2"
+    }
+    # No live /boot entry at all (the boot-in-root layout).
+    no_boot_entry() {
+        ! sudo awk '$1 !~ /^#/ && $2 == "/boot" { found = 1 } END { exit !found }' "$1"
+    }
 
     vcheck "fstab mounts / by the new root UUID"       sudo grep -qF "$NEW_UUID_ROOT" "$MNT/etc/fstab"
-    vcheck "fstab mounts /boot by the new boot UUID"   sudo grep -qF "$NEW_UUID_BOOT" "$MNT/etc/fstab"
+    if [ "$TGT_SEP_BOOT" -eq 1 ]; then
+        vcheck "fstab mounts /boot by the new boot UUID" sudo grep -qF "$NEW_UUID_BOOT" "$MNT/etc/fstab"
+    else
+        vcheck "fstab has no /boot entry (/boot lives inside /)" no_boot_entry "$MNT/etc/fstab"
+    fi
     vcheck "fstab mounts the ESP by the new EFI UUID"  sudo grep -qF "$NEW_UUID_EFI"  "$MNT/etc/fstab"
     if [ -n "$SWAP_DEV" ]; then
         vcheck "fstab swap entry uses the new swap UUID" sudo grep -qF "$NEW_UUID_SWAP" "$MNT/etc/fstab"
     fi
     [ "$OLD_UUID_ROOT" = "$NEW_UUID_ROOT" ] || \
-        vcheck "fstab carries no stale root UUID" absent "$OLD_UUID_ROOT" "$MNT/etc/fstab"
+        vcheck "fstab carries no stale root UUID" absent_active "$OLD_UUID_ROOT" "$MNT/etc/fstab"
     [ "$OLD_UUID_BOOT" = "$NEW_UUID_BOOT" ] || \
-        vcheck "fstab carries no stale boot UUID" absent "$OLD_UUID_BOOT" "$MNT/etc/fstab"
+        vcheck "fstab carries no stale boot UUID" absent_active "$OLD_UUID_BOOT" "$MNT/etc/fstab"
     [ "$OLD_UUID_EFI" = "$NEW_UUID_EFI" ] || \
-        vcheck "fstab carries no stale EFI UUID"  absent "$OLD_UUID_EFI"  "$MNT/etc/fstab"
+        vcheck "fstab carries no stale EFI UUID"  absent_active "$OLD_UUID_EFI"  "$MNT/etc/fstab"
 
+    # NEW_UUID_BOOT is the UUID of whichever filesystem holds /boot -- the /boot
+    # partition when there is one, the root filesystem otherwise -- so the GRUB
+    # checks below need no special case for the boot-in-root layout.
     vcheck "grub.cfg boots by the new root UUID"       sudo grep -qF "$NEW_UUID_ROOT" "$MNT/boot/grub/grub.cfg"
-    vcheck "grub.cfg searches for the new boot UUID"   sudo grep -qF "$NEW_UUID_BOOT" "$MNT/boot/grub/grub.cfg"
+    vcheck "grub.cfg searches the filesystem holding /boot" \
+        sudo grep -qF "$NEW_UUID_BOOT" "$MNT/boot/grub/grub.cfg"
     [ "$OLD_UUID_ROOT" = "$NEW_UUID_ROOT" ] || \
         vcheck "grub.cfg carries no stale root UUID" absent "$OLD_UUID_ROOT" "$MNT/boot/grub/grub.cfg"
 
     vcheck "EFI fallback loader present (EFI/BOOT/BOOTX64.EFI)" \
         sudo test -f "$MNT/boot/efi/EFI/BOOT/BOOTX64.EFI"
-    vcheck "EFI routing stub keyed to the new boot UUID" \
+    vcheck "EFI routing stub keyed to the filesystem holding /boot" \
         sudo grep -qF "$NEW_UUID_BOOT" "$MNT/boot/efi/EFI/BOOT/grub.cfg"
+    # Proves the /boot content actually landed -- the one thing a layout change
+    # (a separate /boot collapsed into /, or split back out) can silently lose.
+    vcheck "a kernel image is present under /boot" \
+        sudo sh -c 'ls "$1"/boot/vmlinuz-* >/dev/null 2>&1' _ "$MNT"
 
     local sf
     for sf in "${SWAPFILES_REBUILT[@]}"; do
@@ -626,8 +749,15 @@ MNT="${MNT:-}"
 SRC="${SRC:-}"
 EXCLUDE_FROM="${EXCLUDE_FROM:-}"
 BRAND="${BRAND:-}"
+# Empty = derive the root inode count from the partition size; --inodes-root pins it.
+INODES_ROOT="${INODES_ROOT:-}"
+# Empty = the default 256 MiB ESP; --target-efi-size overrides it (fresh --target only).
+TGT_EFI_SIZE="${TGT_EFI_SIZE:-}"
+ESP_MIB=256
 DRY_RUN=0
 UPDATE=0
+NO_TGT_BOOT=0
+NO_TRIM=0
 ASSUME_YES=0
 MNT_AUTO=0
 SRC_AUTO=0
@@ -643,6 +773,15 @@ SWAPFILES_REBUILT=()
 SWAP_EXCLUDES=()
 declare -A SWAPFILE_TGT_SIZE=()
 
+# Run with nothing to do: show the help rather than marching into Phase 1 and
+# failing on the *default* source path, which says nothing about what went
+# wrong. Env-var-only invocations (TARGET=/dev/sdb ./install.sh) still work --
+# they are only "no arguments" as far as $# is concerned, so check for a target
+# in the environment before deciding the user asked for nothing.
+if [ $# -eq 0 ] && [ -z "${TARGET}${TGT_ROOT}${TGT_EFI}${TGT_BIOS}${TGT_BOOT}" ]; then
+    set -- --help
+fi
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --image|--source) SOURCE="$2"; shift 2 ;;
@@ -656,6 +795,7 @@ while [ $# -gt 0 ]; do
         --target-bios-boot) TGT_BIOS="$2"; shift 2 ;;
         --target-efi)       TGT_EFI="$2";  shift 2 ;;
         --target-boot)      TGT_BOOT="$2"; shift 2 ;;
+        --no-target-boot)   NO_TGT_BOOT=1; shift ;;
         --target-root)      TGT_ROOT="$2"; shift 2 ;;
         --target-swap)      TGT_SWAP="$2"; shift 2 ;;
 
@@ -663,8 +803,11 @@ while [ $# -gt 0 ]; do
         --src)            SRC="$2"; shift 2 ;;
         --exclude-from)   EXCLUDE_FROM="$2"; shift 2 ;;
         --brand)          BRAND="$2"; shift 2 ;;
+        --inodes-root)    INODES_ROOT="$2"; shift 2 ;;
+        --target-efi-size) TGT_EFI_SIZE="$2"; shift 2 ;;
         --dry-run)        DRY_RUN=1; shift ;;
         --update)         UPDATE=1; shift ;;
+        --no-trim)        NO_TRIM=1; shift ;;
         --yes|-y)         ASSUME_YES=1; shift ;;
         -h|--help)
             cat <<USAGE
@@ -675,20 +818,36 @@ in place or migrated: a --target-X defaults to its --source-X, so a role whose
 target equals its source is left untouched, and one whose target differs is
 formatted and copied.
 
+A separate /boot is OPTIONAL on both sides. No --source-boot (and no such
+partition on a unified source) means the source keeps /boot inside /; a fresh
+--target likewise gets no /boot partition, because root and /boot are formatted
+with the same ext4 feature set and GRUB reads both. An existing target disk's
+layout is detected, not assumed, so a clone that still has a separate /boot
+keeps it. Pointing a run at a target with a /boot partition (--target-boot) or
+without one (--no-target-boot) converts the layout in either direction.
+
 Source (pick one form):
   --image|--source FILE|DEV   Whole image file or block device
                               (default: Ubuntu26-Portable-16GB.img)
-  --source-efi / --source-boot / --source-root PART
-                              Scattered source: supply all three
+  --source-efi / --source-root PART
+                              Scattered source: both required
+  --source-boot PART          Scattered source with a separate /boot; omit when
+                              the source keeps /boot inside /
   --source-swap PART          Reuse this swap as-is (NOT reformatted)
 
 Target:
-  --target DEV                Whole device: GPT-partition it and format
+  --target DEV                Whole device: GPT-partition it (BIOS Boot, ESP,
+                              root) and format
                               (with --update: treat as already-partitioned and
-                              sync onto its existing filesystems instead)
+                              sync onto its existing layout instead, separate
+                              /boot and all)
   --target-bios-boot PART     Provide to (re)install the legacy BIOS bootloader
   --target-efi PART           Defaults to --source-efi  (omit/equal = keep in place)
   --target-boot PART          Defaults to --source-boot (omit/equal = keep in place)
+  --no-target-boot            This disk keeps /boot inside /. Needed only when
+                              the SOURCE has a separate /boot: --target-boot
+                              otherwise defaults to it and would keep it in
+                              place. (A fresh --target has none to begin with.)
   --target-root PART          Defaults to --source-root (omit/equal = keep in place)
   --target-swap PART          Use this swap, reformatting it (mkswap)
 
@@ -710,6 +869,26 @@ Other:
                               Without it, --update keeps the brand already stamped
                               into the target's /etc/default/grub, so a brand
                               chosen at install time survives every sync.
+  --target-efi-size SIZE      Size of the ESP on a freshly partitioned --target
+                              (default 256M). A bare number is MiB; k/M/G are
+                              accepted and must come out whole MiB, since the
+                              root partition starts where the ESP ends. Only
+                              applies when this run partitions the disk -- not
+                              with --update or individual --target-* partitions.
+  --inodes-root N             Pass N to the root mkfs.ext4 as -N instead of
+                              deriving it from the partition size (~4 MiB per
+                              inode, floor 1.5M). A k or M suffix is accepted:
+                              1572864, 1536k and 1M all name a count, not a
+                              size. An explicit count is used as given -- the
+                              1.5M floor is not applied. Only relevant when the
+                              root filesystem is actually formatted (not under
+                              --update, which keeps the existing one).
+  --no-trim                   Skip the closing fstrim of the written filesystems.
+                              By default they are trimmed when the medium can
+                              discard, which keeps flash fast and makes a
+                              loop-attached .img sparse (the loop driver turns
+                              discards into hole punches on the backing file, so
+                              a fallocate'd image only shrinks if this runs).
   --mnt DIR                   Target root mount point  (default: private temp dir)
   --src DIR                   Source root mount point  (default: private temp dir)
   --yes, -y                   Skip the confirmation prompt (for scripted runs)
@@ -730,16 +909,23 @@ Notes:
     before its confirmation prompt. Run each instance in its own terminal.
 
 Examples:
-  # Full deploy of an image onto a fresh disk:
+  # Full deploy of an image onto a fresh disk (3 partitions, /boot inside /,
+  # even when the image itself still carries a separate /boot partition):
   $0 --image Ubuntu26-Portable-16GB.img --target /dev/sda
 
   # Migrate ONLY the root filesystem to a new partition, keeping EFI and /boot:
   $0 --source-efi /dev/sda2 --source-boot /dev/sda3 \\
      --source-root /dev/sda4 --target-root /dev/nvme0n1p1
 
-  # Incrementally sync a split-disk source onto an already-formatted disk
-  # (no reformat — rsync --delete refreshes the existing clone). Replaces the
-  # old backup.sh disk-to-disk clone:
+  # Fold a split source (EFI+/boot on sda, root on NVMe) onto a 3-partition disk
+  # whose /boot lives inside / -- the source has a separate /boot, so say so:
+  $0 --source-efi /dev/sda2 --source-boot /dev/sda3 \\
+     --source-root /dev/nvme0n1p1 --no-target-boot \\
+     --target-bios-boot /dev/sdb1 --target-efi /dev/sdb2 --target-root /dev/sdb3
+
+  # Incrementally sync a split-disk source onto an already-formatted disk that
+  # still has its own /boot (no reformat — rsync --delete refreshes the existing
+  # clone). Replaces the old backup.sh disk-to-disk clone:
   $0 --source-efi /dev/sda2 --source-boot /dev/sda3 \\
      --source-root /dev/nvme0n1p1 \\
      --target-bios-boot /dev/sdb1 --target-efi /dev/sdb2 \\
@@ -762,6 +948,50 @@ done
 if [ -n "$EXCLUDE_FROM" ]; then
     [ -f "$EXCLUDE_FROM" ] || die "--exclude-from file not found: $EXCLUDE_FROM"
     EXCLUDE_FROM=$(readlink -f "$EXCLUDE_FROM")
+fi
+
+# --inodes-root is handed to mkfs.ext4 -N, which wants a plain count; accept a
+# k/M suffix too, since the useful values are things like 1572864. Resolved here
+# so a typo fails before any disk is touched, rather than at mkfs time. 10# keeps
+# a leading zero from being read as octal.
+if [ -n "$INODES_ROOT" ]; then
+    if [[ "$INODES_ROOT" =~ ^([0-9]+)([kKmM]?)$ ]]; then
+        n=$((10#${BASH_REMATCH[1]}))
+        case "${BASH_REMATCH[2]}" in
+            k|K) n=$(( n * 1024 )) ;;
+            m|M) n=$(( n * 1024 * 1024 )) ;;
+        esac
+        [ "$n" -gt 0 ] || die "--inodes-root must be greater than zero."
+        INODES_ROOT=$n
+    else
+        die "--inodes-root must be a positive integer, optionally with a k or M suffix (e.g. 1572864, 1536k, 2M)."
+    fi
+fi
+
+# --target-efi-size is a SIZE, not a count: a bare number means MiB (the unit the
+# GPT layout is expressed in), and k/M/G are KiB/MiB/GiB. It must come out to a
+# whole number of MiB, since the root partition starts where the ESP ends and a
+# sub-MiB boundary would misalign it. Validated here for the same reason as
+# --inodes-root: a typo must not survive until parted has already run.
+if [ -n "$TGT_EFI_SIZE" ]; then
+    if [[ "$TGT_EFI_SIZE" =~ ^([0-9]+)([kKmMgG]?)$ ]]; then
+        n=$((10#${BASH_REMATCH[1]}))
+        case "${BASH_REMATCH[2]}" in
+            k|K) [ $(( n % 1024 )) -eq 0 ] || \
+                     die "--target-efi-size must be a whole number of MiB (got $TGT_EFI_SIZE)."
+                 n=$(( n / 1024 )) ;;
+            g|G) n=$(( n * 1024 )) ;;
+        esac
+        [ "$n" -gt 0 ] || die "--target-efi-size must be greater than zero."
+        # No hard floor: mkfs.fat -F32 will format even 1 MiB. But the GRUB EFI
+        # payload plus the fallback loader need a few MiB, and that failure would
+        # not surface until grub-install, long after the disk was partitioned.
+        [ "$n" -ge 16 ] || \
+            echo "Warning: a ${n} MiB ESP may be too small for the GRUB EFI payload." >&2
+        ESP_MIB=$n
+    else
+        die "--target-efi-size must be a positive integer, optionally with a k, M or G suffix (e.g. 256, 512M, 1G)."
+    fi
 fi
 
 # Front-load the sudo password prompt before any resources are acquired, so it
@@ -871,12 +1101,22 @@ UNIFIED_TARGET=0
 SCATTERED_SOURCE=0
 if [ -n "$SRC_EFI" ] || [ -n "$SRC_BOOT" ] || [ -n "$SRC_ROOT" ]; then
     SCATTERED_SOURCE=1
-    ns=0
-    for v in "$SRC_EFI" "$SRC_BOOT" "$SRC_ROOT"; do
-        if [ -n "$v" ]; then ns=$((ns+1)); fi
-    done
-    [ "$ns" -eq 3 ] || die "Scattered source needs all of --source-efi/--source-boot/--source-root (got $ns/3)."
+    # --source-boot is optional: without it the source keeps /boot inside /.
+    [ -n "$SRC_EFI" ]  || die "Scattered source needs --source-efi."
+    [ -n "$SRC_ROOT" ] || die "Scattered source needs --source-root."
     [ -z "$TARGET" ] || die "Do not combine scattered --source-* with a unified --target."
+fi
+
+if [ $NO_TGT_BOOT -eq 1 ] && [ -n "$TGT_BOOT" ]; then
+    die "Specify only one of --target-boot (a separate /boot) or --no-target-boot (/boot inside /)."
+fi
+
+# A unified --target owns the whole disk; mixing it with per-role --target-*
+# partitions would silently ignore one or the other.
+if [ -n "$TARGET" ]; then
+    for v in "$TGT_BIOS" "$TGT_EFI" "$TGT_BOOT" "$TGT_ROOT"; do
+        [ -z "$v" ] || die "Do not combine a unified --target with individual --target-* partitions."
+    done
 fi
 
 # Swap: --source-swap reuses (no mkswap); --target-swap reformats (mkswap); not both.
@@ -896,22 +1136,49 @@ echo "=========================================="
 if [ $SCATTERED_SOURCE -eq 1 ]; then
     echo "Source Mode: Scattered Partitions"
     validate_partition_type "$SRC_EFI"  "$GUID_EFI"   "Source EFI"  || die "Invalid Source EFI"
-    validate_partition_type "$SRC_BOOT" "$GUID_LINUX" "Source Boot" || die "Invalid Source Boot"
+    if [ -n "$SRC_BOOT" ]; then
+        validate_partition_type "$SRC_BOOT" "$GUID_LINUX" "Source Boot" || die "Invalid Source Boot"
+    fi
     validate_partition_type "$SRC_ROOT" "$GUID_LINUX" "Source Root" || die "Invalid Source Root"
 else
     if [ -b "$SOURCE" ]; then
         echo "Source Mode: Unified Block Device ($SOURCE)"
-        resolve_source_roles "$SOURCE"
+        scan_disk_roles "$SOURCE" SRC
     elif [ -f "$SOURCE" ]; then
         echo "Source Mode: Flat File Image ($SOURCE)"
         if [ "$DRY_RUN" -eq 1 ]; then
-            # No loop device is attached in dry-run, so fall back to the toolkit's
-            # canonical partition numbers just for the printed summary.
-            LOOP_DEV="/dev/loop0"
+            # No loop device is attached in dry-run, so lsblk has nothing to
+            # scan. parted reads the image's partition table out of the file
+            # itself, so the summary still shows its real layout.
+            # Name the device the real run would actually get rather than
+            # assuming loop0: when the TARGET is itself a loop device, a
+            # hardcoded loop0 collides with it and the safety check below
+            # rejects the run with a bogus "it is also a source partition".
+            LOOP_DEV=$(losetup -f 2>/dev/null) || LOOP_DEV=""
+            [ -n "$LOOP_DEV" ] || LOOP_DEV="/dev/loop0"
+            # A real run attaches the source only once the target is already in
+            # use, so losetup can never hand it the target's own loop device. A
+            # dry run has no such protection: losetup -f names the target itself
+            # whenever that loop is not currently attached, and the "target is
+            # also a source partition" check downstream then rejects a conflict
+            # that cannot happen for real. Step past whatever the user named.
+            loop_tries=0
+            while [[ "$LOOP_DEV" =~ ^/dev/loop[0-9]+$ ]] && \
+                  dryrun_loop_clashes "$LOOP_DEV" && [ $loop_tries -lt 64 ]; do
+                LOOP_DEV="/dev/loop$(( ${LOOP_DEV##*/loop} + 1 ))"
+                loop_tries=$((loop_tries + 1))
+            done
             echo "[dry-run] sudo losetup -r -P -f --show \"$SOURCE\""
-            SRC_EFI="${LOOP_DEV}p2"
-            SRC_BOOT="${LOOP_DEV}p3"
-            SRC_ROOT="${LOOP_DEV}p4"
+            IFS=: read -r n_efi n_boot n_root < <(scan_image_roles_dryrun "$SOURCE") || true
+            if [ -z "${n_root:-}" ]; then
+                # Unreadable table: fall back to the canonical numbers of the
+                # layout this toolkit now produces (no separate /boot).
+                echo "Warning: cannot read the partition table of $SOURCE -- assuming the default layout." >&2
+                n_efi=2; n_boot=""; n_root=3
+            fi
+            SRC_EFI="${LOOP_DEV}p${n_efi}"
+            SRC_BOOT="${n_boot:+${LOOP_DEV}p${n_boot}}"
+            SRC_ROOT="${LOOP_DEV}p${n_root}"
         else
             # Read-only: even an ro ext4 mount writes to the device (journal
             # replay, orphan cleanup), so two instances sharing one image via
@@ -922,22 +1189,42 @@ else
             echo "Image mapped to loop device: $LOOP_DEV (read-only)"
             sudo udevadm settle
             wait_for_partitions "$LOOP_DEV"
-            resolve_source_roles "$LOOP_DEV"
+            scan_disk_roles "$LOOP_DEV" SRC
         fi
     else
         die "Source '$SOURCE' is neither a valid block device nor a regular file."
     fi
 fi
 
+# Does the source keep /boot on its own filesystem, or inside /?
+if [ -n "$SRC_BOOT" ]; then SRC_SEP_BOOT=1; else SRC_SEP_BOOT=0; fi
+if [ $SRC_SEP_BOOT -eq 1 ]; then
+    echo "Source /boot: separate partition ($SRC_BOOT)"
+else
+    echo "Source /boot: inside the root filesystem"
+fi
+
 # Old UUIDs from the source (translated into the target's fstab/GRUB later).
+# Without a separate /boot, OLD_UUID_BOOT *is* the root UUID: every consumer
+# wants "the UUID of the filesystem holding /boot", and keeping it non-empty
+# also keeps rewrite_fstab's awk substitutions off an empty regex, which would
+# match at every character position.
 if [ "$DRY_RUN" -eq 1 ]; then
     OLD_UUID_EFI="00000000-0000-0000-0000-000000000001"
-    OLD_UUID_BOOT="00000000-0000-0000-0000-000000000002"
     OLD_UUID_ROOT="00000000-0000-0000-0000-000000000003"
+    if [ $SRC_SEP_BOOT -eq 1 ]; then
+        OLD_UUID_BOOT="00000000-0000-0000-0000-000000000002"
+    else
+        OLD_UUID_BOOT="$OLD_UUID_ROOT"
+    fi
 else
     OLD_UUID_EFI=$(blkid_uuid "$SRC_EFI")
-    OLD_UUID_BOOT=$(blkid_uuid "$SRC_BOOT")
     OLD_UUID_ROOT=$(blkid_uuid "$SRC_ROOT")
+    if [ $SRC_SEP_BOOT -eq 1 ]; then
+        OLD_UUID_BOOT=$(blkid_uuid "$SRC_BOOT")
+    else
+        OLD_UUID_BOOT="$OLD_UUID_ROOT"
+    fi
 fi
 
 echo "=========================================="
@@ -953,55 +1240,103 @@ if [ $SCATTERED_SOURCE -eq 1 ]; then
         validate_partition_type "$TGT_BIOS" "$GUID_BIOS" "Target BIOS" || die "Invalid Target BIOS"
     fi
     validate_partition_type "$TGT_EFI"  "$GUID_EFI"   "Target EFI"  || die "Invalid Target EFI"
-    validate_partition_type "$TGT_BOOT" "$GUID_LINUX" "Target Boot" || die "Invalid Target Boot"
+    if [ -n "$TGT_BOOT" ]; then
+        validate_partition_type "$TGT_BOOT" "$GUID_LINUX" "Target Boot" || die "Invalid Target Boot"
+    fi
     validate_partition_type "$TGT_ROOT" "$GUID_LINUX" "Target Root" || die "Invalid Target Root"
 else
-    # Unified/image source => full deploy. Target is unified or all four --target-*.
-    nt=0
-    for v in "$TGT_BIOS" "$TGT_EFI" "$TGT_BOOT" "$TGT_ROOT"; do
-        if [ -n "$v" ]; then nt=$((nt+1)); fi
-    done
-    if [ "$nt" -gt 0 ] && [ "$nt" -lt 4 ]; then
-        die "Scattered target needs all four of --target-bios-boot/--target-efi/--target-boot/--target-root (got $nt/4)."
-    fi
-    if [ "$nt" -eq 4 ]; then
+    # Unified/image source => full deploy. The target is a unified device, or
+    # individual --target-* partitions: --target-efi and --target-root are
+    # required, --target-bios-boot and --target-boot optional (no --target-boot
+    # means /boot goes inside /).
+    if [ -n "$TGT_BIOS" ] || [ -n "$TGT_EFI" ] || [ -n "$TGT_BOOT" ] || [ -n "$TGT_ROOT" ]; then
+        [ -n "$TGT_EFI" ]  || die "Scattered target needs --target-efi."
+        [ -n "$TGT_ROOT" ] || die "Scattered target needs --target-root."
         echo "Target Mode: Scattered Partitions (full deploy)"
-        validate_partition_type "$TGT_BIOS" "$GUID_BIOS"  "Target BIOS" || die "Invalid Target BIOS"
+        if [ -n "$TGT_BIOS" ]; then
+            validate_partition_type "$TGT_BIOS" "$GUID_BIOS" "Target BIOS" || die "Invalid Target BIOS"
+        fi
         validate_partition_type "$TGT_EFI"  "$GUID_EFI"   "Target EFI"  || die "Invalid Target EFI"
-        validate_partition_type "$TGT_BOOT" "$GUID_LINUX" "Target Boot" || die "Invalid Target Boot"
+        if [ -n "$TGT_BOOT" ]; then
+            validate_partition_type "$TGT_BOOT" "$GUID_LINUX" "Target Boot" || die "Invalid Target Boot"
+        fi
         validate_partition_type "$TGT_ROOT" "$GUID_LINUX" "Target Root" || die "Invalid Target Root"
     else
-        [ -n "$TARGET" ] || die "Specify a unified --target DEV, all four --target-* partitions, or scattered --source-* for partial migration."
+        [ -n "$TARGET" ] || die "Specify a unified --target DEV, --target-efi/--target-root partitions, or scattered --source-* for partial migration."
         if [ "$DRY_RUN" -eq 0 ] && [ ! -b "$TARGET" ]; then
             die "Target '$TARGET' is not a block device."
         fi
         UNIFIED_TARGET=1
         echo "Target Mode: Unified Block Device ($TARGET)"
         P=$(partition_prefix "$TARGET")
-        TGT_BIOS="${TARGET}${P}1"
-        TGT_EFI="${TARGET}${P}2"
-        TGT_BOOT="${TARGET}${P}3"
-        TGT_ROOT="${TARGET}${P}4"
-        # --update trusts the existing layout (we won't repartition or format
-        # it), so the disk must already carry our BIOS/EFI/boot/root layout.
-        if [ $UPDATE -eq 1 ]; then
-            validate_disk_structure "$TARGET" "$P" || \
-                die "Target $TARGET lacks the expected BIOS/EFI/boot/root layout (required for --update)."
+        if [ $UPDATE -eq 1 ] && [ -b "$TARGET" ]; then
+            # --update keeps the existing layout (we neither repartition nor
+            # format), so discover it rather than impose one: a clone that still
+            # carries a separate /boot keeps its own, a newer one does not.
+            info "Reading the existing layout of $TARGET..."
+            scan_disk_roles "$TARGET" TGT
+        else
+            # A fresh disk gets the three-partition layout: BIOS Boot, ESP, and
+            # a root filesystem that also holds /boot.
+            TGT_BIOS="${TARGET}${P}1"
+            TGT_EFI="${TARGET}${P}2"
+            TGT_ROOT="${TARGET}${P}3"
+            TGT_BOOT=""
         fi
     fi
 fi
 
+# --no-target-boot drops the /boot role from whatever the resolution above came
+# up with: a scattered target inherits --source-boot in place by default, and an
+# --update target inherits whatever the disk already carries, so an explicit
+# "this disk keeps /boot inside /" needs saying. On an already-partitioned disk
+# the old /boot partition is simply left behind, unused.
+if [ $NO_TGT_BOOT -eq 1 ] && [ -n "$TGT_BOOT" ]; then
+    info "Dropping the separate /boot ($TGT_BOOT) -- /boot will live inside the root filesystem."
+    [ $UPDATE -eq 0 ] || echo "Note: $TGT_BOOT stays on the disk, no longer used." >&2
+    TGT_BOOT=""
+fi
+
+# --target-efi-size only reaches parted, which only runs for a fresh unified
+# --target. Anywhere else the ESP already exists and the value would be silently
+# ignored -- say so instead.
+if [ -n "$TGT_EFI_SIZE" ] && { [ $UNIFIED_TARGET -eq 0 ] || [ $UPDATE -eq 1 ]; }; then
+    die "--target-efi-size only applies when partitioning a fresh --target disk (not with --update or individual --target-* partitions)."
+fi
+
+# Does the target keep /boot on its own partition, or inside /?
+if [ -n "$TGT_BOOT" ]; then TGT_SEP_BOOT=1; else TGT_SEP_BOOT=0; fi
+
 # Per-role migrate (target differs from source) vs in-place (same device).
+# MIGRATE_BOOT covers the /boot *partition* — whether one must be formatted and
+# given a fresh UUID — so it is 0 whenever the target has no separate /boot.
+# Never feed the empty strings of an absent role to same_dev(): uutils' readlink
+# resolves "" to the working directory, which would compare equal.
 if same_dev "$TGT_EFI"  "$SRC_EFI";  then MIGRATE_EFI=0;  else MIGRATE_EFI=1;  fi
-if same_dev "$TGT_BOOT" "$SRC_BOOT"; then MIGRATE_BOOT=0; else MIGRATE_BOOT=1; fi
 if same_dev "$TGT_ROOT" "$SRC_ROOT"; then MIGRATE_ROOT=0; else MIGRATE_ROOT=1; fi
+MIGRATE_BOOT=0
+if [ $TGT_SEP_BOOT -eq 1 ]; then
+    if [ $SRC_SEP_BOOT -eq 0 ] || ! same_dev "$TGT_BOOT" "$SRC_BOOT"; then MIGRATE_BOOT=1; fi
+fi
+
+# BOOT_PASS: does the /boot content need a transfer of its own? Only when the
+# source's /boot filesystem is not already the target's — i.e. both sides keep
+# /boot inside / (the root rsync carries it along), or both use the very same
+# /boot partition. Everything else needs a pass: the two separate partitions
+# differ, or the layout is being converted in one direction or the other.
+BOOT_PASS=1
+if [ $SRC_SEP_BOOT -eq 0 ] && [ $TGT_SEP_BOOT -eq 0 ]; then
+    BOOT_PASS=0
+elif [ $SRC_SEP_BOOT -eq 1 ] && [ $TGT_SEP_BOOT -eq 1 ] && same_dev "$TGT_BOOT" "$SRC_BOOT"; then
+    BOOT_PASS=0
+fi
 
 # Bootloader install scope: BIOS only when a BIOS target is given, EFI when the
 # ESP is fresh. (run_chroot_block always runs update-grub + update-initramfs.)
 if [ -n "$TGT_BIOS" ]; then INSTALL_GRUB_BIOS=1; else INSTALL_GRUB_BIOS=0; fi
 INSTALL_GRUB_EFI=$MIGRATE_EFI
 
-if [ $MIGRATE_EFI -eq 0 ] && [ $MIGRATE_BOOT -eq 0 ] && [ $MIGRATE_ROOT -eq 0 ] && [ -z "$SWAP_DEV" ]; then
+if [ $MIGRATE_EFI -eq 0 ] && [ $BOOT_PASS -eq 0 ] && [ $MIGRATE_ROOT -eq 0 ] && [ -z "$SWAP_DEV" ]; then
     die "Nothing to do: every role resolves in-place and no swap was given."
 fi
 
@@ -1047,7 +1382,8 @@ if [ $MIGRATE_EFI  -eq 1 ]; then migrated_targets+=("$TGT_EFI");  fi
 if [ $MIGRATE_BOOT -eq 1 ]; then migrated_targets+=("$TGT_BOOT"); fi
 if [ $MIGRATE_ROOT -eq 1 ]; then migrated_targets+=("$TGT_ROOT"); fi
 if [ "$DO_MKSWAP"  -eq 1 ]; then migrated_targets+=("$SWAP_DEV"); fi
-source_devs=("$SRC_EFI" "$SRC_BOOT" "$SRC_ROOT")
+source_devs=("$SRC_EFI" "$SRC_ROOT")
+if [ -n "$SRC_BOOT" ]; then source_devs+=("$SRC_BOOT"); fi
 if [ -n "$SRC_SWAP" ]; then source_devs+=("$SRC_SWAP"); fi
 if [ ${#migrated_targets[@]} -gt 0 ]; then
     for t in "${migrated_targets[@]}"; do
@@ -1067,7 +1403,8 @@ fi
 if [ $UNIFIED_TARGET -eq 1 ]; then
     busy_devs=("$TARGET")   # whole disk: lsblk reports every partition's use
 else
-    busy_devs=("$TGT_EFI" "$TGT_BOOT" "$TGT_ROOT")
+    busy_devs=("$TGT_EFI" "$TGT_ROOT")
+    if [ -n "$TGT_BOOT" ]; then busy_devs+=("$TGT_BOOT"); fi
     if [ "$DO_MKSWAP" -eq 1 ]; then busy_devs+=("$SWAP_DEV"); fi
 fi
 for t in "${busy_devs[@]}"; do
@@ -1135,12 +1472,18 @@ fi
 echo
 echo "About to install:"
 if [ $SCATTERED_SOURCE -eq 1 ]; then
-    echo "  Source:   scattered  (efi=$SRC_EFI boot=$SRC_BOOT root=$SRC_ROOT)"
+    echo "  Source:   scattered  (efi=$SRC_EFI boot=${SRC_BOOT:-<in root>} root=$SRC_ROOT)"
 else
     echo "  Source:   $SOURCE${LOOP_DEV:+  (loop $LOOP_DEV)}"
 fi
 echo "  EFI:      $(role_state $MIGRATE_EFI)  $TGT_EFI"
-echo "  /boot:    $(role_state $MIGRATE_BOOT)  $TGT_BOOT"
+if [ $TGT_SEP_BOOT -eq 1 ]; then
+    echo "  /boot:    $(role_state $MIGRATE_BOOT)  $TGT_BOOT"
+elif [ $SRC_SEP_BOOT -eq 1 ]; then
+    echo "  /boot:    COLLAPSE  into the root filesystem (no separate partition)"
+else
+    echo "  /boot:    in the root filesystem"
+fi
 echo "  / (root): $(role_state $MIGRATE_ROOT)  $TGT_ROOT"
 if [ -n "$SWAP_DEV" ]; then
     if [ "$DO_MKSWAP" -eq 1 ]; then echo "  swap:     reformat  $SWAP_DEV"; else echo "  swap:     reuse     $SWAP_DEV"; fi
@@ -1158,6 +1501,15 @@ else
     echo "  Bootldr:  kept as-is — only update-grub + update-initramfs run"
 fi
 echo "  Mounts:   target=$MNT  source=$SRC"
+if [ $UNIFIED_TARGET -eq 1 ] && [ $UPDATE -eq 0 ]; then
+    echo "  Layout:   ${ESP_MIB} MiB ESP, root to 100%${TGT_EFI_SIZE:+  (--target-efi-size)}"
+fi
+if [ -n "$INODES_ROOT" ] && [ $MIGRATE_ROOT -eq 1 ] && [ $UPDATE -eq 0 ]; then
+    echo "  Inodes:   root mkfs -N $INODES_ROOT (--inodes-root override)"
+fi
+if [ $NO_TRIM -eq 1 ]; then
+    echo "  Trim:     skipped (--no-trim)"
+fi
 if [ -n "$EXCLUDE_FROM" ]; then
     if [ $UPDATE -eq 1 ]; then
         echo "  Excludes: --exclude-from=$EXCLUDE_FROM (listed paths purged from target via --delete-excluded)"
@@ -1181,13 +1533,15 @@ if [ $UNIFIED_TARGET -eq 1 ] && [ $UPDATE -eq 0 ]; then
     run sudo parted -s "$TARGET" mklabel gpt
     run sudo parted -s "$TARGET" mkpart primary 1MiB 2MiB
     run sudo parted -s "$TARGET" set 1 bios_grub on
-    run sudo parted -s "$TARGET" mkpart primary fat32 2MiB 258MiB
+    ESP_END=$(( 2 + ESP_MIB ))   # the ESP starts at 2 MiB, after the BIOS Boot
+    run sudo parted -s "$TARGET" mkpart primary fat32 2MiB "${ESP_END}MiB"
     run sudo parted -s "$TARGET" set 2 esp on
-    run sudo parted -s "$TARGET" mkpart primary ext4 258MiB 770MiB
-    run sudo parted -s "$TARGET" mkpart primary ext4 770MiB 100%
+    # No separate /boot: root and /boot are formatted with the same ext4 feature
+    # set and GRUB reads both, so the partition would buy nothing.
+    run sudo parted -s "$TARGET" mkpart primary ext4 "${ESP_END}MiB" 100%
     # Wait for OUR partition nodes rather than the global udev queue, which a
     # concurrent instance can keep busy past the settle timeout.
-    run sudo udevadm wait --timeout=30 "$TGT_BIOS" "$TGT_EFI" "$TGT_BOOT" "$TGT_ROOT"
+    run sudo udevadm wait --timeout=30 "$TGT_BIOS" "$TGT_EFI" "$TGT_ROOT"
 fi
 
 # ---- Format the migrated roles ----
@@ -1210,17 +1564,24 @@ if [ $UPDATE -eq 0 ]; then
     if [ $MIGRATE_ROOT -eq 1 ]; then
         run sudo wipefs -q -a "$TGT_ROOT"
 
-        TGT_BYTES=$(lsblk -dbno SIZE "$TGT_ROOT" 2>/dev/null) || TGT_BYTES=""
-        if [ -z "$TGT_BYTES" ]; then
-            # Only dry-run may proceed without a size (the partition node may
-            # not exist yet); a real run must not fabricate the inode count.
-            [ "$DRY_RUN" -eq 1 ] || die "Cannot determine size of $TGT_ROOT"
-            TGT_BYTES=$((16 * 1024**3))
+        if [ -n "$INODES_ROOT" ]; then
+            # Pinned by the caller: no probing, and no minimum imposed either --
+            # an explicit count is taken at face value.
+            TARGET_INODES="$INODES_ROOT"
+            info "Root inode count pinned by --inodes-root: $TARGET_INODES"
+        else
+            TGT_BYTES=$(lsblk -dbno SIZE "$TGT_ROOT" 2>/dev/null) || TGT_BYTES=""
+            if [ -z "$TGT_BYTES" ]; then
+                # Only dry-run may proceed without a size (the partition node may
+                # not exist yet); a real run must not fabricate the inode count.
+                [ "$DRY_RUN" -eq 1 ] || die "Cannot determine size of $TGT_ROOT"
+                TGT_BYTES=$((16 * 1024**3))
+            fi
+            ROOT_BYTES_PER_INODE=$(( 1024**4 / (4 * 1024**2) ))
+            CALC_INODES=$(( TGT_BYTES / ROOT_BYTES_PER_INODE ))
+            MIN_INODES=$(( 3*1024**2/2 )) # 1.5M inodes minimum
+            TARGET_INODES=$(( CALC_INODES < MIN_INODES ? MIN_INODES : CALC_INODES ))
         fi
-        ROOT_BYTES_PER_INODE=$(( 1024**4 / (4 * 1024**2) ))
-        CALC_INODES=$(( TGT_BYTES / ROOT_BYTES_PER_INODE ))
-        MIN_INODES=$(( 3*1024**2/2 )) # 1.5M inodes minimum
-        TARGET_INODES=$(( CALC_INODES < MIN_INODES ? MIN_INODES : CALC_INODES ))
 
         run sudo mkfs.ext4 -vF -m 0 -L root -N "$TARGET_INODES" -E lazy_itable_init=0,lazy_journal_init=0 -O sparse_super2 "$TGT_ROOT"
     fi
@@ -1231,15 +1592,22 @@ if [ "$DO_MKSWAP" -eq 1 ]; then
 fi
 
 # ---- New UUIDs: fresh for migrated roles, unchanged for in-place ----
+# NEW_UUID_BOOT is "the UUID of the filesystem that holds /boot", so without a
+# separate /boot partition it is the root UUID — which is exactly what the EFI
+# routing stub must search for, and what update-grub puts in its own search line.
 if [ "$DRY_RUN" -eq 0 ]; then
     if [ $MIGRATE_EFI  -eq 1 ]; then NEW_UUID_EFI=$(blkid_uuid "$TGT_EFI");   else NEW_UUID_EFI="$OLD_UUID_EFI";   fi
-    if [ $MIGRATE_BOOT -eq 1 ]; then NEW_UUID_BOOT=$(blkid_uuid "$TGT_BOOT"); else NEW_UUID_BOOT="$OLD_UUID_BOOT"; fi
     if [ $MIGRATE_ROOT -eq 1 ]; then NEW_UUID_ROOT=$(blkid_uuid "$TGT_ROOT"); else NEW_UUID_ROOT="$OLD_UUID_ROOT"; fi
+    if [ $TGT_SEP_BOOT -eq 0 ]; then                 NEW_UUID_BOOT="$NEW_UUID_ROOT"
+    elif [ $MIGRATE_BOOT -eq 1 ]; then               NEW_UUID_BOOT=$(blkid_uuid "$TGT_BOOT")
+    else                                             NEW_UUID_BOOT="$OLD_UUID_BOOT"; fi
     if [ -n "$SWAP_DEV" ]; then NEW_UUID_SWAP=$(blkid_uuid "$SWAP_DEV"); fi
 else
     if [ $MIGRATE_EFI  -eq 1 ]; then NEW_UUID_EFI="dry-run-new-efi";   else NEW_UUID_EFI="$OLD_UUID_EFI";   fi
-    if [ $MIGRATE_BOOT -eq 1 ]; then NEW_UUID_BOOT="dry-run-new-boot"; else NEW_UUID_BOOT="$OLD_UUID_BOOT"; fi
     if [ $MIGRATE_ROOT -eq 1 ]; then NEW_UUID_ROOT="dry-run-new-root"; else NEW_UUID_ROOT="$OLD_UUID_ROOT"; fi
+    if [ $TGT_SEP_BOOT -eq 0 ]; then                 NEW_UUID_BOOT="$NEW_UUID_ROOT"
+    elif [ $MIGRATE_BOOT -eq 1 ]; then               NEW_UUID_BOOT="dry-run-new-boot"
+    else                                             NEW_UUID_BOOT="$OLD_UUID_BOOT"; fi
     if [ -n "$SWAP_DEV" ]; then NEW_UUID_SWAP="dry-run-new-swap"; fi
 fi
 
@@ -1268,7 +1636,11 @@ else
     MOUNTS_DONE=1
     sudo mount "$TGT_ROOT" "$MNT"
     sudo mkdir -p "$MNT/boot"
-    sudo mount "$TGT_BOOT" "$MNT/boot"
+    # Without a separate /boot partition, $MNT/boot is simply a directory on the
+    # root filesystem — the ESP still mounts under it either way.
+    if [ $TGT_SEP_BOOT -eq 1 ]; then
+        sudo mount "$TGT_BOOT" "$MNT/boot"
+    fi
     sudo mkdir -p "$MNT/boot/efi"
     sudo mount "$TGT_EFI" "$MNT/boot/efi"
 
@@ -1308,22 +1680,42 @@ else
     fi
     if [ -n "$EXCLUDE_FROM" ]; then RSYNC_OPTS+=(--exclude-from="$EXCLUDE_FROM"); fi
 
+    # When /boot gets a pass of its own, keep the root transfer off it entirely.
+    # Two rules, not one: "- /boot/" hides it from the sender, and the explicit
+    # receiver-side "P /boot/" is what stops --delete from emptying the target's
+    # /boot before the second pass refills it. A plain exclude would not do —
+    # --delete-excluded (added when --update and --exclude-from are combined)
+    # demotes unqualified rules to sender-side only. Without a pass of its own,
+    # /boot is an ordinary directory on both sides and simply rides along.
+    BOOT_FILTERS=()
+    if [ $BOOT_PASS -eq 1 ]; then
+        BOOT_FILTERS=(--filter='- /boot/' --filter='P /boot/')
+    fi
+
     if [ $MIGRATE_ROOT -eq 1 ]; then
         # Swap files are never transferred (rsync -S would punch them full of
         # holes); they are re-created on the target once the sync is done.
         scan_swapfiles
         echo "Rsyncing root filesystem..."
-        sudo rsync "${RSYNC_OPTS[@]}" \
+        sudo rsync "${RSYNC_OPTS[@]}" "${BOOT_FILTERS[@]}" \
             --exclude={"/dev/*","/proc/*","/sys/*","/tmp/*","/run/*","/media/*","/mnt/*","/lost+found"} \
             "${SWAP_EXCLUDES[@]}" \
             "$SRC/" "$MNT/"
         rebuild_swapfiles
     fi
-    if [ $MIGRATE_BOOT -eq 1 ]; then
-        sudo mount -r -o noatime "$SRC_BOOT" "$SRC/boot" || \
-            die "Cannot mount source /boot $SRC_BOOT read-only (dirty journal? run e2fsck on it once and retry)."
-        echo "Rsyncing /boot filesystem..."
-        sudo rsync "${RSYNC_OPTS[@]}" "$SRC/boot/" "$MNT/boot/"
+    if [ $BOOT_PASS -eq 1 ]; then
+        # The source side is a mount of its own /boot partition, or — when the
+        # source keeps /boot inside / — already a directory under $SRC.
+        if [ $SRC_SEP_BOOT -eq 1 ]; then
+            sudo mount -r -o noatime "$SRC_BOOT" "$SRC/boot" || \
+                die "Cannot mount source /boot $SRC_BOOT read-only (dirty journal? run e2fsck on it once and retry)."
+        fi
+        echo "Rsyncing /boot..."
+        # /boot/efi is the target's mounted ESP, which the EFI pass below owns:
+        # keep this transfer out of it (and out of --delete's reach) now that
+        # $MNT/boot may be an ordinary directory rather than a mount point.
+        sudo rsync "${RSYNC_OPTS[@]}" --filter='- /efi/' --filter='P /efi/' \
+            "$SRC/boot/" "$MNT/boot/"
     fi
     if [ $MIGRATE_EFI -eq 1 ]; then
         sudo mount -r "$SRC_EFI" "$SRC/boot/efi"
@@ -1379,17 +1771,38 @@ echo "=========================================="
 echo " Phase 7: Teardown & Cleanup              "
 echo "=========================================="
 # Discard unused blocks on the filesystems we wrote: keeps flash media fast and
-# lets a loop-attached .img target shrink (hole punching). Skipped when the
-# medium cannot discard (spinning disks), so a dry run only shows trims that
-# would actually happen; a failure on discard-capable media is reported but
-# never aborts the teardown.
-if [ $MIGRATE_EFI  -eq 1 ] && supports_discard "$TGT_EFI";  then run sudo fstrim -v "$MNT/boot/efi" || true; fi
-if [ $MIGRATE_BOOT -eq 1 ] && supports_discard "$TGT_BOOT"; then run sudo fstrim -v "$MNT/boot"     || true; fi
-if [ $MIGRATE_ROOT -eq 1 ] && supports_discard "$TGT_ROOT"; then run sudo fstrim -v "$MNT"          || true; fi
+# lets a loop-attached .img target shrink, since the loop driver turns discards
+# into FALLOC_FL_PUNCH_HOLE on the backing file (which is why a fallocate'd image
+# only becomes sparse if this runs). Skipped when the medium cannot discard
+# (spinning disks), so a dry run only shows trims that would actually happen; a
+# failure on discard-capable media is reported but never aborts the teardown.
+# --no-trim suppresses it outright, for a medium where the trim is slow, pointless
+# or unwanted (e.g. a target whose free space should stay written).
+if [ $NO_TRIM -eq 1 ]; then
+    echo "Skipping fstrim on the written filesystems (--no-trim)."
+else
+    if [ $MIGRATE_EFI  -eq 1 ] && supports_discard "$TGT_EFI";  then run sudo fstrim -v "$MNT/boot/efi" || true; fi
+    if [ $TGT_SEP_BOOT -eq 1 ] && [ $MIGRATE_BOOT -eq 1 ] && supports_discard "$TGT_BOOT"; then
+        run sudo fstrim -v "$MNT/boot" || true
+    fi
+    if [ $MIGRATE_ROOT -eq 1 ] && supports_discard "$TGT_ROOT"; then run sudo fstrim -v "$MNT"          || true; fi
+fi
 if [ "$DRY_RUN" -eq 0 ]; then
     echo "[Teardown] Unmounting filesystems and releasing locks..."
 fi
 cleanup   # also runs from the EXIT trap on any earlier failure
+
+# With /boot inside /, GRUB has to read the root filesystem itself rather than a
+# deliberately conservative /boot. Ask GRUB's own ext2 driver, now that the
+# filesystem is unmounted and consistent -- advisory, since a failure here means
+# the disk will not boot but nothing on it is wrong to fix.
+if [ "$DRY_RUN" -eq 0 ] && [ $TGT_SEP_BOOT -eq 0 ] && command -v grub-fstest >/dev/null 2>&1; then
+    if sudo grub-fstest "$TGT_ROOT" ls /boot/grub/grub.cfg >/dev/null 2>&1; then
+        echo "  [PASS] GRUB can read /boot/grub/grub.cfg on $TGT_ROOT."
+    else
+        echo "Warning: GRUB's own ext2 driver cannot read /boot/grub/grub.cfg on $TGT_ROOT -- this disk is unlikely to boot." >&2
+    fi
+fi
 
 if [ $UNIFIED_TARGET -eq 1 ]; then
     if [ $UPDATE -eq 1 ]; then
@@ -1400,7 +1813,7 @@ if [ $UNIFIED_TARGET -eq 1 ]; then
 else
     roles=""
     if [ $MIGRATE_ROOT -eq 1 ]; then roles="$roles /"; fi
-    if [ $MIGRATE_BOOT -eq 1 ]; then roles="$roles /boot"; fi
+    if [ $BOOT_PASS    -eq 1 ]; then roles="$roles /boot"; fi
     if [ $MIGRATE_EFI  -eq 1 ]; then roles="$roles EFI"; fi
     if [ -n "$SWAP_DEV" ]; then roles="$roles swap"; fi
     verb="Migrated"; [ $UPDATE -eq 1 ] && verb="Synced"
