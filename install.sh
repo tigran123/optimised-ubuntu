@@ -1222,7 +1222,7 @@ if [ $UPDATE -eq 0 ]; then
         MIN_INODES=$(( 3*1024**2/2 )) # 1.5M inodes minimum
         TARGET_INODES=$(( CALC_INODES < MIN_INODES ? MIN_INODES : CALC_INODES ))
 
-        run sudo mkfs.ext4 -vF -m 0 -L root -N "$TARGET_INODES" -E lazy_itable_init=0,lazy_journal_init=0 -O sparse_super2,orphan_file,metadata_csum_seed "$TGT_ROOT"
+        run sudo mkfs.ext4 -vF -m 0 -L root -N "$TARGET_INODES" -E lazy_itable_init=0,lazy_journal_init=0 -O sparse_super2 "$TGT_ROOT"
     fi
 fi
 if [ "$DO_MKSWAP" -eq 1 ]; then
