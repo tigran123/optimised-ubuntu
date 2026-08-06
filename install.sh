@@ -884,8 +884,12 @@ Other:
                               root filesystem is actually formatted (not under
                               --update, which keeps the existing one).
   --no-trim                   Skip the closing fstrim of the written filesystems.
-                              By default they are trimmed when the medium can
-                              discard, which keeps flash fast and makes a
+                              By default the ESP is trimmed on every run (mkfs.fat
+                              has no discard of its own) but the ext4 filesystems
+                              only under --update: a fresh mkfs.ext4 has already
+                              discarded the whole partition and the rsync that
+                              follows only allocates, so nothing is left to
+                              reclaim. Trimming keeps flash fast and makes a
                               loop-attached .img sparse (the loop driver turns
                               discards into hole punches on the backing file, so
                               a fallocate'd image only shrinks if this runs).
@@ -1771,14 +1775,29 @@ echo "=========================================="
 # failure on discard-capable media is reported but never aborts the teardown.
 # --no-trim suppresses it outright, for a medium where the trim is slow, pointless
 # or unwanted (e.g. a target whose free space should stay written).
+#
+# The ext4 roles are trimmed only under --update. Without it they were just
+# mkfs.ext4'd, and mke2fs discards the whole partition at format time (its
+# "discard" extended option is the default); the rsync that follows only ever
+# allocates blocks, so no block transitions back to free and the closing fstrim
+# would merely re-discard ranges the mkfs already discarded. Under --update the
+# existing filesystem is kept and rsync --delete really does free blocks, so the
+# trim is the only thing that reclaims them. The ESP is the exception in the
+# other direction: mkfs.fat has no discard of its own, so a freshly formatted
+# 256 MiB ESP holding a few MiB of bootloader is only ever released here -- which
+# on a loop-backed .img is the difference between a sparse and a solid ESP.
 if [ $NO_TRIM -eq 1 ]; then
     echo "Skipping fstrim on the written filesystems (--no-trim)."
 else
-    if [ $MIGRATE_EFI  -eq 1 ] && supports_discard "$TGT_EFI";  then run sudo fstrim -v "$MNT/boot/efi" || true; fi
-    if [ $TGT_SEP_BOOT -eq 1 ] && [ $MIGRATE_BOOT -eq 1 ] && supports_discard "$TGT_BOOT"; then
-        run sudo fstrim -v "$MNT/boot" || true
+    if [ $MIGRATE_EFI -eq 1 ] && supports_discard "$TGT_EFI"; then run sudo fstrim -v "$MNT/boot/efi" || true; fi
+    if [ $UPDATE -eq 1 ]; then
+        if [ $TGT_SEP_BOOT -eq 1 ] && [ $MIGRATE_BOOT -eq 1 ] && supports_discard "$TGT_BOOT"; then
+            run sudo fstrim -v "$MNT/boot" || true
+        fi
+        if [ $MIGRATE_ROOT -eq 1 ] && supports_discard "$TGT_ROOT"; then run sudo fstrim -v "$MNT" || true; fi
+    elif [ $MIGRATE_ROOT -eq 1 ] || { [ $TGT_SEP_BOOT -eq 1 ] && [ $MIGRATE_BOOT -eq 1 ]; }; then
+        echo "Skipping fstrim on the freshly formatted ext4 filesystems (mkfs.ext4 already discarded them)."
     fi
-    if [ $MIGRATE_ROOT -eq 1 ] && supports_discard "$TGT_ROOT"; then run sudo fstrim -v "$MNT"          || true; fi
 fi
 if [ "$DRY_RUN" -eq 0 ]; then
     echo "[Teardown] Unmounting filesystems and releasing locks..."
