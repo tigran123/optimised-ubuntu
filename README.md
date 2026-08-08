@@ -33,31 +33,33 @@ $ ./install.sh --image Ubuntu26-Portable-16GB.img --target /dev/sda
 
 The `.img` file is distributed elsewhere -- too big to upload on GitHub, plus all the standard mp3, etc issues I don't want to have to deal with.
 
-`install.sh` is the single entry point for every flavour of deployment. Besides flashing a whole image/device, it can take a *scattered* source whose partitions live on different disks (`--source-efi` / `--source-root`, plus `--source-boot` if that system has a separate `/boot`) and write to either a whole device or individual `--target-*` partitions. Each role is independently left in place, migrated (reformatted + copied), or — with `--update` — **synced** onto its existing filesystem with `rsync --delete` (no reformat), so refreshing an already-installed clone is fast instead of a full rebuild. For example, to incrementally sync a system whose `/boot/efi` and `/boot` are on `sda` and whose root is on an NVMe drive onto an already-prepared disk `sdb` that also has a separate `/boot`:
+`install.sh` is the single entry point for every flavour of deployment. Besides flashing a whole image/device, it can take a *scattered* source whose partitions live on different disks (`--source-efi` / `--source-root`) and write to either a whole device or individual `--target-*` partitions. Each role is independently left in place, migrated (reformatted + copied), or — with `--update` — **synced** onto its existing filesystem with `rsync --delete` (no reformat), so refreshing an already-installed clone is fast instead of a full rebuild. For example, to incrementally sync a system whose `/boot/efi` is on `sda` and whose root is on an NVMe drive onto an already-prepared disk `sdb`:
 
 ```
 $ ./install.sh \
-    --source-efi /dev/sda2 --source-boot /dev/sda3 --source-root /dev/nvme0n1p1 \
+    --source-efi /dev/sda2 --source-root /dev/nvme0n1p1 \
     --target-bios-boot /dev/sdb1 --target-efi /dev/sdb2 \
-    --target-boot /dev/sdb3 --target-root /dev/sdb4 --update
+    --target-root /dev/sdb3 --update
 ```
 
-A separate `/boot` is optional on **both** sides, and the script converts between the layouts. Omitting `--target-boot` folds the source's `/boot` into the target's root filesystem (its `fstab` entry is commented out); supplying one against a source that has none splits it back out (an `fstab` entry is inserted right after `/`). A whole `--target` disk is partitioned with the new three-partition layout, while `--target ... --update` *detects* what the disk already has, so an older four-partition clone keeps its `/boot` and keeps syncing:
+`/boot` always lives inside `/`, on both sides — separate-`/boot` support was removed once no machine here still had one. A source that keeps `/boot` on a filesystem of its own is refused (its `fstab` is checked as soon as the source root is mounted, before anything is copied), and a leftover `/boot` partition on a target disk is left alone, unused.
+
+Roles are found by GPT type and filesystem label, not by partition number, so anything *else* on either disk is none of the script's business. Deploying from a machine whose NVMe carries a big data partition alongside the rootfs needs no special flags:
 
 ```
-$ ./install.sh \
-    --source-efi /dev/sda2 --source-boot /dev/sda3 --source-root /dev/nvme0n1p1 \
-    --target-bios-boot /dev/sdb1 --target-efi /dev/sdb2 --target-root /dev/sdb3
+$ ./install.sh --source /dev/nvme0n1 --target /dev/sdb
 ```
 
-To produce an *impersonal* clone (stripped of personal data), pass `--exclude-from FILE`, which hands the file to `rsync --exclude-from`. List one path per line (see the included `exclude.txt` for the kind of thing I strip — caches, histories, credentials, downloads, etc.):
+The one case that is an error rather than a guess is a disk with several unlabelled Linux partitions and none labelled `root`: the script stops and names the candidates, since picking wrong would mean reformatting the wrong partition. Say which one it is with `--source-root` / `--target-root`, or label it (`sudo e2label /dev/sdX3 root`).
+
+To produce an *impersonal* clone (stripped of personal data), pass `--exclude-from FILE`, which hands the file to `rsync --exclude-from`. List one path per line (see the included `exclude-personal.txt` for the kind of thing I strip — caches, histories, credentials, downloads, etc.):
 
 ```
-$ ./install.sh --image Ubuntu26-Portable-16GB.img --target /dev/sda --exclude-from exclude.txt
+$ ./install.sh --image Ubuntu26-Portable-16GB.img --target /dev/sda --exclude-from exclude-personal.txt
 ```
 
 This works with or without `--update`. On an `--update` re-sync it additionally passes `--delete-excluded`, so any listed paths that already exist on the target are *removed* (rsync otherwise protects excluded files from deletion, which would leave stale personal data behind).
 
-A **swap file** is never copied. `rsync -S` would turn its gigabytes of zeros into holes on the target, and the kernel then refuses it on the next boot with `swapon: /var/swap: skipping - it appears to have holes`. So every swap file listed in the source's `/etc/fstab` is excluded from the transfer and re-created on the target instead — same size, same label and UUID, `0600 root:root`, freshly `mkswap`ed — which is also much faster than shipping all those zeros over USB. If your `--exclude-from` file lists the swap file (as `exclude.txt` does), it is dropped instead: no swap file is created and its `fstab` entry is commented out, so a minimal boot disk stays swapless and does not boot into a failing `swapon`.
+A **swap file** is never copied. `rsync -S` would turn its gigabytes of zeros into holes on the target, and the kernel then refuses it on the next boot with `swapon: /var/swap: skipping - it appears to have holes`. So every swap file listed in the source's `/etc/fstab` is excluded from the transfer and re-created on the target instead — same size, same label and UUID, `0600 root:root`, freshly `mkswap`ed — which is also much faster than shipping all those zeros over USB. If your `--exclude-from` file lists the swap file (as `exclude-personal.txt` does), it is dropped instead: no swap file is created and its `fstab` entry is commented out, so a minimal boot disk stays swapless and does not boot into a failing `swapon`.
 
 Always preview a run with `--dry-run` first; it prints every destructive command instead of executing it. See `./install.sh --help` for the full set of options.

@@ -38,7 +38,7 @@ There is deliberately **no separate `/boot` partition**. It only ever existed be
 sudo grub-fstest /dev/sdb3 ls /boot/grub/
 ```
 
-(If you are working with a drive that still has the older four-partition layout, keep its `/boot` on partition 3 and shift the root to partition 4 — everything below works either way, and `install.sh` detects which layout a disk has.)
+Note that this is the *manual* method, and it is the one place a separate `/boot` still appears: the source machine described above has one, and the hand-run `rsync` below flattens it into the target's root. `install.sh` no longer does — separate-`/boot` support was removed from it entirely, and it refuses a source whose `fstab` still mounts `/boot` from a filesystem of its own. To deploy such a machine with `install.sh`, flatten it first (or follow the manual steps here).
 
 **2. Format the Filesystems**
 
@@ -168,7 +168,7 @@ vi /boot/efi/EFI/BOOT/grub.cfg
 
 ```
 
-Paste the universal logic, ensuring you insert the UUID of **whichever filesystem holds `/boot`** — that is the root partition `/dev/sdb3` on this layout, or a dedicated `/boot` partition on a disk that still has one. This script dynamically detects which of the two it landed on and adjusts its `$prefix` automatically, so the same stub works either way:
+Paste the universal logic, ensuring you insert the UUID of **whichever filesystem holds `/boot`** — the root partition `/dev/sdb3` on this layout, or a dedicated `/boot` partition on a disk that still has one. The stub detects which of the two it landed on and adjusts its `$prefix` automatically, so the same text works either way; `install.sh` writes it verbatim, always keyed to the root filesystem.
 
 ```text
 search --no-floppy --fs-uuid --set=root YOUR-BOOT-FILESYSTEM-UUID
