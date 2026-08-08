@@ -200,25 +200,30 @@ scan_disk_roles() {
     local -a linux_parts=()
     local bios="" efi="" boot="" root=""
 
-    while read -r dev; do
+    # One lsblk for the whole disk, rather than one per partition per column.
+    # Default IFS on purpose: lsblk emits no tabs in any output mode (-l pads
+    # its columns with spaces), and word splitting collapses that padding. A row
+    # whose PARTTYPE is empty shifts its remaining fields left, but that only
+    # happens for the whole-disk row (skipped below) and for the non-partition
+    # children -l flattens into the list (dm/LVM/crypt), whose FSTYPE can never
+    # look like a GUID -- they fall through the case untouched either way.
+    while read -r dev ptype fstype label; do
         [ "$dev" = "$disk" ] && continue
-        ptype=$(lsblk -dno PARTTYPE "$dev" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+        ptype=${ptype,,}
         case "$ptype" in
             "$GUID_BIOS")
                 bios="$dev" ;;
             "$GUID_EFI")
                 efi="$dev" ;;
             "$GUID_LINUX")
-                fstype=$(lsblk -dno FSTYPE "$dev" 2>/dev/null)
                 [ "$fstype" = swap ] && continue   # a Linux-typed swap: not /boot or /
-                label=$(lsblk -dno LABEL "$dev" 2>/dev/null)
                 case "$label" in
                     boot) boot="$dev" ;;
                     root) root="$dev" ;;
                     *)    linux_parts+=("$dev") ;;
                 esac ;;
         esac
-    done < <(lsblk -lnpo NAME "$disk")
+    done < <(lsblk -lnpo NAME,PARTTYPE,FSTYPE,LABEL "$disk")
 
     # Any Linux-fs partitions we could not tell apart by label fall back to
     # on-disk order: the first unclaimed one is /boot, the next is root. The
@@ -1570,11 +1575,7 @@ fi
 if [ $UPDATE -eq 0 ]; then
     if [ $MIGRATE_EFI -eq 1 ]; then
         run sudo wipefs -q -a "$TGT_EFI"
-        if [ "$DRY_RUN" -eq 1 ]; then
-            run sudo mkfs.fat -F32 -n EFI "$TGT_EFI"
-        else
-            sudo mkfs.fat -F32 -n EFI "$TGT_EFI"
-        fi
+        run sudo mkfs.fat -F32 -n EFI "$TGT_EFI"
     fi
     if [ $MIGRATE_BOOT -eq 1 ]; then
         run sudo wipefs -q -a "$TGT_BOOT"
