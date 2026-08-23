@@ -71,7 +71,31 @@ Roles are found by GPT type and filesystem label, not by partition number, so an
 $ ./install.sh --source /dev/nvme0n1 --target /dev/sdb
 ```
 
-The one case that is an error rather than a guess is a disk with several unlabelled Linux partitions and none labelled `root`: the script stops and names the candidates, since picking wrong would mean reformatting the wrong partition. Say which one it is with `--source-root` / `--target-root`, or label it (`sudo e2label /dev/sdX3 root`).
+The one case that is an error rather than a guess is a disk whose root is ambiguous — several unlabelled Linux partitions and none labelled `root`, or several *labelled* `root`: the script stops and names the candidates, since picking wrong would mean reformatting the wrong partition. Say which one it is with `--source-root` / `--target-root`, or label it (`sudo e2label /dev/sdX3 root`).
+
+## One disk, several machines, one menu
+
+GRUB's boot directory goes on the **ESP** — `grub-install --boot-directory=/boot/efi/boot`, for legacy BIOS and UEFI alike — so the boot menu belongs to the disk rather than to any one root filesystem. A disk can therefore carry a rootfs per machine (desktop, laptop, iMac), each holding only its platform-specific state, with `/home`, `/usr/local` and the rest bind-mounted out of a shared data partition, and all of them booting from one shared ESP:
+
+```
+/boot/efi/boot/grub/grub.cfg            the master menu, rebuilt on every install
+/boot/efi/boot/grub/entries/<uuid>.cfg  one file per rootfs, named by its UUID
+/boot/efi/boot/grub/custom.cfg          hand-written extras, sourced last
+```
+
+Each install writes **only its own** entry file — a `GUI` / `TTY` pair whose kernel command line is taken from that system's `/etc/default/grub`, so every machine keeps its own quirks — and then rebuilds the master over whatever entry files are present, carrying over the `timeout` and `default` already set there. Deleting an entry file retires that system from the menu; nothing else refers to it.
+
+Adding a second machine's rootfs to a disk that already boots one means keeping the shared ESP, which `--keep-efi` does: its filesystem and UUID are left alone (formatting it would drop the other systems' entries and invalidate the ESP UUID in their `fstab`s), and only the named root partition is formatted and filled:
+
+```
+$ ./install.sh --image Ubuntu26-Portable-16GB.img --keep-efi \
+    --target-bios-boot /dev/sde1 --target-efi /dev/sde2 \
+    --target-root /dev/sde5 --brand Laptop
+```
+
+`--brand` is worth passing here: without it every slot on the disk is named after the disk's own model, and the menu ends up listing the same title three times. The summary printed before the confirmation gate names the entry being registered, the command line it will boot with, and every system already registered on that ESP that the run will keep.
+
+The `fstab` of such a system survives the copy: a mount whose UUID is on the disk being installed is kept (a shared `/data` partition is present exactly when the system is), and so are the bind mounts hanging off it. Mounts naming *another* machine's disk are still commented out, along with the binds that depend on them — a clone that boots elsewhere must not block on a device that is not there.
 
 To produce an *impersonal* clone (stripped of personal data), pass `--exclude-from FILE`, which hands the file to `rsync --exclude-from`. List one path per line (see the included `exclude-personal.txt` for the kind of thing I strip — caches, histories, credentials, downloads, etc.):
 

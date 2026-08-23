@@ -144,44 +144,69 @@ sudo chroot /mnt
 
 ---
 
-### Phase 5: Bootloader Architecture & Universal Routing
+### Phase 5: Bootloader Architecture & the Menu on the ESP
 
-You are now inside the cloned OS on the portable SSD. We will install the payloads for both UEFI and CSM, and drop the universal routing stub.
+You are now inside the cloned OS on the portable SSD. We install the payloads for both UEFI and CSM, and put GRUB's boot directory — and with it the menu — on the ESP, where it belongs to the disk rather than to any one root filesystem.
 
 **1. Install the Payloads**
 
 ```bash
-# 1. Install standard MBR payload into the BIOS Boot partition for legacy CSM
-grub-install --target=i386-pc /dev/sdb
+# 1. Standard MBR payload in the BIOS Boot partition, for legacy CSM
+grub-install --target=i386-pc --boot-directory=/boot/efi/boot /dev/sdb
 
-# 2. Install the mathematically pure, un-signed UEFI payload on the fallback path
-grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --no-uefi-secure-boot
+# 2. The un-signed UEFI payload on the fallback path
+grub-install --target=x86_64-efi --efi-directory=/boot/efi \
+             --boot-directory=/boot/efi/boot --removable --no-uefi-secure-boot
 
 ```
 
-**2. Create the Universal Routing Stub**
-If Canonical's script recreated the `ubuntu` directory, purge it, then write our universal `grub.cfg`.
+`--boot-directory=/boot/efi/boot` is the whole trick: both payloads get their `$prefix` pointed at `/boot/grub` **on the ESP**, so `/boot/efi/boot/grub` is the real `/boot/grub` for BIOS and UEFI alike. Because the boot directory sits on the ESP itself, `grub-install` embeds a device-relative prefix in the EFI image — so there is no routing stub to write, and an ESP built this way holds `EFI/BOOT/BOOTX64.EFI` and no `EFI/BOOT/grub.cfg`. (Delete a stale one from an older build; nothing reads it.)
+
+**2. Write the Master Menu**
+
+If Canonical's script recreated the `ubuntu` directory, purge it, then write the menu that GRUB will actually read.
 
 ```bash
 rm -rf /boot/efi/EFI/ubuntu
-vi /boot/efi/EFI/BOOT/grub.cfg
+rm -f  /boot/efi/EFI/BOOT/grub.cfg
+mkdir -p /boot/efi/boot/grub/entries
+vi /boot/efi/boot/grub/grub.cfg
 
 ```
 
-Paste the universal logic, ensuring you insert the UUID of **whichever filesystem holds `/boot`** — the root partition `/dev/sdb3` on this layout, or a dedicated `/boot` partition on a disk that still has one. The stub detects which of the two it landed on and adjusts its `$prefix` automatically, so the same text works either way; `install.sh` writes it verbatim, keyed to whichever filesystem holds `/boot` on the disk it just built.
+The master holds nothing machine-specific: it sources one file per registered root filesystem, so a disk can carry a rootfs per machine behind this single ESP and each install only ever touches its own entry file.
 
 ```text
-search --no-floppy --fs-uuid --set=root YOUR-BOOT-FILESYSTEM-UUID
+set timeout=5
+set default=0
 
-if [ -f ($root)/boot/grub/grub.cfg ]; then
-    set prefix=($root)/boot/grub
-else
-    set prefix=($root)/grub
-fi
+insmod part_gpt
+insmod ext2
 
-configfile $prefix/grub.cfg
+if [ -f $prefix/entries/YOUR-ROOT-UUID.cfg ]; then source $prefix/entries/YOUR-ROOT-UUID.cfg; fi
+
+if [ -f $prefix/custom.cfg ]; then source $prefix/custom.cfg; fi
 
 ```
+
+Then the entry itself, in `/boot/efi/boot/grub/entries/YOUR-ROOT-UUID.cfg`. The `search` names **whichever filesystem holds `/boot`** — the root partition `/dev/sdb3` on this layout, or a dedicated `/boot` partition on a disk that still has one, in which case the kernel paths lose their `/boot` prefix. The options after `root=UUID=` are this machine's own, out of its `/etc/default/grub`:
+
+```text
+menuentry "GUI Portable SSD" {
+    search --no-floppy --fs-uuid --set=root YOUR-BOOT-FILESYSTEM-UUID
+    linux /boot/vmlinuz root=UUID=YOUR-ROOT-UUID quiet apparmor=0 mitigations=off
+    initrd /boot/initrd.img
+}
+
+menuentry "TTY Portable SSD" {
+    search --no-floppy --fs-uuid --set=root YOUR-BOOT-FILESYSTEM-UUID
+    linux /boot/vmlinuz root=UUID=YOUR-ROOT-UUID quiet apparmor=0 mitigations=off systemd.unit=multi-user.target
+    initrd /boot/initrd.img
+}
+
+```
+
+`install.sh` writes exactly this, deriving the options from the target's own `/etc/default/grub` and rebuilding the master over whatever entry files are on the ESP. `grub-script-check` will parse either file for you before you reboot.
 
 **3. Enforce the Root UUID Mapping**
 
@@ -197,8 +222,8 @@ Locate the `GRUB_CMDLINE_LINUX` variable and append our new `/dev/sdb3` UUID:
 GRUB_CMDLINE_LINUX="root=UUID=YOUR-SDB3-UUID"
 ```
 
-**4. Regenerate the Master Menu**
-This will execute `09_console` (which will also realize it is on a unified drive and prepend `/boot` to the kernel paths) and lock in text-mode colors.
+**4. Regenerate the rootfs's own menu**
+Nothing boots from `/boot/grub/grub.cfg` any more — the menu on the ESP is what GRUB reads — but this keeps the system self-describing and is what a rescue `configfile` would find. It executes `09_console` (which will also realize it is on a unified drive and prepend `/boot` to the kernel paths) and locks in text-mode colors.
 
 ```bash
 update-grub

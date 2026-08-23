@@ -196,13 +196,15 @@ validate_partition_type() {
 #   another distro's rootfs. Ambiguity is never resolved by guessing (an
 #   earlier version claimed the first unclaimed Linux partition as
 #   /boot, which happily adopted — and then reformatted — a data partition):
-#   two or more candidates with no "root" label is a fatal error naming them.
+#   two or more candidates with no "root" label is a fatal error naming them,
+#   and so is more than one partition labelled "root" (a disk carrying a rootfs
+#   per machine behind one shared ESP has exactly that layout).
 #   Dies likewise if the ESP or root is missing, so an unexpected layout fails
 #   here rather than at mount time.
 scan_disk_roles() {
     local disk=$1 pfx=$2
     local dev ptype fstype label
-    local -a linux_parts=()
+    local -a linux_parts=() root_parts=()
     local bios="" efi="" root=""
 
     # One lsblk for the whole disk, rather than one per partition per column.
@@ -223,7 +225,7 @@ scan_disk_roles() {
             "$GUID_LINUX")
                 [ "$fstype" = swap ] && continue   # a Linux-typed swap: not /
                 case "$label" in
-                    root) root="$dev" ;;
+                    root) root_parts+=("$dev") ;;
                     # A separate /boot. It is a role again, but never a
                     # discovered one: --source-boot/--target-boot name it, so
                     # all this scan owes it is not to mistake it for a root
@@ -235,11 +237,24 @@ scan_disk_roles() {
         esac
     done < <(lsblk -lnpo NAME,PARTTYPE,FSTYPE,LABEL "$disk")
 
-    # The "root" label settles it, and every other Linux partition on the disk
+    # One "root" label settles it, and every other Linux partition on the disk
     # is then someone else's (data, an unnamed /boot, a second distro). Only
     # when nothing is labelled does the scan fall back to "there is exactly one
     # candidate, so that is it" — and more than one candidate is an error, not
     # a coin toss: picking wrong here means reformatting the wrong partition.
+    #
+    # Several partitions labelled 'root' is the same error, and a live layout
+    # now that one disk can carry a rootfs per machine behind a shared ESP: an
+    # earlier version let the last one win, so a whole-disk --target --update
+    # silently synced onto whichever slot lsblk listed last.
+    if [ ${#root_parts[@]} -eq 1 ]; then
+        root="${root_parts[0]}"
+    elif [ ${#root_parts[@]} -gt 1 ]; then
+        die "Disk $disk has ${#root_parts[@]} partitions labelled 'root':
+  ${root_parts[*]}
+A disk carrying one rootfs per machine must be addressed partition by
+partition -- name the one you mean with --source-root/--target-root."
+    fi
     if [ -z "$root" ]; then
         if [ ${#linux_parts[@]} -eq 1 ]; then
             root="${linux_parts[0]}"
@@ -387,6 +402,11 @@ probe_source_swapfiles() {
             SWAP_PREVIEW+=("$sf ${size:-?} $state")
         done < <(swapfile_entries "$SRC/etc/fstab")
     fi
+    # The source root is mounted anyway, and its /etc/default/grub is the file
+    # that lands on the target and feeds this system's menu entry: read the boot
+    # options now, so the summary can show the command line the disk will boot
+    # with (see probe_menu_cmdline, which only mounts anything if this did not).
+    MENU_CMDLINE_PREVIEW=$(grub_cmdline_options "$SRC")
     sudo umount "$SRC" || true
 }
 
@@ -504,6 +524,36 @@ fstab_mounts_boot() {
 # -----------------------------------------------------------------------------
 # Translation Operations
 # -----------------------------------------------------------------------------
+
+# target_disk_uuids — the UUIDs of every filesystem on the disk(s) this install
+#   writes to, space-delimited with sentinel spaces at both ends for the awk
+#   lookups below. A mount naming one of them is not "foreign" in any sense that
+#   matters: it lives on the very disk being installed, so it is present exactly
+#   when this system is (a rootfs sharing its disk with a /data partition, the
+#   layout a disk carrying one rootfs per machine has). Everything else -- the
+#   source machine's other disks above all -- stays disabled, since a clone that
+#   boots elsewhere must not block on a device that is not there.
+target_disk_uuids() {
+    local d disk u out=" "
+    local -a disks=()
+    for d in "$TGT_ROOT" "$TGT_EFI" "$TGT_BOOT"; do
+        [ -n "$d" ] || continue
+        disk=$(get_parent_disk "$d")
+        [ -n "$disk" ] || continue
+        case " ${disks[*]-} " in *" $disk "*) continue ;; esac
+        disks+=("$disk")
+    done
+    for disk in "${disks[@]-}"; do
+        [ -n "$disk" ] || continue
+        while read -r u; do
+            [ -n "$u" ] || continue
+            case "$out" in *" $u "*) continue ;; esac
+            out+="$u "
+        done < <(lsblk -lno UUID "$disk" 2>/dev/null || true)
+    done
+    printf '%s' "$out"
+}
+
 rewrite_fstab() {
     # drop_swap: swap FILES the --exclude-from file removes from the transfer.
     # Their entries are commented out, so a disk deliberately built without swap
@@ -527,12 +577,90 @@ rewrite_fstab() {
     local has_boot=0
     if fstab_mounts_boot "$MNT/etc/fstab"; then has_boot=1; fi
 
+    # keep_uuids: mounts on the target's own disk(s) survive (see
+    # target_disk_uuids); the two-pass awk below then keeps the bind mounts that
+    # hang off them, and disables the ones whose backing mount it just disabled.
+    local keep_uuids
+    keep_uuids=$(target_disk_uuids)
+
     sudo awk -v old_efi="$OLD_UUID_EFI" -v new_efi="$NEW_UUID_EFI" \
              -v old_root="$OLD_UUID_ROOT" -v new_root="$NEW_UUID_ROOT" \
              -v old_boot="$OLD_UUID_BOOT" -v new_boot="$NEW_UUID_BOOT" \
              -v map_boot="$map_boot" -v sep_boot="$TGT_SEP_BOOT" \
-             -v has_boot="$has_boot" \
+             -v has_boot="$has_boot" -v keep_uuids="$keep_uuids" \
              -v new_swap="${NEW_UUID_SWAP:-}" -v drop_swap="$drop_swap" '
+    # The UUID a line mounts by, or "" when it names none (a device path, a
+    # swap file, tmpfs, a bind source).
+    function line_uuid(s) {
+        if (match(s, /UUID=[0-9A-Za-z-]+/))
+            return substr(s, RSTART + 5, RLENGTH - 5);
+        if (match(s, /\/dev\/disk\/by-uuid\/[0-9A-Za-z-]+/))
+            return substr(s, RSTART + 18, RLENGTH - 18);
+        return "";
+    }
+    function xlate(s) {
+        gsub(old_efi, new_efi, s);
+        if (map_boot) gsub(old_boot, new_boot, s);
+        gsub(old_root, new_root, s);
+        return s;
+    }
+    function uuid_kept(u) {
+        if (u == "") return 1;                             # not mounted by UUID
+        if (u == new_efi || u == new_boot || u == new_root) return 1;
+        return index(keep_uuids, " " u " ") > 0;
+    }
+    # The mount this path sits on: the longest of the mount points pass 1
+    # resolved that prefixes it. "/" always matches, so this never comes back
+    # empty -- and a path under a mount this run disables resolves to that
+    # mount, not to "/", so it goes down with it.
+    function nearest_mount(path,   mp, best, bestlen) {
+        best = "/"; bestlen = 0;
+        for (mp in mp_kept) {
+            if (mp == "/" || length(mp) <= bestlen) continue;
+            if (path == mp || substr(path, 1, length(mp) + 1) == mp "/")
+                { best = mp; bestlen = length(mp) }
+        }
+        return best;
+    }
+
+    # ---- Pass 1: which mounts survive -------------------------------------
+    # Read once to decide every device-backed mount, so that pass 2 can judge a
+    # bind by the mount its SOURCE sits on. A bind is not a filesystem: it is
+    # worth exactly as much as whatever carries the directory it points at.
+    NR == FNR {
+        if ($0 ~ /^# \[PORTABLE-SYNC-DISABLED\] /) {
+            payload = $0;
+            while (sub(/^# \[PORTABLE-SYNC-DISABLED\] /, "", payload)) { }
+            if (payload ~ /^[[:space:]]*#/) next;
+            split(payload, f);
+            if (substr(f[2], 1, 1) == "/") was_disabled[f[2]] = 1;
+            next;
+        }
+        if ($0 ~ /^[[:space:]]*#/ || NF < 3) next;
+        line = xlate($0);
+        split(line, f);
+        if (f[4] ~ /(^|,)bind(,|$)/) { binds[++nbind] = f[1] SUBSEP f[2]; next }
+        if (!sep_boot && f[2] == "/boot")   keep = 0;
+        else if (f[3] == "swap")            keep = (index(drop_swap, " " f[1] " ") == 0);
+        else                                keep = uuid_kept(line_uuid(line));
+        if (substr(f[2], 1, 1) == "/") mp_kept[f[2]] = keep;
+        next;
+    }
+
+    # Binds resolve between the passes, in file order -- which is authoritative,
+    # since mount -a walks fstab in order and a bind whose source is mounted
+    # later would already be broken on the source system. Each resolved bind
+    # joins the mount table, so a bind hanging off another bind is judged by the
+    # one it rides on.
+    FNR == 1 {
+        for (mp in was_disabled) if (!(mp in mp_kept)) mp_kept[mp] = 0;
+        for (i = 1; i <= nbind; i++) {
+            split(binds[i], b, SUBSEP);
+            bind_kept[b[2]] = mp_kept[nearest_mount(b[1])];
+            mp_kept[b[2]] = bind_kept[b[2]];
+        }
+    }
+
     # Lines disabled by a previous run: never re-prefix them (collapse any
     # stacked markers left by older versions), and drop disabled swap entries
     # once a live swap entry is being written below -- otherwise every
@@ -603,18 +731,21 @@ rewrite_fstab() {
         }
 
         if ($0 ~ /UUID=/ || $0 ~ /\/dev\/disk\/by-uuid\//) {
-            if ($0 !~ new_efi && $0 !~ new_boot && $0 !~ new_root) {
-                # Ensure we also ignore foreign swap partitions
+            # A filesystem on the disk this install writes to is kept: it is
+            # there exactly when this system is. Anything else -- another disk
+            # of the source machine, a foreign swap partition -- is disabled,
+            # since a disk that boots elsewhere must not wait for it.
+            if (!uuid_kept(line_uuid($0))) {
                 print "# [PORTABLE-SYNC-DISABLED] " $0;
                 next;
             }
         }
 
         if ($4 ~ /(^|,)bind(,|$)/) {
-            if ($1 == "/tmp" && $2 == "/var/tmp") {
-                print $0;
-                next;
-            }
+            # Resolved above from the mount its source sits on: /tmp ->
+            # /var/tmp rides on / and always survives; /data/tigran ->
+            # /home/tigran survives exactly as long as /data does.
+            if (bind_kept[$2]) { print $0; next }
             print "# [PORTABLE-SYNC-DISABLED] " $0;
             next;
         }
@@ -624,7 +755,7 @@ rewrite_fstab() {
     END {
         if (new_swap != "" && !swap_done)
             print "/dev/disk/by-uuid/" new_swap " none swap sw 0 0";
-    }' "$MNT/etc/fstab" | sudo tee "$MNT/etc/fstab.new" >/dev/null
+    }' "$MNT/etc/fstab" "$MNT/etc/fstab" | sudo tee "$MNT/etc/fstab.new" >/dev/null
 
     sudo mv "$MNT/etc/fstab.new" "$MNT/etc/fstab"
     sudo chown root:root "$MNT/etc/fstab"
@@ -649,6 +780,45 @@ probe_target_brand() {
     fi
 }
 
+# probe_esp_menu — the systems already registered on the target ESP, read
+#   *before* the confirmation gate so the summary can say whose entries this run
+#   will keep, and so verify_install() can prove afterwards that it kept them.
+#   Skipped by the caller when the ESP is about to be formatted (nothing
+#   survives that) and silent when it cannot be mounted. The ESP is mounted on
+#   MNT, free at this point, exactly as probe_target_brand() borrows it for the
+#   target root -- so the grub directory is $MNT/boot/grub here, the ESP's own
+#   /boot/grub, not the /boot/efi/boot/grub it becomes once the root is mounted.
+#   Fills ESP_MENU_ENTRIES ("<uuid><TAB><title>") and sets ESP_MENU_PROBED.
+probe_esp_menu() {
+    ESP_MENU_ENTRIES=(); ESP_MENU_PROBED=0
+    local row
+    [ -b "$TGT_EFI" ] || return 0
+    MOUNTS_DONE=1   # from here on cleanup() must sweep $MNT, interrupts included
+    sudo mount -r "$TGT_EFI" "$MNT" 2>/dev/null || return 0
+    ESP_MENU_PROBED=1
+    while IFS= read -r row; do
+        [ -n "$row" ] && ESP_MENU_ENTRIES+=("$row")
+    done < <(esp_entries "$MNT/boot/grub")
+    sudo umount "$MNT" || true
+}
+
+# probe_menu_cmdline — the kernel command line the menu entry will carry, for
+#   the summary. Same transient read-only mount trick, on whichever root is the
+#   authority: the source's /etc/default/grub when its rootfs is being copied
+#   (that file lands on the target verbatim), the target's own when the root is
+#   in place. Costs nothing when probe_source_swapfiles() already had the source
+#   mounted and filled it in.
+probe_menu_cmdline() {
+    [ -z "$MENU_CMDLINE_PREVIEW" ] || return 0
+    local dev="$TGT_ROOT"
+    [ "$MIGRATE_ROOT" -eq 0 ] || dev="$SRC_ROOT"
+    [ -b "$dev" ] || return 0
+    MOUNTS_DONE=1
+    sudo mount -r -o noatime "$dev" "$MNT" 2>/dev/null || return 0
+    MENU_CMDLINE_PREVIEW=$(grub_cmdline_options "$MNT")
+    sudo umount "$MNT" || true
+}
+
 rewrite_grub_distributor() {
     info "Updating GRUB_DISTRIBUTOR with target model ($TGT_MODEL)..."
     # A --brand value may contain sed-replacement metacharacters (&, /, \).
@@ -662,47 +832,223 @@ rewrite_grub_distributor() {
     fi
 }
 
+# -----------------------------------------------------------------------------
+# The standalone ESP: GRUB's boot directory, and the menu every rootfs shares
+# -----------------------------------------------------------------------------
+# GRUB's boot directory lives on the ESP (/boot/efi/boot/grub, i.e. /boot/grub
+# as seen from the ESP's own root), not on any rootfs: grub-install is told
+# --boot-directory=/boot/efi/boot for BOTH i386-pc and x86_64-efi, so the BIOS
+# core.img and the UEFI image resolve the same prefix and read the same menu.
+# That is what lets one disk carry a rootfs per machine -- desktop, laptop, iMac
+# -- behind a single ESP: the menu belongs to the disk, not to whichever system
+# was installed last.
+#
+# Its layout:
+#
+#   /boot/efi/boot/grub/grub.cfg              master menu, regenerated per run
+#   /boot/efi/boot/grub/entries/<uuid>.cfg    one file per registered rootfs
+#   /boot/efi/boot/grub/custom.cfg            optional, hand-written, sourced last
+#   /boot/efi/boot/grub/{x86_64-efi,i386-pc}/ modules, written by grub-install
+#
+# An install owns exactly one entry file -- the one named after the root
+# filesystem it just wrote -- and never edits another system's. The master is
+# rebuilt from whatever entry files are present, so registering, re-branding or
+# (by deleting a file) retiring a system is a local operation.
+
+# grub_default_value <file> <KEY> — the last KEY="..." (or '...') assignment in
+#   an /etc/default/grub-style file. Read, never sourced: it is the target's
+#   file, not ours to execute.
+grub_default_value() {
+    sed -nE "s/^[[:space:]]*$2=\"(.*)\"[[:space:]]*\$/\\1/p;
+             s/^[[:space:]]*$2='(.*)'[[:space:]]*\$/\\1/p" "$1" 2>/dev/null | tail -n 1
+}
+
+# grub_cmdline_options <mounted-root> — the boot options that system asks for,
+#   composed the way update-grub composes them: GRUB_CMDLINE_LINUX then
+#   GRUB_CMDLINE_LINUX_DEFAULT, out of that system's own /etc/default/grub, so
+#   each rootfs keeps the quirks its machine needs (USB storage, IOMMU, console)
+#   instead of inheriting whichever machine the toolkit last ran on. root= is
+#   stripped: it is not an option to carry over but a fact about the filesystem
+#   this install just wrote, restated by esp_cmdline_from().
+grub_cmdline_options() {
+    local f=$1/etc/default/grub
+    printf '%s %s' "$(grub_default_value "$f" GRUB_CMDLINE_LINUX)" \
+                   "$(grub_default_value "$f" GRUB_CMDLINE_LINUX_DEFAULT)" \
+        | sed -E 's#(^| )root=[^ ]*##g; s/^ +//; s/ +$//; s/ {2,}/ /g'
+}
+
+# esp_cmdline_from <options> — the full command line: the new root UUID, then
+#   the options. The fallback covers the pre-confirmation summary, printed
+#   before any mkfs has produced a UUID to name.
+esp_cmdline_from() {
+    printf 'root=UUID=%s%s' "${NEW_UUID_ROOT:-<the new root UUID>}" "${1:+ $1}"
+}
+
+# esp_cmdline <mounted-root> — both of the above, for the real write.
+esp_cmdline() {
+    esp_cmdline_from "$(grub_cmdline_options "$1")"
+}
+
+# esp_entries <grubdir> — the systems registered on that ESP, one
+#   "<root-uuid><TAB><title>" line each, ordered by title then UUID so the menu
+#   has a stable, legible order no matter which system was installed last.
+esp_entries() {
+    local dir="$1/entries" f uuid title
+    [ -d "$dir" ] || return 0
+    for f in "$dir"/*.cfg; do
+        [ -e "$f" ] || continue
+        uuid=${f##*/}; uuid=${uuid%.cfg}
+        title=$(sed -nE 's/^menuentry "([^"]*)".*/\1/p' "$f" 2>/dev/null | head -n 1)
+        printf '%s\t%s\n' "$uuid" "${title:-$uuid}"
+    done | LC_ALL=C sort -t "$(printf '\t')" -k2,2 -k1,1
+}
+
+# esp_entry_text <title> <cmdline> <kernel-dir> — this system's entry file: the
+#   GUI pair the toolkit has always offered, keyed to the filesystem that holds
+#   /boot (NEW_UUID_BOOT: the /boot partition on a disk that has one, the root
+#   filesystem otherwise), with the kernel path to match.
+esp_entry_text() {
+    local title=$1 cmdline=$2 kdir=$3
+    cat <<EOF
+# Written by install.sh -- one file per rootfs registered on this ESP.
+# Root filesystem $NEW_UUID_ROOT on $TGT_ROOT; kernel read from $NEW_UUID_BOOT.
+# Deleting this file retires the system from the menu; nothing else refers to it.
+menuentry "GUI $title" {
+    search --no-floppy --fs-uuid --set=root $NEW_UUID_BOOT
+    linux $kdir/vmlinuz $cmdline
+    initrd $kdir/initrd.img
+}
+
+menuentry "TTY $title" {
+    search --no-floppy --fs-uuid --set=root $NEW_UUID_BOOT
+    linux $kdir/vmlinuz $cmdline systemd.unit=multi-user.target
+    initrd $kdir/initrd.img
+}
+EOF
+}
+
+# esp_master_text <grubdir> — the master menu, rebuilt from the entry files
+#   present. timeout/default are carried over from the master already there, so
+#   a value set by hand survives every later install and the last system
+#   installed never silently redefines the menu for the others; 5 and 0 only
+#   when writing a master from scratch. Each source is guarded, so an entry file
+#   deleted by hand retires that system instead of breaking the menu for all of
+#   them.
+esp_master_text() {
+    local grubdir=$1 timeout="" default="" uuid title
+    if [ -f "$grubdir/grub.cfg" ]; then
+        timeout=$(sed -nE 's/^[[:space:]]*set[[:space:]]+timeout=(.+)$/\1/p' "$grubdir/grub.cfg" | head -n 1)
+        default=$(sed -nE 's/^[[:space:]]*set[[:space:]]+default=(.+)$/\1/p' "$grubdir/grub.cfg" | head -n 1)
+    fi
+    printf '%s\n' \
+        "# Generated by install.sh: the menu shared by every rootfs on this disk." \
+        "# Add nothing here -- per-system entries live in entries/<root-uuid>.cfg" \
+        "# and this file is rebuilt from them on every install (timeout and" \
+        "# default are carried over). Hand-written extras go in custom.cfg." \
+        "set timeout=${timeout:-5}" \
+        "set default=${default:-0}" \
+        "" \
+        "insmod part_gpt" \
+        "insmod ext2" \
+        ""
+    while IFS="$(printf '\t')" read -r uuid title; do
+        [ -n "$uuid" ] || continue
+        printf '# %s\nif [ -f $prefix/entries/%s.cfg ]; then source $prefix/entries/%s.cfg; fi\n' \
+            "$title" "$uuid" "$uuid"
+    done < <(esp_entries "$grubdir")
+    printf '\n%s\n' 'if [ -f $prefix/custom.cfg ]; then source $prefix/custom.cfg; fi'
+}
+
+# write_esp_menu — register this system in the shared menu, after
+#   run_chroot_block has installed the modules grub-install puts there. Reads
+#   caller globals (MNT, TGT_MODEL, TGT_ROOT, TGT_SEP_BOOT, NEW_UUID_ROOT,
+#   NEW_UUID_BOOT, MENU_CMDLINE_PREVIEW); prints what it would write under
+#   --dry-run, where the ESP is not mounted and the command line can only come
+#   from the pre-confirmation probe.
+write_esp_menu() {
+    local grubdir="$MNT/boot/efi/boot/grub"
+    local title=${TGT_MODEL//\"/} kdir="/boot" cmdline master
+    [ "$TGT_SEP_BOOT" -eq 0 ] || kdir=""
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        cmdline=$(esp_cmdline_from "${MENU_CMDLINE_PREVIEW:-<options from /etc/default/grub, read at install time>}")
+        echo "[dry-run] would write /boot/efi/boot/grub/entries/$NEW_UUID_ROOT.cfg:"
+        esp_entry_text "$title" "$cmdline" "$kdir" | sed 's/^/    /'
+        echo "[dry-run] would rebuild /boot/efi/boot/grub/grub.cfg over the entries:"
+        local row uuid etitle shown=0
+        for row in ${ESP_MENU_ENTRIES[@]+"${ESP_MENU_ENTRIES[@]}"}; do
+            IFS="$(printf '\t')" read -r uuid etitle <<<"$row"
+            [ "$uuid" = "$NEW_UUID_ROOT" ] && continue
+            if [ "$uuid" = "${TGT_ROOT_UUID_NOW:-}" ]; then
+                echo "    $uuid  $etitle  (retired with the filesystem it names)"
+            else
+                echo "    $uuid  $etitle  (kept)"
+            fi
+            shown=1
+        done
+        echo "    $NEW_UUID_ROOT  GUI $title / TTY $title  (this install)"
+        [ "$shown" -eq 1 ] || [ "$ESP_MENU_PROBED" -eq 1 ] || \
+            echo "    (the ESP could not be read here, so entries already on it are not listed)"
+        return 0
+    fi
+
+    cmdline=$(esp_cmdline "$MNT")
+    info "Registering \"GUI $title\" in the ESP master menu..."
+    sudo mkdir -p "$grubdir/entries"
+    esp_entry_text "$title" "$cmdline" "$kdir" | sudo tee "$grubdir/entries/$NEW_UUID_ROOT.cfg" >/dev/null
+    # The system this partition held before it was reformatted: its filesystem
+    # is gone, so its entry goes with it rather than pointing the menu at a UUID
+    # that no longer exists anywhere.
+    if [ -n "${TGT_ROOT_UUID_NOW:-}" ] && [ "$TGT_ROOT_UUID_NOW" != "$NEW_UUID_ROOT" ]; then
+        sudo rm -f "$grubdir/entries/$TGT_ROOT_UUID_NOW.cfg"
+    fi
+    # Build the master before truncating it: it carries over its own timeout.
+    master=$(esp_master_text "$grubdir")
+    printf '%s\n' "$master" | sudo tee "$grubdir/grub.cfg" >/dev/null
+}
+
 run_chroot_block() {
     for i in /dev /dev/pts /proc /sys /run; do
         sudo mount --bind "$i" "$MNT$i"
     done
 
     # INSTALL_GRUB_BIOS / INSTALL_GRUB_EFI default to 1 (full install) for callers
-    # that don't set them; install.sh sets them per-role so EFI/BIOS can be kept
-    # intact during a partial (e.g. rootfs-only) migration. TGT_GRUB_DISK and
-    # NEW_UUID_BOOT are resolved by the caller.
+    # that don't set them; install.sh gates BIOS on a BIOS target being given.
+    # TGT_GRUB_DISK is resolved by the caller.
+    #
+    # --boot-directory=/boot/efi/boot puts GRUB's boot directory on the ESP for
+    # BOTH firmware paths, so one prefix -- and one menu -- serves BIOS and UEFI
+    # and belongs to the disk rather than to this rootfs. Nothing writes a
+    # routing stub any more: with the boot directory on the ESP itself,
+    # grub-install embeds a device-relative prefix in the image, which is why an
+    # ESP built this way holds EFI/BOOT/BOOTX64.EFI and no EFI/BOOT/grub.cfg.
     sudo chroot "$MNT" /bin/bash <<EOF
 set -e
 echo "=> Inside chroot..."
 
 if [ "${INSTALL_GRUB_BIOS:-1}" = 1 ]; then
     echo "=> Installing legacy BIOS GRUB to $TGT_GRUB_DISK..."
-    grub-install --target=i386-pc "$TGT_GRUB_DISK"
+    grub-install --target=i386-pc --boot-directory=/boot/efi/boot "$TGT_GRUB_DISK"
 fi
 
 if [ "${INSTALL_GRUB_EFI:-1}" = 1 ]; then
     echo "=> Installing UEFI GRUB (removable)..."
-    if grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --no-uefi-secure-boot; then
+    if grub-install --target=x86_64-efi --efi-directory=/boot/efi \
+                    --boot-directory=/boot/efi/boot --removable --no-uefi-secure-boot; then
         rm -rf /boot/efi/EFI/ubuntu
-        mkdir -p /boot/efi/EFI/BOOT
-
-        # NEW_UUID_BOOT is the UUID of whichever filesystem holds /boot -- the
-        # /boot partition on a disk that has one, the root filesystem otherwise
-        # -- so one stub serves both layouts: the search lands on that
-        # filesystem, and the branch below picks the prefix that matches it.
-        echo "search --no-floppy --fs-uuid --set=root $NEW_UUID_BOOT" > /boot/efi/EFI/BOOT/grub.cfg
-        echo 'if [ -f (\$root)/boot/grub/grub.cfg ]; then' >> /boot/efi/EFI/BOOT/grub.cfg
-        echo '    set prefix=(\$root)/boot/grub' >> /boot/efi/EFI/BOOT/grub.cfg
-        echo 'else' >> /boot/efi/EFI/BOOT/grub.cfg
-        echo '    set prefix=(\$root)/grub' >> /boot/efi/EFI/BOOT/grub.cfg
-        echo 'fi' >> /boot/efi/EFI/BOOT/grub.cfg
-        echo 'configfile \$prefix/grub.cfg' >> /boot/efi/EFI/BOOT/grub.cfg
+        # A stub left by an older version of this toolkit, when the menu lived
+        # on the rootfs. The prefix is embedded now, so nothing reads it.
+        rm -f /boot/efi/EFI/BOOT/grub.cfg
     else
         echo "grub-install (EFI) failed; leaving /boot/efi/EFI/ubuntu untouched."
     fi
 fi
 
-echo "=> Regenerating Master Menu..."
+# The menu GRUB actually reads is the one on the ESP, written by
+# write_esp_menu() once this chroot is done. This regenerates the rootfs's own
+# /boot/grub/grub.cfg, which nothing boots from any more but which keeps the
+# system self-describing (and is what a rescue "configfile" would find).
+echo "=> Regenerating the rootfs menu..."
 update-grub
 
 echo "=> Rebuilding initramfs..."
@@ -714,11 +1060,12 @@ EOF
 
 # verify_install — post-install sanity checks on the still-mounted target tree:
 #   fstab and the regenerated grub.cfg must reference the new UUIDs (and no
-#   longer the old ones), and the universal EFI routing stub must be keyed to
-#   the filesystem that holds /boot. Catches a silently broken configuration
-#   while the disk is still on the desk rather than at boot time on another
-#   machine. Reads caller globals (MNT, SRC_SEP_BOOT/TGT_SEP_BOOT,
-#   OLD_UUID_*/NEW_UUID_*, SWAP_DEV, NEW_UUID_SWAP).
+#   longer the old ones), the ESP must carry GRUB's boot directory with this
+#   system registered in the shared menu, and every system that was registered
+#   there before must still be. Catches a silently broken configuration while
+#   the disk is still on the desk rather than at boot time on another machine.
+#   Reads caller globals (MNT, SRC_SEP_BOOT/TGT_SEP_BOOT, ESP_MENU_ENTRIES,
+#   INSTALL_GRUB_BIOS, OLD_UUID_*/NEW_UUID_*, SWAP_DEV, NEW_UUID_SWAP).
 #   Returns non-zero if any check failed.
 verify_install() {
     local fails=0
@@ -774,8 +1121,39 @@ verify_install() {
 
     vcheck "EFI fallback loader present (EFI/BOOT/BOOTX64.EFI)" \
         sudo test -f "$MNT/boot/efi/EFI/BOOT/BOOTX64.EFI"
-    vcheck "EFI routing stub keyed to the filesystem holding /boot" \
-        sudo grep -qF "$NEW_UUID_BOOT" "$MNT/boot/efi/EFI/BOOT/grub.cfg"
+
+    # The standalone ESP: GRUB's boot directory, the menu it reads, and this
+    # system's entry in it. There is no routing stub to check -- with the boot
+    # directory on the ESP, grub-install embeds the prefix in the image.
+    local espgrub="$MNT/boot/efi/boot/grub"
+    local espentry="$espgrub/entries/$NEW_UUID_ROOT.cfg"
+    vcheck "EFI GRUB modules on the ESP (boot/grub/x86_64-efi)" \
+        sudo test -d "$espgrub/x86_64-efi"
+    if [ "${INSTALL_GRUB_BIOS:-0}" -eq 1 ]; then
+        vcheck "BIOS GRUB modules on the ESP (boot/grub/i386-pc)" \
+            sudo test -d "$espgrub/i386-pc"
+    fi
+    vcheck "this system is registered in the ESP menu (entries/$NEW_UUID_ROOT.cfg)" \
+        sudo test -f "$espentry"
+    vcheck "its entry boots the new root UUID" \
+        sudo grep -qF "root=UUID=$NEW_UUID_ROOT" "$espentry"
+    vcheck "its entry searches the filesystem holding /boot" \
+        sudo grep -qF "set=root $NEW_UUID_BOOT" "$espentry"
+    vcheck "the ESP master menu sources it" \
+        sudo grep -qF "entries/$NEW_UUID_ROOT.cfg" "$espgrub/grub.cfg"
+    # Every other system that was on this ESP before the run must still be on
+    # it: rebuilding the shared master is the one step that could quietly
+    # unregister the machines this install was not about.
+    local row uuid etitle
+    for row in ${ESP_MENU_ENTRIES[@]+"${ESP_MENU_ENTRIES[@]}"}; do
+        IFS="$(printf '\t')" read -r uuid etitle <<<"$row"
+        [ -n "$uuid" ] && [ "$uuid" != "$NEW_UUID_ROOT" ] || continue
+        # Retired on purpose with the filesystem it named (write_esp_menu).
+        [ "$uuid" != "${TGT_ROOT_UUID_NOW:-}" ] || continue
+        vcheck "kept the entry for \"$etitle\" ($uuid)" \
+            sudo sh -c 'test -f "$1" && grep -qF "$2" "$3"' _ \
+                "$espgrub/entries/$uuid.cfg" "entries/$uuid.cfg" "$espgrub/grub.cfg"
+    done
     # Proves the /boot content actually landed -- the one thing a layout change
     # (a separate /boot folded into /, or split back out) can silently lose, and
     # the backstop for a source that hides /boot in some way the Phase 3 fstab
@@ -832,6 +1210,10 @@ ESP_MIB=256
 DRY_RUN=0
 UPDATE=0
 NO_TRIM=0
+# Keep the ESP's filesystem: no mkfs, no new UUID. What a shared ESP needs, and
+# nothing else -- its contents are written by grub-install and write_esp_menu on
+# every run either way, since the ESP is generated here, never copied.
+KEEP_EFI=0
 SPARSE=0
 ASSUME_YES=0
 MNT_AUTO=0
@@ -841,6 +1223,14 @@ MOUNTS_DONE=0
 CLEANED=0
 # "This target keeps /boot inside /", said explicitly (see --no-target-boot).
 NO_TGT_BOOT=0
+
+# The systems already registered in the shared ESP menu (probe_esp_menu), the
+# boot options this system's entry will carry (probe_menu_cmdline / the source
+# swap probe), and the UUIDs verify_install needs before they exist.
+ESP_MENU_ENTRIES=()
+ESP_MENU_PROBED=0
+MENU_CMDLINE_PREVIEW=""
+NEW_UUID_ROOT=""
 
 # Swap files listed in the source's fstab: to rebuild, dropped by --exclude-from,
 # actually rebuilt (verified later), and the rsync exclusions for all of them.
@@ -879,6 +1269,7 @@ while [ $# -gt 0 ]; do
         --no-target-boot)   NO_TGT_BOOT=1; shift ;;
         --target-root)      TGT_ROOT="$2"; shift 2 ;;
         --target-swap)      TGT_SWAP="$2"; shift 2 ;;
+        --keep-efi)         KEEP_EFI=1;    shift ;;
 
         --mnt)            MNT="$2"; shift 2 ;;
         --src)            SRC="$2"; shift 2 ;;
@@ -911,8 +1302,15 @@ the target is described by individual --target-* partitions, saying which of the
 two you want is required rather than guessed. The other roles are found by GPT
 type and filesystem label, so any other partition on either disk (data, swap,
 an unnamed /boot, another distro) is ignored -- but a disk with several
-unlabelled Linux partitions is an error rather than a guess: name root with
---source-root / --target-root, or label it (e2label PART root).
+unlabelled Linux partitions, or several labelled "root", is an error rather than
+a guess: name root with --source-root / --target-root, or label it
+(e2label PART root). A disk carrying one rootfs per machine behind a shared ESP
+is exactly that case, and is always addressed partition by partition.
+
+The ESP is the exception to "migrated": it is never copied from the source.
+GRUB is installed onto it with its boot directory there (/boot/efi/boot/grub),
+for legacy BIOS and UEFI alike, and this system is registered in the menu that
+lives there -- see the notes below.
 
 Source (pick one form):
   --image|--source FILE|DEV   Whole image file or block device
@@ -941,6 +1339,14 @@ Target:
                               two flags must say what becomes of it.
   --target-root PART          Defaults to --source-root (omit/equal = keep in place)
   --target-swap PART          Use this swap, reformatting it (mkswap)
+  --keep-efi                  Do not format --target-efi: keep its filesystem and
+                              its UUID, and only refresh GRUB and this system's
+                              menu entry on it. What a shared ESP needs -- the one
+                              a disk carrying a rootfs per machine boots them all
+                              from -- since formatting it would drop the other
+                              systems' entries and change the UUID their fstabs
+                              name. The ESP is never copied from the source in
+                              either case; its contents are written here.
 
 Other:
   --update                    Sync onto already-formatted target partitions:
@@ -1016,6 +1422,15 @@ Notes:
   * EFI booting uses the EFI System Partition; the BIOS Boot partition is only
     for legacy boot and is regenerated by grub-install (when --target-bios-boot
     is given) or left intact otherwise.
+  * GRUB's boot directory lives on the ESP (/boot/efi/boot/grub), for legacy BIOS
+    and UEFI alike, so the menu belongs to the disk rather than to any one rootfs.
+    Each install registers itself in entries/<root-uuid>.cfg there and rebuilds
+    the master grub.cfg over whatever entry files are present, keeping its
+    timeout/default; hand-written extras go in custom.cfg, sourced last. Deleting
+    an entry file retires that system from the menu. So one disk can carry a
+    rootfs per machine behind a single ESP:
+      $0 --source /dev/sde --target-efi /dev/sde2 --keep-efi \\
+         --target-bios-boot /dev/sde1 --target-root /dev/sde5 --brand Laptop
   * A separate /boot earns its keep on a machine whose BIOS cannot boot from
     NVMe: BIOS Boot, the ESP and /boot go on a disk that BIOS can read, while /
     -- everything the running system actually reads -- stays on the NVMe.
@@ -1030,6 +1445,12 @@ Examples:
 
   # Deploy from the running machine's own disk, whatever else it carries:
   $0 --source /dev/nvme0n1 --target /dev/sda
+
+  # Add a second machine's rootfs to a disk that already boots one: keep the
+  # shared ESP (and register this system in the menu on it), format only sde5:
+  $0 --image Ubuntu26-Portable-16GB.img --keep-efi \\
+     --target-bios-boot /dev/sde1 --target-efi /dev/sde2 \\
+     --target-root /dev/sde5 --brand Laptop
 
   # Migrate ONLY the root filesystem to a new partition, keeping EFI in place:
   $0 --source-efi /dev/sda2 --source-root /dev/sda3 \\
@@ -1482,6 +1903,14 @@ if [ -n "$TGT_EFI_SIZE" ] && { [ $UNIFIED_TARGET -eq 0 ] || [ $UPDATE -eq 1 ]; }
     die "--target-efi-size only applies when partitioning a fresh --target disk (not with --update or individual --target-* partitions)."
 fi
 
+# --keep-efi keeps an ESP that already exists. A fresh unified --target has just
+# been repartitioned, so its ESP is an empty partition with no filesystem on it
+# at all -- keeping that means a target nothing can boot.
+if [ $KEEP_EFI -eq 1 ] && [ $UNIFIED_TARGET -eq 1 ] && [ $UPDATE -eq 0 ]; then
+    die "--keep-efi needs an ESP that already exists; a fresh --target disk is repartitioned here and its ESP must be formatted.
+Name the partitions instead (--target-efi ... --target-root ...), or add --update to keep the disk's existing filesystems."
+fi
+
 # Does the target keep /boot on its own partition, or inside /?
 if [ -n "$TGT_BOOT" ]; then TGT_SEP_BOOT=1; else TGT_SEP_BOOT=0; fi
 
@@ -1489,8 +1918,23 @@ if [ -n "$TGT_BOOT" ]; then TGT_SEP_BOOT=1; else TGT_SEP_BOOT=0; fi
 # Never feed the empty strings of an absent role to same_dev(): uutils' readlink
 # resolves "" to the working directory, which would compare equal -- which is
 # why MIGRATE_BOOT is only ever computed for a target that has a /boot at all.
-if same_dev "$TGT_EFI"  "$SRC_EFI";  then MIGRATE_EFI=0;  else MIGRATE_EFI=1;  fi
 if same_dev "$TGT_ROOT" "$SRC_ROOT"; then MIGRATE_ROOT=0; else MIGRATE_ROOT=1; fi
+
+# The ESP is the one role that is never copied: its whole content -- GRUB's boot
+# directory, the modules, the shared menu -- is produced here, by grub-install
+# and write_esp_menu, on every run. So there is nothing to "migrate", only the
+# question of whether its filesystem is created: FORMAT_EFI. A target ESP that
+# is already the source's stays as it is, and --keep-efi says so explicitly for
+# an ESP that several systems boot from -- reformatting that one would wipe the
+# other systems' menu entries and give the ESP a UUID their fstabs do not name.
+# (--update formats nothing at all, so it settles this the same way --keep-efi
+# does -- and then the entries already on that ESP are worth probing, since the
+# run is going to keep them.)
+if same_dev "$TGT_EFI" "$SRC_EFI" || [ $KEEP_EFI -eq 1 ] || [ $UPDATE -eq 1 ]; then
+    FORMAT_EFI=0
+else
+    FORMAT_EFI=1
+fi
 
 # MIGRATE_BOOT covers the /boot *partition* -- whether one must be formatted and
 # given a fresh UUID -- so it is 0 whenever the target has no separate /boot.
@@ -1511,21 +1955,35 @@ elif [ $SRC_SEP_BOOT -eq 1 ] && [ $TGT_SEP_BOOT -eq 1 ] && same_dev "$TGT_BOOT" 
     BOOT_PASS=0
 fi
 
-# Bootloader install scope: BIOS only when a BIOS target is given, EFI when the
-# ESP is fresh. (run_chroot_block always runs update-grub + update-initramfs.)
+# Bootloader install scope: BIOS only when a BIOS target is given. EFI always --
+# the ESP carries GRUB's boot directory now, and this system's menu entry has to
+# be registered there whatever else the run does, so there is no such thing as a
+# migration that leaves the ESP untouched. (run_chroot_block always runs
+# update-grub + update-initramfs as well.)
 if [ -n "$TGT_BIOS" ]; then INSTALL_GRUB_BIOS=1; else INSTALL_GRUB_BIOS=0; fi
-INSTALL_GRUB_EFI=$MIGRATE_EFI
+INSTALL_GRUB_EFI=1
 
-if [ $MIGRATE_EFI -eq 0 ] && [ $BOOT_PASS -eq 0 ] && [ $MIGRATE_ROOT -eq 0 ] && [ -z "$SWAP_DEV" ]; then
+if [ $FORMAT_EFI -eq 0 ] && [ $BOOT_PASS -eq 0 ] && [ $MIGRATE_ROOT -eq 0 ] && [ -z "$SWAP_DEV" ]; then
     die "Nothing to do: every role resolves in-place and no swap was given."
+fi
+
+# An ESP this run does not format is one it trusts: it must already hold a FAT
+# filesystem, or Phase 3 fails on the mount with the target half-written. Not
+# just under --update -- --keep-efi and an in-place ESP are the same bet.
+if [ $FORMAT_EFI -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+    fstype=$(sudo blkid -c /dev/null -o value -s TYPE "$TGT_EFI" 2>/dev/null || true)
+    if [ -z "$fstype" ]; then
+        die "EFI target $TGT_EFI has no recognizable filesystem (unformatted?); drop --keep-efi to create one."
+    elif [ "$fstype" != vfat ]; then
+        die "EFI target $TGT_EFI has filesystem '$fstype', expected 'vfat'."
+    fi
 fi
 
 # Under --update the target filesystems must already exist and be the right
 # type — we won't mkfs, so catch unformatted or wrong-type partitions now
 # rather than failing with a cryptic mount error later.
 if [ $UPDATE -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
-    for entry in "$TGT_EFI:EFI:vfat:$MIGRATE_EFI" \
-                 "$TGT_BOOT:Boot:ext4:$MIGRATE_BOOT" \
+    for entry in "$TGT_BOOT:Boot:ext4:$MIGRATE_BOOT" \
                  "$TGT_ROOT:Root:ext4:$MIGRATE_ROOT"; do
         dev="${entry%%:*}"
         rest="${entry#*:}"
@@ -1558,7 +2016,7 @@ fi
 
 # Safety: a partition we are about to format must not also be a source we read.
 migrated_targets=()
-if [ $MIGRATE_EFI  -eq 1 ]; then migrated_targets+=("$TGT_EFI");  fi
+if [ $FORMAT_EFI   -eq 1 ]; then migrated_targets+=("$TGT_EFI");  fi
 if [ $MIGRATE_BOOT -eq 1 ]; then migrated_targets+=("$TGT_BOOT"); fi
 if [ $MIGRATE_ROOT -eq 1 ]; then migrated_targets+=("$TGT_ROOT"); fi
 if [ "$DO_MKSWAP"  -eq 1 ]; then migrated_targets+=("$SWAP_DEV"); fi
@@ -1654,6 +2112,17 @@ fi
 # when the root filesystem is actually transferred, though -- rebuild_swapfiles()
 # runs with the root rsync, so an in-place root touches no swap file at all.
 if [ $MIGRATE_ROOT -eq 1 ]; then probe_source_swapfiles; fi
+# ...then the boot options for the menu entry, if that probe did not already
+# have the source mounted, and the systems already registered on the ESP (which
+# a run that formats it cannot keep, so there is nothing to read).
+probe_menu_cmdline
+if [ $FORMAT_EFI -eq 0 ]; then probe_esp_menu; fi
+# The root filesystem the target partition holds *now*: the system this slot
+# used to boot. It is this system when the filesystem is kept (--update or an
+# in-place root) and a stranger when it is about to be reformatted -- in which
+# case write_esp_menu() retires its menu entry along with it, rather than leave
+# the menu advertising a UUID that no longer exists.
+TGT_ROOT_UUID_NOW=$(sudo blkid -c /dev/null -s UUID -o value "$TGT_ROOT" 2>/dev/null || true)
 
 echo
 echo "About to install:"
@@ -1662,7 +2131,13 @@ if [ $SCATTERED_SOURCE -eq 1 ]; then
 else
     summary_row "Source:" "$SOURCE${LOOP_DEV:+  (loop $LOOP_DEV)}"
 fi
-role_row "EFI:"      "$MIGRATE_EFI"  "$SRC_EFI"  "$TGT_EFI"
+# The ESP is never a copy of the source's, so it gets a row of its own rather
+# than a role_row: the only question is whether its filesystem survives the run.
+if [ $FORMAT_EFI -eq 1 ]; then
+    summary_row "EFI:" "FORMAT    $TGT_EFI  (fresh FAT32, then GRUB + the menu written onto it)"
+else
+    summary_row "EFI:" "KEEP      $TGT_EFI  (filesystem and UUID untouched; GRUB + the menu refreshed)"
+fi
 if [ $TGT_SEP_BOOT -eq 1 ]; then
     role_row "/boot:" "$MIGRATE_BOOT" "${SRC_BOOT:-inside / on $SRC_ROOT}" "$TGT_BOOT"
 elif [ $SRC_SEP_BOOT -eq 1 ]; then
@@ -1704,15 +2179,40 @@ if [ "$swap_shown" -eq 0 ]; then
     fi
 fi
 echo "  Menu:     GRUB title branded \"$TGT_MODEL\" ($BRAND_ORIGIN)"
-if [ $INSTALL_GRUB_BIOS -eq 1 ] && [ $INSTALL_GRUB_EFI -eq 1 ]; then
-    echo "  Bootldr:  reinstall legacy BIOS -> $TGT_GRUB_DISK, and UEFI (removable)"
-elif [ $INSTALL_GRUB_BIOS -eq 1 ]; then
-    echo "  Bootldr:  reinstall legacy BIOS -> $TGT_GRUB_DISK (UEFI left intact)"
-elif [ $INSTALL_GRUB_EFI -eq 1 ]; then
-    echo "  Bootldr:  reinstall UEFI (removable) (legacy BIOS left intact)"
-else
-    echo "  Bootldr:  kept as-is — only update-grub + update-initramfs run"
+# The entry this run registers in the menu on the ESP, the systems already
+# registered there that it will keep, and the command line it will boot with --
+# the three things a shared-ESP disk must not be guessed about.
+summary_row "" "entry \"GUI $TGT_MODEL\" / \"TTY $TGT_MODEL\" in the ESP menu"
+summary_row "" "boots $(esp_cmdline_from "${MENU_CMDLINE_PREVIEW:-<options from /etc/default/grub, read at install time>}")"
+esp_menu_kept=0
+for esp_row in ${ESP_MENU_ENTRIES[@]+"${ESP_MENU_ENTRIES[@]}"}; do
+    IFS="$(printf '\t')" read -r esp_uuid esp_title <<<"$esp_row"
+    if [ "$esp_uuid" = "${TGT_ROOT_UUID_NOW:-}" ]; then
+        # The entry of whatever this partition holds now: re-branded in place
+        # when the filesystem is kept, retired with it when it is reformatted.
+        if [ $MIGRATE_ROOT -eq 1 ] && [ $UPDATE -eq 0 ]; then
+            summary_row "" "replaces \"$esp_title\" ($esp_uuid), the system this partition holds now"
+            esp_menu_kept=1
+        fi
+        continue
+    fi
+    summary_row "" "keeps \"$esp_title\" ($esp_uuid), already registered there"
+    esp_menu_kept=1
+    if [ "$esp_title" = "GUI $TGT_MODEL" ] || [ "$esp_title" = "TTY $TGT_MODEL" ]; then
+        echo "Warning: the ESP already lists \"$esp_title\" for a different root filesystem ($esp_uuid); pass --brand NAME to tell the two apart in the menu." >&2
+    fi
+done
+if [ $FORMAT_EFI -eq 1 ] && [ $UNIFIED_TARGET -eq 0 ]; then
+    summary_row "" "any entries already on that ESP go with its filesystem (--keep-efi keeps both)"
+elif [ "$esp_menu_kept" -eq 0 ] && [ "$ESP_MENU_PROBED" -eq 0 ] && [ $FORMAT_EFI -eq 0 ]; then
+    summary_row "" "(the ESP could not be read here, so entries already on it are not listed)"
 fi
+if [ $INSTALL_GRUB_BIOS -eq 1 ]; then
+    echo "  Bootldr:  reinstall legacy BIOS -> $TGT_GRUB_DISK, and UEFI (removable)"
+else
+    echo "  Bootldr:  reinstall UEFI (removable) (no --target-bios-boot, so legacy BIOS is left intact)"
+fi
+echo "            GRUB boot directory + menu on the ESP (--boot-directory=/boot/efi/boot)"
 echo "  Mounts:   target=$MNT  source=$SRC"
 if [ $UNIFIED_TARGET -eq 1 ] && [ $UPDATE -eq 0 ]; then
     echo "  Layout:   ${ESP_MIB} MiB ESP, root to 100%${TGT_EFI_SIZE:+  (--target-efi-size)}"
@@ -1765,7 +2265,7 @@ fi
 # only rsyncs --delete onto it. (--target-swap reformatting is independent: it is
 # an explicit opt-in and still honoured below.)
 if [ $UPDATE -eq 0 ]; then
-    if [ $MIGRATE_EFI -eq 1 ]; then
+    if [ $FORMAT_EFI -eq 1 ]; then
         run sudo wipefs -q -a "$TGT_EFI"
         run sudo mkfs.fat -F32 -n EFI "$TGT_EFI"
     fi
@@ -1808,17 +2308,18 @@ fi
 
 # ---- New UUIDs: fresh for migrated roles, unchanged for in-place ----
 # NEW_UUID_BOOT is "the UUID of the filesystem that holds /boot", so without a
-# separate /boot partition it is the root UUID -- which is exactly what the EFI
-# routing stub must search for, and what update-grub puts in its own search line.
+# separate /boot partition it is the root UUID -- which is exactly what the menu
+# entry on the ESP must search for to find the kernel, and what update-grub puts
+# in the search line of the rootfs menu it regenerates.
 if [ "$DRY_RUN" -eq 0 ]; then
-    if [ $MIGRATE_EFI  -eq 1 ]; then NEW_UUID_EFI=$(blkid_uuid "$TGT_EFI");   else NEW_UUID_EFI="$OLD_UUID_EFI";   fi
+    NEW_UUID_EFI=$(blkid_uuid "$TGT_EFI")
     if [ $MIGRATE_ROOT -eq 1 ]; then NEW_UUID_ROOT=$(blkid_uuid "$TGT_ROOT"); else NEW_UUID_ROOT="$OLD_UUID_ROOT"; fi
     if [ $TGT_SEP_BOOT -eq 0 ];  then NEW_UUID_BOOT="$NEW_UUID_ROOT"
     elif [ $MIGRATE_BOOT -eq 1 ]; then NEW_UUID_BOOT=$(blkid_uuid "$TGT_BOOT")
     else                              NEW_UUID_BOOT="$OLD_UUID_BOOT"; fi
     if [ -n "$SWAP_DEV" ]; then NEW_UUID_SWAP=$(blkid_uuid "$SWAP_DEV"); fi
 else
-    if [ $MIGRATE_EFI  -eq 1 ]; then NEW_UUID_EFI="dry-run-new-efi";   else NEW_UUID_EFI="$OLD_UUID_EFI";   fi
+    if [ $FORMAT_EFI   -eq 1 ]; then NEW_UUID_EFI="dry-run-new-efi";   else NEW_UUID_EFI="$OLD_UUID_EFI";   fi
     if [ $MIGRATE_ROOT -eq 1 ]; then NEW_UUID_ROOT="dry-run-new-root"; else NEW_UUID_ROOT="$OLD_UUID_ROOT"; fi
     if [ $TGT_SEP_BOOT -eq 0 ];  then NEW_UUID_BOOT="$NEW_UUID_ROOT"
     elif [ $MIGRATE_BOOT -eq 1 ]; then NEW_UUID_BOOT="dry-run-new-boot"
@@ -1883,11 +2384,10 @@ $SRC_ROOT keeps /boot inside its own root filesystem. Mounting $SRC_BOOT over it
 would hide the real /boot and copy an empty one. Drop --source-boot."
 fi
 
-# The layout is agreed, so complete the source tree. Needed for the /boot pass,
-# and also for the EFI pass, whose mount point $SRC/boot/efi lives on the
-# source's /boot filesystem -- without this, /boot under $SRC is the bare mount
-# point directory of the source root and has no efi/ in it at all.
-if [ $SRC_SEP_BOOT -eq 1 ] && { [ $BOOT_PASS -eq 1 ] || [ $MIGRATE_EFI -eq 1 ]; }; then
+# The layout is agreed, so complete the source tree: without this, /boot under
+# $SRC is the bare mount point directory of the source root. Only the /boot pass
+# needs it now -- the ESP is generated on the target, never read from the source.
+if [ $SRC_SEP_BOOT -eq 1 ] && [ $BOOT_PASS -eq 1 ]; then
     if [ $BOOT_PASS -eq 0 ]; then
         # In-place /boot: this very filesystem is already mounted read-write
         # at $MNT/boot, so a second, read-only mount of it is at best redundant
@@ -1980,11 +2480,12 @@ if [ $BOOT_PASS -eq 1 ]; then
     run sudo rsync "${RSYNC_OPTS[@]}" --filter='- /efi/' --filter='P /efi/' \
         "$SRC/boot/" "$MNT/boot/"
 fi
-if [ $MIGRATE_EFI -eq 1 ]; then
-    run sudo mount -r "$SRC_EFI" "$SRC/boot/efi"
-    echo "Rsyncing EFI filesystem..."
-    run sudo rsync "${RSYNC_OPTS[@]}" "$SRC/boot/efi/" "$MNT/boot/efi/"
-fi
+# No EFI pass: the ESP is not copied. Everything on it -- GRUB's boot directory,
+# the modules, the shared menu -- is written by Phase 5 (grub-install) and
+# write_esp_menu, from this system's own GRUB. Copying the source's ESP instead
+# would drag over its master menu, whose entries name the source disk's root
+# filesystems, and on a shared ESP would bury the entries of the other systems
+# that boot from it.
 
 echo "=========================================="
 echo " Phase 4: Filesystem Translation (UUIDs)  "
@@ -2008,7 +2509,7 @@ echo "=========================================="
 echo " Phase 5: The Headless chroot Environment "
 echo "=========================================="
 if [ "$DRY_RUN" -eq 1 ]; then
-    echo "[dry-run] would chroot: update-grub + update-initramfs (grub-install bios=$INSTALL_GRUB_BIOS efi=$INSTALL_GRUB_EFI)"
+    echo "[dry-run] would chroot: grub-install --boot-directory=/boot/efi/boot (bios=$INSTALL_GRUB_BIOS efi=$INSTALL_GRUB_EFI), update-grub + update-initramfs"
 else
     # os-prober is inert on GRUB >= 2.06 unless explicitly enabled. If the
     # target enables it, concurrent update-grubs probe each other's in-flight
@@ -2019,12 +2520,15 @@ else
     fi
     run_chroot_block
 fi
+# Register this system in the menu on the ESP -- after the chroot, which is what
+# puts GRUB's boot directory there. Prints what it would write in a dry run.
+write_esp_menu
 
 echo "=========================================="
 echo " Phase 6: Post-install Verification       "
 echo "=========================================="
 if [ "$DRY_RUN" -eq 1 ]; then
-    echo "[dry-run] would verify the UUID translation in fstab/grub.cfg and the EFI routing stub"
+    echo "[dry-run] would verify the UUID translation in fstab/grub.cfg, and the ESP menu (this system registered, the others kept)"
 else
     verify_install || die "Verification failed -- the target may not boot; inspect it before relying on it."
 fi
@@ -2054,7 +2558,10 @@ echo "=========================================="
 if [ $NO_TRIM -eq 1 ]; then
     echo "Skipping fstrim on the written filesystems (--no-trim)."
 else
-    if [ $MIGRATE_EFI -eq 1 ] && supports_discard "$TGT_EFI"; then run sudo fstrim -v "$MNT/boot/efi" || true; fi
+    # The ESP is trimmed on every run, not just a formatting one: mkfs.fat has no
+    # discard of its own, and a kept ESP has just had its menu and modules
+    # rewritten, so blocks come free either way.
+    if supports_discard "$TGT_EFI"; then run sudo fstrim -v "$MNT/boot/efi" || true; fi
     if [ $UPDATE -eq 1 ]; then
         if [ $MIGRATE_ROOT -eq 1 ] && supports_discard "$TGT_ROOT"; then run sudo fstrim -v "$MNT" || true; fi
         if [ $MIGRATE_BOOT -eq 1 ] && supports_discard "$TGT_BOOT"; then run sudo fstrim -v "$MNT/boot" || true; fi
@@ -2071,22 +2578,33 @@ if [ "$DRY_RUN" -eq 0 ]; then
 fi
 cleanup   # also runs from the EXIT trap on any earlier failure
 
-# GRUB has to read whichever filesystem holds /boot: the root filesystem on a
-# disk that keeps /boot inside / (which is why the rootfs is formatted with
-# nothing GRUB cannot parse), or the /boot partition on one that has its own. Ask
-# GRUB's own ext2 driver, now that the filesystem is unmounted and consistent --
-# advisory, since a failure here means the disk will not boot but nothing on it
-# is wrong to fix.
+# GRUB reads two filesystems at boot: the ESP, for the menu and the modules
+# under its boot directory, and then whichever filesystem holds /boot, for the
+# kernel the menu points at -- the root filesystem on a disk that keeps /boot
+# inside / (which is why the rootfs is formatted with nothing GRUB cannot
+# parse), or the /boot partition on one that has its own. Ask GRUB's own drivers,
+# now that both are unmounted and consistent -- advisory, since a failure here
+# means the disk will not boot but nothing on it is wrong to fix.
 if [ "$DRY_RUN" -eq 0 ] && command -v grub-fstest >/dev/null 2>&1; then
-    if [ $TGT_SEP_BOOT -eq 1 ]; then
-        BOOT_FS="$TGT_BOOT"; BOOT_CFG="/grub/grub.cfg"
+    if sudo grub-fstest "$TGT_EFI" ls /boot/grub/grub.cfg >/dev/null 2>&1; then
+        echo "  [PASS] GRUB can read its menu at /boot/grub/grub.cfg on the ESP $TGT_EFI."
     else
-        BOOT_FS="$TGT_ROOT"; BOOT_CFG="/boot/grub/grub.cfg"
+        echo "Warning: GRUB's own FAT driver cannot read /boot/grub/grub.cfg on the ESP $TGT_EFI -- this disk is unlikely to boot." >&2
     fi
-    if sudo grub-fstest "$BOOT_FS" ls "$BOOT_CFG" >/dev/null 2>&1; then
-        echo "  [PASS] GRUB can read $BOOT_CFG on $BOOT_FS."
+    if [ $TGT_SEP_BOOT -eq 1 ]; then
+        BOOT_FS="$TGT_BOOT"; BOOT_KERNEL="/vmlinuz"
     else
-        echo "Warning: GRUB's own ext2 driver cannot read $BOOT_CFG on $BOOT_FS -- this disk is unlikely to boot." >&2
+        BOOT_FS="$TGT_ROOT"; BOOT_KERNEL="/boot/vmlinuz"
+    fi
+    # The path the menu entry actually loads, symlink and all -- the thing the
+    # ext2 driver has to resolve. Fall back to the directory it lives in, so a
+    # driver that will not follow the symlink is not reported as a broken disk.
+    if sudo grub-fstest "$BOOT_FS" ls "$BOOT_KERNEL" >/dev/null 2>&1; then
+        echo "  [PASS] GRUB can read the kernel at $BOOT_KERNEL on $BOOT_FS."
+    elif sudo grub-fstest "$BOOT_FS" ls "${BOOT_KERNEL%/*}/" >/dev/null 2>&1; then
+        echo "  [PASS] GRUB can read ${BOOT_KERNEL%/*}/ on $BOOT_FS (it would not resolve the $BOOT_KERNEL symlink here)."
+    else
+        echo "Warning: GRUB's own ext2 driver cannot read $BOOT_KERNEL on $BOOT_FS -- this disk is unlikely to boot." >&2
     fi
 fi
 
@@ -2100,7 +2618,7 @@ else
     roles=""
     if [ $MIGRATE_ROOT -eq 1 ]; then roles="$roles /"; fi
     if [ $BOOT_PASS    -eq 1 ]; then roles="$roles /boot"; fi
-    if [ $MIGRATE_EFI  -eq 1 ]; then roles="$roles EFI"; fi
+    if [ $FORMAT_EFI   -eq 1 ]; then roles="$roles EFI"; fi
     if [ -n "$SWAP_DEV" ]; then roles="$roles swap"; fi
     verb="Migrated"; [ $UPDATE -eq 1 ] && verb="Synced"
     if [ $INSTALL_GRUB_BIOS -eq 1 ] || [ $INSTALL_GRUB_EFI -eq 1 ]; then
