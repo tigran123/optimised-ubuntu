@@ -38,7 +38,7 @@ There is deliberately **no separate `/boot` partition**. It only ever existed be
 sudo grub-fstest /dev/sdb3 ls /boot/grub/
 ```
 
-Note that this is the *manual* method, and it is the one place a separate `/boot` still appears: the source machine described above has one, and the hand-run `rsync` below flattens it into the target's root. `install.sh` no longer does — separate-`/boot` support was removed from it entirely, and it refuses a source whose `fstab` still mounts `/boot` from a filesystem of its own. To deploy such a machine with `install.sh`, flatten it first (or follow the manual steps here).
+The source machine described above *does* have a separate `/boot`, and the hand-run `rsync` below flattens it into the target's root. `install.sh` does the same job with `--source-boot /dev/sda3 --no-target-boot` — and, given `--target-boot` instead, will split `/boot` back out onto a partition of its own, which is what a machine whose BIOS cannot boot from NVMe needs. Neither layout is inferred: both `--source-boot` and `--target-boot` name a partition explicitly, and where the source has one and the target is described partition by partition, saying which of the two you want is required rather than guessed.
 
 **2. Format the Filesystems**
 
@@ -168,7 +168,7 @@ vi /boot/efi/EFI/BOOT/grub.cfg
 
 ```
 
-Paste the universal logic, ensuring you insert the UUID of **whichever filesystem holds `/boot`** — the root partition `/dev/sdb3` on this layout, or a dedicated `/boot` partition on a disk that still has one. The stub detects which of the two it landed on and adjusts its `$prefix` automatically, so the same text works either way; `install.sh` writes it verbatim, always keyed to the root filesystem.
+Paste the universal logic, ensuring you insert the UUID of **whichever filesystem holds `/boot`** — the root partition `/dev/sdb3` on this layout, or a dedicated `/boot` partition on a disk that still has one. The stub detects which of the two it landed on and adjusts its `$prefix` automatically, so the same text works either way; `install.sh` writes it verbatim, keyed to whichever filesystem holds `/boot` on the disk it just built.
 
 ```text
 search --no-floppy --fs-uuid --set=root YOUR-BOOT-FILESYSTEM-UUID

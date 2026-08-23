@@ -5,6 +5,8 @@ I have made the following optimisations:
 
 * No separate `/boot` partition. It only ever existed because the rootfs carried features GRUB could not read; now that both are plain `-O sparse_super2`, GRUB reads the rootfs directly and `/boot` is just a directory in `/`. A fresh disk gets three partitions — 1 MiB BIOS Boot, 256 MiB ESP, and the root filesystem. You can check this claim yourself without booting anything, using GRUB's own ext2 driver: `grub-fstest Ubuntu26-16GB.img ls '(loop0,gpt3)/boot/grub/'`.
 
+  One machine here is the exception, and it is not about GRUB being able to *read* the kernel but about the BIOS being able to *reach* it: that BIOS cannot boot from NVMe at all, so its BIOS Boot partition, ESP and `/boot` sit on the SATA SSD (~530 MB/s) while `/` — everything the running system actually touches — lives on the NVMe (~2000 MB/s). `install.sh` supports that layout explicitly, with `--source-boot` / `--target-boot`; see below.
+
 * Disabled WiFi, printer and many other services by default (trivially enabled by commands like `sudo systemctl unmask wpa_supplicant ; sudo systemctl enable --now wpa_supplicant`, etc.
 
 * Disabled auto-loading of kernel modules for ancient hardware, like serial port, parallel port, etc. Again, re-enabled by trivial editing of files in `/etc/modprobe.d` and remaking initrd
@@ -33,7 +35,7 @@ $ ./install.sh --image Ubuntu26-Portable-16GB.img --target /dev/sda
 
 The `.img` file is distributed elsewhere -- too big to upload on GitHub, plus all the standard mp3, etc issues I don't want to have to deal with.
 
-`install.sh` is the single entry point for every flavour of deployment. Besides flashing a whole image/device, it can take a *scattered* source whose partitions live on different disks (`--source-efi` / `--source-root`) and write to either a whole device or individual `--target-*` partitions. Each role is independently left in place, migrated (reformatted + copied), or — with `--update` — **synced** onto its existing filesystem with `rsync --delete` (no reformat), so refreshing an already-installed clone is fast instead of a full rebuild. For example, to incrementally sync a system whose `/boot/efi` is on `sda` and whose root is on an NVMe drive onto an already-prepared disk `sdb`:
+`install.sh` is the single entry point for every flavour of deployment. Besides flashing a whole image/device, it can take a *scattered* source whose partitions live on different disks (`--source-efi` / `--source-root`, plus `--source-boot`) and write to either a whole device or individual `--target-*` partitions. Each role is independently left in place, migrated (reformatted + copied), or — with `--update` — **synced** onto its existing filesystem with `rsync --delete` (no reformat), so refreshing an already-installed clone is fast instead of a full rebuild. For example, to incrementally sync a system whose `/boot/efi` is on `sda` and whose root is on an NVMe drive onto an already-prepared disk `sdb`:
 
 ```
 $ ./install.sh \
@@ -42,7 +44,26 @@ $ ./install.sh \
     --target-root /dev/sdb3 --update
 ```
 
-`/boot` always lives inside `/`, on both sides — separate-`/boot` support was removed once no machine here still had one. A source that keeps `/boot` on a filesystem of its own is refused (its `fstab` is checked as soon as the source root is mounted, before anything is copied), and a leftover `/boot` partition on a target disk is left alone, unused.
+`/boot` inside `/` is the default, and a separate `/boot` is **explicit on both sides**: only `--source-boot` says the source has one, only `--target-boot` gives the target one. Nothing is guessed from a partition table — a `/boot` partition a disk happens to carry is left alone unless it is named. The source's own `fstab` is cross-checked against `--source-boot` as soon as the source root is mounted, before anything is copied, so neither mistake gets far.
+
+The two sides are independent, so the same tool builds the layout, refreshes it, or undoes it. To give a machine whose BIOS cannot boot from NVMe its BIOS Boot, ESP and `/boot` on `sda` and its root on the NVMe (all four partitions must already exist — `--target-boot` names one, it never creates one):
+
+```
+$ ./install.sh --image Ubuntu26-Portable-16GB.img \
+    --target-bios-boot /dev/sda1 --target-efi /dev/sda2 \
+    --target-boot /dev/sda3 --target-root /dev/nvme0n1p1
+```
+
+and to clone that machine back onto an ordinary three-partition disk, folding `/boot` into the root filesystem on the way:
+
+```
+$ ./install.sh \
+    --source-efi /dev/sda2 --source-boot /dev/sda3 --source-root /dev/nvme0n1p1 \
+    --no-target-boot \
+    --target-bios-boot /dev/sdb1 --target-efi /dev/sdb2 --target-root /dev/sdb3
+```
+
+`--no-target-boot` is the one that says "fold it in". When the source has a separate `/boot` and the target is described partition by partition, one of the two flags is **required**: converting a layout by accident is not something the script will do on a guess.
 
 Roles are found by GPT type and filesystem label, not by partition number, so anything *else* on either disk is none of the script's business. Deploying from a machine whose NVMe carries a big data partition alongside the rootfs needs no special flags:
 
