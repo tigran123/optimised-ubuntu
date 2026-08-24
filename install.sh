@@ -525,6 +525,23 @@ fstab_mounts_boot() {
 # Translation Operations
 # -----------------------------------------------------------------------------
 
+# target_disks — the disk(s) this install writes to: the parent disks of the
+#   target's role partitions, de-duplicated and space separated. The basis of
+#   target_disk_uuids(), and what report_fstab_disables() names when it explains
+#   that a mount was disabled because its filesystem is on none of them.
+target_disks() {
+    local d disk
+    local -a disks=()
+    for d in "$TGT_ROOT" "$TGT_EFI" "$TGT_BOOT"; do
+        [ -n "$d" ] || continue
+        disk=$(get_parent_disk "$d")
+        [ -n "$disk" ] || continue
+        case " ${disks[*]-} " in *" $disk "*) continue ;; esac
+        disks+=("$disk")
+    done
+    printf '%s' "${disks[*]-}"
+}
+
 # target_disk_uuids — the UUIDs of every filesystem on the disk(s) this install
 #   writes to, space-delimited with sentinel spaces at both ends for the awk
 #   lookups below. A mount naming one of them is not "foreign" in any sense that
@@ -534,17 +551,10 @@ fstab_mounts_boot() {
 #   source machine's other disks above all -- stays disabled, since a clone that
 #   boots elsewhere must not block on a device that is not there.
 target_disk_uuids() {
-    local d disk u out=" "
-    local -a disks=()
-    for d in "$TGT_ROOT" "$TGT_EFI" "$TGT_BOOT"; do
-        [ -n "$d" ] || continue
-        disk=$(get_parent_disk "$d")
-        [ -n "$disk" ] || continue
-        case " ${disks[*]-} " in *" $disk "*) continue ;; esac
-        disks+=("$disk")
-    done
-    for disk in "${disks[@]-}"; do
-        [ -n "$disk" ] || continue
+    local disk u out=" "
+    # Unquoted on purpose: target_disks() returns space-separated device paths,
+    # and an empty result must yield no iterations at all.
+    for disk in $(target_disks); do
         while read -r u; do
             [ -n "$u" ] || continue
             case "$out" in *" $u "*) continue ;; esac
@@ -552,6 +562,52 @@ target_disk_uuids() {
         done < <(lsblk -lno UUID "$disk" 2>/dev/null || true)
     done
     printf '%s' "$out"
+}
+
+# report_fstab_disables <records> — say what rewrite_fstab() just commented out:
+#   one line per entry, in fstab order, with the reason it went. Five mounts can
+#   vanish from a booting system's fstab in a single run -- a /data on the
+#   source's own disk and every bind hanging off it -- and the only way to find
+#   out used to be to read the file afterwards. A UUID row also names the device
+#   that UUID resolves to here, which is what makes the message actionable: it is
+#   almost always a partition of the source disk. Nothing is printed when the
+#   record file is empty. Reads the caller-set TGT_* globals via target_disks().
+report_fstab_disables() {
+    local file=$1 kind mp detail dev disks word
+    local width=14 n=0 uuid_rows=0
+    [ -s "$file" ] || return 0
+    while IFS=$'\t' read -r kind mp detail; do
+        [ ${#mp} -gt $width ] && width=${#mp}
+        n=$((n + 1))
+    done < "$file"
+    word=entries; [ "$n" -eq 1 ] && word=entry
+    disks=$(target_disks)
+    info "Disabled in the target's /etc/fstab ($n $word):"
+    while IFS=$'\t' read -r kind mp detail; do
+        case "$kind" in
+            uuid)
+                dev=""
+                [ -e "/dev/disk/by-uuid/$detail" ] && dev=$(readlink -f "/dev/disk/by-uuid/$detail")
+                printf '      %-*s UUID=%s (%s) -- not on %s\n' \
+                       "$width" "$mp" "$detail" "${dev:-not attached}" "${disks:-any target disk}"
+                uuid_rows=$((uuid_rows + 1))
+                ;;
+            bind)
+                printf '      %-*s bind on %s, disabled above\n' "$width" "$mp" "$detail" ;;
+            swapmount)
+                printf '      %-*s swap file on %s, disabled above\n' "$width" "$mp" "$detail" ;;
+            swapdrop)
+                printf '      %-*s swap file dropped by --exclude-from\n' "$width" "$mp" ;;
+            boot)
+                printf '      %-*s /boot is inside / on this target\n' "$width" "$mp" ;;
+        esac
+    done < "$file"
+    if [ "$uuid_rows" -gt 0 ]; then
+        echo "    A disk that boots elsewhere must not block on a device that is not there,"
+        echo "    so those are commented out rather than carried over. If this disk will"
+        echo "    always see them, uncomment by hand -- naming this disk's own equivalent"
+        echo "    filesystem, which does not have the source's UUID."
+    fi
 }
 
 rewrite_fstab() {
@@ -583,12 +639,19 @@ rewrite_fstab() {
     local keep_uuids
     keep_uuids=$(target_disk_uuids)
 
+    # FSTAB_REPORT: one tab-separated record (kind, mount point, detail) per line
+    # the awk disables, rendered by report_fstab_disables() below. Written by
+    # root (sudo awk) into a file this shell owns, so reading and removing it
+    # needs no privilege of its own; cleanup() sweeps it if the run dies first.
+    FSTAB_REPORT=$(mktemp /tmp/install-fstab-report.XXXXXX)
+
     sudo awk -v old_efi="$OLD_UUID_EFI" -v new_efi="$NEW_UUID_EFI" \
              -v old_root="$OLD_UUID_ROOT" -v new_root="$NEW_UUID_ROOT" \
              -v old_boot="$OLD_UUID_BOOT" -v new_boot="$NEW_UUID_BOOT" \
              -v map_boot="$map_boot" -v sep_boot="$TGT_SEP_BOOT" \
              -v has_boot="$has_boot" -v keep_uuids="$keep_uuids" \
-             -v new_swap="${NEW_UUID_SWAP:-}" -v drop_swap="$drop_swap" '
+             -v new_swap="${NEW_UUID_SWAP:-}" -v drop_swap="$drop_swap" \
+             -v report="$FSTAB_REPORT" '
     # The UUID a line mounts by, or "" when it names none (a device path, a
     # swap file, tmpfs, a bind source).
     function line_uuid(s) {
@@ -608,6 +671,13 @@ rewrite_fstab() {
         if (u == "") return 1;                             # not mounted by UUID
         if (u == new_efi || u == new_boot || u == new_root) return 1;
         return index(keep_uuids, " " u " ") > 0;
+    }
+    # One record per line this run disables, in file order, for the report the
+    # shell prints afterwards. Lines that arrived already tagged are NOT
+    # recorded: they are not news, and an --update re-sync of a disk installed
+    # this way would otherwise re-announce every one of them on every run.
+    function note(kind, mp, detail) {
+        printf "%s\t%s\t%s\n", kind, mp, detail >> report;
     }
     # The mount this path sits on: the longest of the mount points pass 1
     # resolved that prefixes it. "/" always matches, so this never comes back
@@ -691,6 +761,7 @@ rewrite_fstab() {
         # otherwise rewrite it into a bogus "mount the root filesystem at
         # /boot" line.
         if (!sep_boot && $2 == "/boot") {
+            note("boot", $2, "");
             print "# [PORTABLE-SYNC-DISABLED] " $0;
             next;
         }
@@ -713,8 +784,24 @@ rewrite_fstab() {
         # A swap file that was deliberately left off this disk: disable its
         # entry rather than leave systemd trying to swapon a missing file.
         if ($3 == "swap" && index(drop_swap, " " $1 " ") > 0) {
+            note("swapdrop", $1, "");
             print "# [PORTABLE-SYNC-DISABLED] " $0;
             next;
+        }
+
+        # A swap file is worth exactly as much as the filesystem carrying it --
+        # the rule binds already follow. When that mount is one this run just
+        # disabled, the file is unreachable and swapon -a fails at boot, so the
+        # entry goes with it. Only a mount pass 1 actually judged counts: an
+        # unrecognised carrier leaves the entry alone rather than guessing.
+        if ($3 == "swap" && substr($1, 1, 1) == "/" && $1 !~ /^\/dev\// &&
+            $0 !~ /UUID=/) {
+            carrier = nearest_mount($1);
+            if ((carrier in mp_kept) && !mp_kept[carrier]) {
+                note("swapmount", $1, carrier);
+                print "# [PORTABLE-SYNC-DISABLED] " $0;
+                next;
+            }
         }
 
         # Retarget the existing UUID-based swap entry in place (keeping its
@@ -736,6 +823,7 @@ rewrite_fstab() {
             # of the source machine, a foreign swap partition -- is disabled,
             # since a disk that boots elsewhere must not wait for it.
             if (!uuid_kept(line_uuid($0))) {
+                note("uuid", $2, line_uuid($0));
                 print "# [PORTABLE-SYNC-DISABLED] " $0;
                 next;
             }
@@ -746,6 +834,7 @@ rewrite_fstab() {
             # /var/tmp rides on / and always survives; /data/tigran ->
             # /home/tigran survives exactly as long as /data does.
             if (bind_kept[$2]) { print $0; next }
+            note("bind", $2, nearest_mount($1));
             print "# [PORTABLE-SYNC-DISABLED] " $0;
             next;
         }
@@ -760,6 +849,10 @@ rewrite_fstab() {
     sudo mv "$MNT/etc/fstab.new" "$MNT/etc/fstab"
     sudo chown root:root "$MNT/etc/fstab"
     sudo chmod 644 "$MNT/etc/fstab"
+
+    report_fstab_disables "$FSTAB_REPORT"
+    rm -f "$FSTAB_REPORT"
+    FSTAB_REPORT=""
 }
 
 # probe_target_brand — read the brand already stamped into GRUB_DISTRIBUTOR of
@@ -913,13 +1006,13 @@ esp_entry_text() {
 # Written by install.sh -- one file per rootfs registered on this ESP.
 # Root filesystem $NEW_UUID_ROOT on $TGT_ROOT; kernel read from $NEW_UUID_BOOT.
 # Deleting this file retires the system from the menu; nothing else refers to it.
-menuentry "GUI $title" {
+menuentry "Desktop $title" {
     search --no-floppy --fs-uuid --set=root $NEW_UUID_BOOT
     linux $kdir/vmlinuz $cmdline
     initrd $kdir/initrd.img
 }
 
-menuentry "TTY $title" {
+menuentry "Console $title" {
     search --no-floppy --fs-uuid --set=root $NEW_UUID_BOOT
     linux $kdir/vmlinuz $cmdline systemd.unit=multi-user.target
     initrd $kdir/initrd.img
@@ -1243,6 +1336,11 @@ declare -A SWAPFILE_TGT_SIZE=()
 # file, and whether the probe managed to read the source's fstab at all.
 SWAP_PREVIEW=()
 SWAP_PROBED=0
+
+# Where rewrite_fstab()'s awk records what it disabled, for the report printed
+# right afterwards. Held globally only so cleanup() can remove it when the run
+# ends between the mktemp and the rm (an interrupt, or a failing awk under -e).
+FSTAB_REPORT=""
 
 # Run with nothing to do: show the help rather than marching into Phase 1 and
 # failing on the *default* source path, which says nothing about what went
@@ -1629,6 +1727,7 @@ cleanup() {
     # rmdir, never rm -rf: failing on a still-mounted/busy dir is the safety net.
     if [ "$MNT_AUTO" -eq 1 ]; then rmdir "$MNT" 2>/dev/null || true; fi
     if [ "$SRC_AUTO" -eq 1 ]; then rmdir "$SRC" 2>/dev/null || true; fi
+    if [ -n "${FSTAB_REPORT:-}" ]; then rm -f "$FSTAB_REPORT"; fi
 }
 trap cleanup EXIT
 # Turn fatal signals into a normal exit so the EXIT trap runs (bash does not
@@ -2294,7 +2393,7 @@ if [ $UPDATE -eq 0 ]; then
             fi
             ROOT_BYTES_PER_INODE=$(( 1024**4 / (4 * 1024**2) ))
             CALC_INODES=$(( TGT_BYTES / ROOT_BYTES_PER_INODE ))
-            MIN_INODES=$(( 3*1024**2/2 )) # 1.5M inodes minimum
+            MIN_INODES=$(( 1024**2 )) # 1M inodes minimum
             TARGET_INODES=$(( CALC_INODES < MIN_INODES ? MIN_INODES : CALC_INODES ))
         fi
 
@@ -2492,6 +2591,7 @@ echo " Phase 4: Filesystem Translation (UUIDs)  "
 echo "=========================================="
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "[dry-run] would rewrite fstab + GRUB root UUID and (re)brand the GRUB menu as \"$TGT_MODEL\""
+    echo "[dry-run] cannot list the fstab entries it would disable: that needs the target's own fstab, which is only readable once mounted"
 else
     # rewrite_fstab also retargets (or, if absent, appends) the swap entry to
     # NEW_UUID_SWAP when a swap device was given.
