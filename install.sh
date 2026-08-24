@@ -643,7 +643,23 @@ rewrite_fstab() {
     # the awk disables, rendered by report_fstab_disables() below. Written by
     # root (sudo awk) into a file this shell owns, so reading and removing it
     # needs no privilege of its own; cleanup() sweeps it if the run dies first.
-    FSTAB_REPORT=$(mktemp /tmp/install-fstab-report.XXXXXX)
+    #
+    # It lives in a private directory of our own, NOT straight in /tmp. /tmp is
+    # root-owned, world-writable and sticky, and fs.protected_regular (2 on
+    # Ubuntu) then refuses root an O_CREAT open of a file it does not own there
+    # -- so a report file this shell creates in /tmp is precisely one the sudo
+    # awk below cannot write. mawk treats a failed output redirection as fatal,
+    # so that killed the run in Phase 4 with the copy already done and the fstab
+    # not yet translated, all over a side-channel. A mktemp -d directory carries
+    # no sticky bit, so may_create_in_sticky() never applies inside it.
+    FSTAB_REPORT_DIR=$(mktemp -d /tmp/install-report.XXXXXX) || FSTAB_REPORT_DIR=""
+    if [ -n "$FSTAB_REPORT_DIR" ]; then
+        FSTAB_REPORT="$FSTAB_REPORT_DIR/disabled"
+        : > "$FSTAB_REPORT"
+    else
+        FSTAB_REPORT=""
+        echo "Warning: no temp dir for the fstab report; entries will still be disabled, just not listed." >&2
+    fi
 
     sudo awk -v old_efi="$OLD_UUID_EFI" -v new_efi="$NEW_UUID_EFI" \
              -v old_root="$OLD_UUID_ROOT" -v new_root="$NEW_UUID_ROOT" \
@@ -677,6 +693,7 @@ rewrite_fstab() {
     # recorded: they are not news, and an --update re-sync of a disk installed
     # this way would otherwise re-announce every one of them on every run.
     function note(kind, mp, detail) {
+        if (report == "") return;   # unreportable: still disable the line
         printf "%s\t%s\t%s\n", kind, mp, detail >> report;
     }
     # The mount this path sits on: the longest of the mount points pass 1
@@ -851,8 +868,9 @@ rewrite_fstab() {
     sudo chmod 644 "$MNT/etc/fstab"
 
     report_fstab_disables "$FSTAB_REPORT"
-    rm -f "$FSTAB_REPORT"
+    if [ -n "$FSTAB_REPORT_DIR" ]; then rm -rf "$FSTAB_REPORT_DIR"; fi
     FSTAB_REPORT=""
+    FSTAB_REPORT_DIR=""
 }
 
 # probe_target_brand — read the brand already stamped into GRUB_DISTRIBUTOR of
@@ -1006,13 +1024,13 @@ esp_entry_text() {
 # Written by install.sh -- one file per rootfs registered on this ESP.
 # Root filesystem $NEW_UUID_ROOT on $TGT_ROOT; kernel read from $NEW_UUID_BOOT.
 # Deleting this file retires the system from the menu; nothing else refers to it.
-menuentry "Desktop $title" {
+menuentry "GUI $title" {
     search --no-floppy --fs-uuid --set=root $NEW_UUID_BOOT
     linux $kdir/vmlinuz $cmdline
     initrd $kdir/initrd.img
 }
 
-menuentry "Console $title" {
+menuentry "TTY $title" {
     search --no-floppy --fs-uuid --set=root $NEW_UUID_BOOT
     linux $kdir/vmlinuz $cmdline systemd.unit=multi-user.target
     initrd $kdir/initrd.img
@@ -1350,9 +1368,11 @@ SWAP_PREVIEW=()
 SWAP_PROBED=0
 
 # Where rewrite_fstab()'s awk records what it disabled, for the report printed
-# right afterwards. Held globally only so cleanup() can remove it when the run
-# ends between the mktemp and the rm (an interrupt, or a failing awk under -e).
+# right afterwards. Held globally only so cleanup() can remove the directory
+# when the run ends between the mktemp and the rm (an interrupt, or a failing
+# awk under -e).
 FSTAB_REPORT=""
+FSTAB_REPORT_DIR=""
 
 # Run with nothing to do: show the help rather than marching into Phase 1 and
 # failing on the *default* source path, which says nothing about what went
@@ -1780,7 +1800,7 @@ cleanup() {
     # rmdir, never rm -rf: failing on a still-mounted/busy dir is the safety net.
     if [ "$MNT_AUTO" -eq 1 ]; then rmdir "$MNT" 2>/dev/null || true; fi
     if [ "$SRC_AUTO" -eq 1 ]; then rmdir "$SRC" 2>/dev/null || true; fi
-    if [ -n "${FSTAB_REPORT:-}" ]; then rm -f "$FSTAB_REPORT"; fi
+    if [ -n "${FSTAB_REPORT_DIR:-}" ]; then rm -rf "$FSTAB_REPORT_DIR"; fi
 }
 trap cleanup EXIT
 # Turn fatal signals into a normal exit so the EXIT trap runs (bash does not
