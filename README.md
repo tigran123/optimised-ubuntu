@@ -71,7 +71,7 @@ Roles are found by GPT type and filesystem label, not by partition number, so an
 $ ./install.sh --source /dev/nvme0n1 --target /dev/sdb
 ```
 
-The one case that is an error rather than a guess is a disk whose root is ambiguous — several unlabelled Linux partitions and none labelled `root`, or several *labelled* `root`: the script stops and names the candidates, since picking wrong would mean reformatting the wrong partition. Say which one it is with `--source-root` / `--target-root`, or label it (`sudo e2label /dev/sdX3 root`).
+The one case that is an error rather than a guess is a disk whose root is ambiguous — several unlabelled Linux partitions and none labelled `root`, or several *labelled* `root`: the script stops and names the candidates, since picking wrong would mean reformatting the wrong partition. Say which one it is with `--source-root` / `--target-root`, or label it (`sudo e2label /dev/sdX3 root`). `root` is the only label that scan looks for, and `--target-root-label` chooses the one `install.sh` writes — so a rootfs labelled anything else is out of the scan for good, and is named partition by partition from then on.
 
 ## One disk, several machines, one menu
 
@@ -90,10 +90,10 @@ Adding a second machine's rootfs to a disk that already boots one means keeping 
 ```
 $ ./install.sh --image Ubuntu26-Portable-16GB.img --keep-efi \
     --target-bios-boot /dev/sde1 --target-efi /dev/sde2 \
-    --target-root /dev/sde5 --brand Laptop
+    --target-root /dev/sde5 --brand Laptop --target-root-label laptop
 ```
 
-`--brand` is worth passing here: without it every slot on the disk is named after the disk's own model, and the menu ends up listing the same title three times. The summary printed before the confirmation gate names the entry being registered, the command line it will boot with, and every system already registered on that ESP that the run will keep.
+`--brand` is worth passing here: without it every slot on the disk is named after the disk's own model, and the menu ends up listing the same title three times. `--target-root-label` is its counterpart on the disk itself: it labels this slot's root filesystem `laptop` rather than the `root` that every slot otherwise carries, so `lsblk` tells them apart at a glance. It does not make the disk scannable — a rootfs labelled anything but `root` is not what a whole-disk scan looks for, and such a disk is addressed partition by partition either way. The summary printed before the confirmation gate names the entry being registered, the command line it will boot with, and every system already registered on that ESP that the run will keep.
 
 The `fstab` of such a system survives the copy: a mount whose UUID is on the disk being installed is kept (a shared `/data` partition is present exactly when the system is), and so are the bind mounts hanging off it. Mounts naming *another* machine's disk are still commented out, along with the binds that depend on them — a clone that boots elsewhere must not block on a device that is not there.
 

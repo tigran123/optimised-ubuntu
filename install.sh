@@ -1180,6 +1180,7 @@ verify_install() {
                               END { exit !found }' "$2"
     }
     no_boot_entry() { ! fstab_mounts_boot "$1"; }
+    root_label_is() { [ "$(sudo blkid -c /dev/null -s LABEL -o value "$1")" = "$2" ]; }
 
     vcheck "fstab mounts / by the new root UUID"       sudo grep -qF "$NEW_UUID_ROOT" "$MNT/etc/fstab"
     if [ "$TGT_SEP_BOOT" -eq 1 ]; then
@@ -1253,6 +1254,12 @@ verify_install() {
     # check cannot see (an unlisted mount, a bind).
     vcheck "a kernel image is present under /boot" \
         sudo sh -c 'ls "$1"/boot/vmlinuz-* >/dev/null 2>&1' _ "$MNT"
+    # Only when a label was actually asked for: an --update onto a disk whose root
+    # this toolkit never labelled is entitled to whatever it already carries.
+    if [ -n "$TGT_ROOT_LABEL" ]; then
+        vcheck "the root filesystem is labelled \"$ROOT_LABEL\"" \
+            root_label_is "$TGT_ROOT" "$ROOT_LABEL"
+    fi
 
     local sf
     for sf in "${SWAPFILES_REBUILT[@]}"; do
@@ -1300,6 +1307,11 @@ INODES_ROOT="${INODES_ROOT:-}"
 # Empty = the default 256 MiB ESP; --target-efi-size overrides it (fresh --target only).
 TGT_EFI_SIZE="${TGT_EFI_SIZE:-}"
 ESP_MIB=256
+# Empty = the target's root filesystem is labelled "root"; --target-root-label
+# overrides it. ROOT_LABEL is the resolved label and is never empty: it is what
+# reaches mkfs.ext4 -L / e2label, either of which would clear the label instead.
+TGT_ROOT_LABEL="${TGT_ROOT_LABEL:-}"
+ROOT_LABEL=root
 DRY_RUN=0
 UPDATE=0
 NO_TRIM=0
@@ -1375,6 +1387,7 @@ while [ $# -gt 0 ]; do
         --brand)          BRAND="$2"; shift 2 ;;
         --inodes-root)    INODES_ROOT="$2"; shift 2 ;;
         --target-efi-size) TGT_EFI_SIZE="$2"; shift 2 ;;
+        --target-root-label) TGT_ROOT_LABEL="$2"; shift 2 ;;
         --dry-run)        DRY_RUN=1; shift ;;
         --update)         UPDATE=1; shift ;;
         --no-trim)        NO_TRIM=1; shift ;;
@@ -1402,8 +1415,11 @@ type and filesystem label, so any other partition on either disk (data, swap,
 an unnamed /boot, another distro) is ignored -- but a disk with several
 unlabelled Linux partitions, or several labelled "root", is an error rather than
 a guess: name root with --source-root / --target-root, or label it
-(e2label PART root). A disk carrying one rootfs per machine behind a shared ESP
-is exactly that case, and is always addressed partition by partition.
+(e2label PART root). "root" is the only label that scan looks for, and
+--target-root-label chooses the one this script writes -- so labelling a rootfs
+anything else takes it out of the scan for good. A disk carrying one rootfs per
+machine behind a shared ESP is exactly that case, and is always addressed
+partition by partition.
 
 The ESP is the exception to "migrated": it is never copied from the source.
 GRUB is installed onto it with its boot directory there (/boot/efi/boot/grub),
@@ -1478,6 +1494,22 @@ Other:
                               1.5M floor is not applied. Only relevant when the
                               root filesystem is actually formatted (not under
                               --update, which keeps the existing one).
+  --target-root-label LABEL   Label the target's root filesystem LABEL instead of
+                              "root". Stamped by the root mkfs.ext4 -L when this
+                              run formats it, and by e2label under --update, which
+                              keeps the filesystem (its UUID is untouched either
+                              way). Refused when --target-root resolves in place:
+                              that filesystem is the source's own, and relabelling
+                              it would rename the disk being copied FROM. At most
+                              16 bytes (the ext4 label field), and "boot" is
+                              refused, since a boot-labelled partition is skipped
+                              by the disk scan on purpose. Note that "root" is the
+                              only label that scan looks for, so a rootfs carrying
+                              any other one is no longer found by a whole-disk
+                              --source / --target and has to be named with
+                              --source-root / --target-root. That is the point of
+                              it: it is what tells the slots of a disk carrying a
+                              rootfs per machine apart.
   --sparse                    Add -S to the rsync, re-creating each run of nulls
                               in the source as a hole rather than writing it out.
                               Off by default: a hole costs an entry in the file's
@@ -1545,10 +1577,11 @@ Examples:
   $0 --source /dev/nvme0n1 --target /dev/sda
 
   # Add a second machine's rootfs to a disk that already boots one: keep the
-  # shared ESP (and register this system in the menu on it), format only sde5:
+  # shared ESP (and register this system in the menu on it), format only sde5,
+  # and label it so this disk's slots can be told apart:
   $0 --image Ubuntu26-Portable-16GB.img --keep-efi \\
      --target-bios-boot /dev/sde1 --target-efi /dev/sde2 \\
-     --target-root /dev/sde5 --brand Laptop
+     --target-root /dev/sde5 --brand Laptop --target-root-label laptop
 
   # Migrate ONLY the root filesystem to a new partition, keeping EFI in place:
   $0 --source-efi /dev/sda2 --source-root /dev/sda3 \\
@@ -1587,7 +1620,8 @@ Examples:
      --exclude-from exclude-personal.txt
 
 Most options also read from the matching environment variable (SOURCE, TARGET,
-SRC_ROOT, SRC_BOOT, TGT_ROOT, TGT_BOOT, TGT_SWAP, EXCLUDE_FROM, ...).
+SRC_ROOT, SRC_BOOT, TGT_ROOT, TGT_BOOT, TGT_ROOT_LABEL, TGT_SWAP, EXCLUDE_FROM,
+...).
 USAGE
             exit 0 ;;
         *) die "Unknown argument: $1 (try --help)" ;;
@@ -1643,6 +1677,25 @@ if [ -n "$TGT_EFI_SIZE" ]; then
     else
         die "--target-efi-size must be a positive integer, optionally with a k, M or G suffix (e.g. 256, 512M, 1G)."
     fi
+fi
+
+# --target-root-label reaches the root filesystem's superblock -- mkfs.ext4 -L when
+# this run formats it, e2label when --update keeps it. Checked here for the same
+# reason as the two above: mke2fs silently truncates a label that does not fit, and
+# stamping something the caller did not ask for is worse than refusing it. An empty
+# value means "not given" and leaves the label "root", as an empty --brand does.
+if [ -n "$TGT_ROOT_LABEL" ]; then
+    # ext4's s_volume_name is 16 bytes with no room for a terminator, so count
+    # bytes: ${#var} counts characters, which differ in a UTF-8 locale.
+    label_bytes=$(printf %s "$TGT_ROOT_LABEL" | wc -c)
+    [ "$label_bytes" -le 16 ] || \
+        die "--target-root-label must fit in 16 bytes (the ext4 label field); \"$TGT_ROOT_LABEL\" needs $label_bytes."
+    # scan_disk_roles() skips a boot-labelled Linux partition on purpose, so a root
+    # filesystem wearing that label would be invisible to every whole-disk scan --
+    # and would read as a separate /boot to the next person to look at the disk.
+    [ "$TGT_ROOT_LABEL" != boot ] || \
+        die "--target-root-label boot is refused: the disk scan skips boot-labelled partitions, so a root filesystem labelled 'boot' could never be found by one again."
+    ROOT_LABEL="$TGT_ROOT_LABEL"
 fi
 
 # Front-load the sudo password prompt before any resources are acquired, so it
@@ -2066,6 +2119,15 @@ if [ $FORMAT_EFI -eq 0 ] && [ $BOOT_PASS -eq 0 ] && [ $MIGRATE_ROOT -eq 0 ] && [
     die "Nothing to do: every role resolves in-place and no swap was given."
 fi
 
+# --target-root-label reaches the root filesystem's superblock, written either by
+# the mkfs that creates it or by the e2label that renames one --update keeps. An
+# in-place root is neither: that filesystem is the source's own, mounted here and
+# not otherwise touched, so relabelling it would rename the disk we copy FROM.
+# Refuse rather than ignore it (the --target-efi-size precedent above).
+if [ -n "$TGT_ROOT_LABEL" ] && [ $MIGRATE_ROOT -eq 0 ]; then
+    die "--target-root-label needs a root filesystem this run writes, but --target-root ($TGT_ROOT) is the source's own and is left in place."
+fi
+
 # An ESP this run does not format is one it trusts: it must already hold a FAT
 # filesystem, or Phase 3 fails on the mount with the target half-written. Not
 # just under --update -- --keep-efi and an in-place ESP are the same bet.
@@ -2222,6 +2284,9 @@ if [ $FORMAT_EFI -eq 0 ]; then probe_esp_menu; fi
 # case write_esp_menu() retires its menu entry along with it, rather than leave
 # the menu advertising a UUID that no longer exists.
 TGT_ROOT_UUID_NOW=$(sudo blkid -c /dev/null -s UUID -o value "$TGT_ROOT" 2>/dev/null || true)
+# ...and the label it wears now, so the summary can say what --target-root-label
+# changes it FROM, and so an e2label that would change nothing is skipped.
+TGT_ROOT_LABEL_NOW=$(sudo blkid -c /dev/null -s LABEL -o value "$TGT_ROOT" 2>/dev/null || true)
 
 echo
 echo "About to install:"
@@ -2319,6 +2384,19 @@ fi
 if [ -n "$INODES_ROOT" ] && [ $MIGRATE_ROOT -eq 1 ] && [ $UPDATE -eq 0 ]; then
     echo "  Inodes:   root mkfs -N $INODES_ROOT (--inodes-root override)"
 fi
+if [ -n "$TGT_ROOT_LABEL" ]; then
+    if [ $UPDATE -eq 0 ]; then
+        summary_row "Label:" "root mkfs -L $ROOT_LABEL (--target-root-label override)"
+    elif [ "$TGT_ROOT_LABEL_NOW" = "$ROOT_LABEL" ]; then
+        summary_row "Label:" "root filesystem already labelled \"$ROOT_LABEL\" (--target-root-label: nothing to do)"
+    else
+        summary_row "Label:" "relabel the root filesystem \"${TGT_ROOT_LABEL_NOW:-<none>}\" -> \"$ROOT_LABEL\" (e2label; --update keeps the filesystem)"
+    fi
+    # The one consequence a reader must not have to work out for themselves: this
+    # rootfs has just left the set a whole-disk scan can resolve.
+    [ "$ROOT_LABEL" = root ] || summary_row "" \
+        "not \"root\", so a whole-disk --source/--target will no longer find it: name this partition with --source-root/--target-root"
+fi
 if [ $NO_TRIM -eq 1 ]; then
     echo "  Trim:     skipped (--no-trim)"
 fi
@@ -2360,9 +2438,11 @@ if [ $UNIFIED_TARGET -eq 1 ] && [ $UPDATE -eq 0 ]; then
 fi
 
 # ---- Format the migrated roles ----
-# Skipped entirely under --update, which keeps each target filesystem intact and
-# only rsyncs --delete onto it. (--target-swap reformatting is independent: it is
-# an explicit opt-in and still honoured below.)
+# Skipped under --update, which keeps each target filesystem intact and only
+# rsyncs --delete onto it -- all but the root filesystem's LABEL, the one piece of
+# metadata --target-root-label still stamps on a filesystem that is kept.
+# (--target-swap reformatting is independent: it is an explicit opt-in and still
+# honoured below.)
 if [ $UPDATE -eq 0 ]; then
     if [ $FORMAT_EFI -eq 1 ]; then
         run sudo wipefs -q -a "$TGT_EFI"
@@ -2397,8 +2477,15 @@ if [ $UPDATE -eq 0 ]; then
             TARGET_INODES=$(( CALC_INODES < MIN_INODES ? MIN_INODES : CALC_INODES ))
         fi
 
-        run sudo mkfs.ext4 -vF -m 0 -L root -N "$TARGET_INODES" -E lazy_itable_init=0,lazy_journal_init=0 -O sparse_super2 "$TGT_ROOT"
+        run sudo mkfs.ext4 -vF -m 0 -L "$ROOT_LABEL" -N "$TARGET_INODES" -E lazy_itable_init=0,lazy_journal_init=0 -O sparse_super2 "$TGT_ROOT"
     fi
+elif [ -n "$TGT_ROOT_LABEL" ] && [ "$TGT_ROOT_LABEL_NOW" != "$ROOT_LABEL" ]; then
+    # No mkfs runs under --update, so this is where a kept root filesystem gets
+    # the label it was asked for. Here rather than in Phase 3 because the
+    # partition is not mounted yet; and e2label leaves the UUID alone, so fstab,
+    # the ESP menu and everything verified afterwards are untouched by it.
+    info "Relabelling $TGT_ROOT: \"${TGT_ROOT_LABEL_NOW:-<none>}\" -> \"$ROOT_LABEL\""
+    run sudo e2label "$TGT_ROOT" "$ROOT_LABEL"
 fi
 if [ "$DO_MKSWAP" -eq 1 ]; then
     run sudo wipefs -q -a "$SWAP_DEV"
