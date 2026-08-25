@@ -407,6 +407,10 @@ probe_source_swapfiles() {
     # options now, so the summary can show the command line the disk will boot
     # with (see probe_menu_cmdline, which only mounts anything if this did not).
     MENU_CMDLINE_PREVIEW=$(grub_cmdline_options "$SRC")
+    # The same mount answers the rest of what the summary needs from the source:
+    # which regenerable caches this run drops, and which --exclude-from rules
+    # cannot match because a bind puts their data somewhere else.
+    probe_source_layout
     sudo umount "$SRC" || true
 }
 
@@ -519,6 +523,253 @@ fstab_disabled() {
 #   was written into the target's fstab.
 fstab_mounts_boot() {
     sudo awk '$1 !~ /^#/ && $2 == "/boot" { found = 1 } END { exit !found }' "$1"
+}
+
+# -----------------------------------------------------------------------------
+# Bind-aware paths
+# -----------------------------------------------------------------------------
+# The rsync sees the source's root filesystem RAW: mounted read-only at $SRC
+# with none of its bind mounts replayed. A path as the running system shows it
+# is therefore not necessarily the path the same data has in the transfer. On a
+# disk whose slots share one /data, ~/.cache is a bind of /var/local/<...>/cache
+# -- on the root filesystem, and copied -- while /home/<user> itself is a bind
+# of a directory on the data partition, which -x never enters at all. So a rule
+# written as /home/<user>/.cache/... matches nothing, and one written as
+# /home/<user>/.ssh/id_ed25519 silently fails to strip a private key. Both
+# helpers below translate between the two namespaces, with the source's own
+# fstab as the authority -- the same principle as fstab_mounts_boot() and
+# swapfile_entries(), and for the same reason: the layout is the source's to
+# declare, never ours to guess.
+
+# fstab_mount_table <fstab> — one row per mount point, tab separated:
+#   <mountpoint>\t<fs|bind>\t<source>\t<onroot>, where onroot is 1 when files
+#   under that mount point live on the ROOT filesystem (so: only for a bind
+#   whose source resolves onto /). "/" itself and swap entries are not emitted.
+#   Binds resolve in file order, each joining the table as it goes, so a bind
+#   riding another bind is judged by the one it rides on -- the same rule, for
+#   the same reason (mount -a walks fstab in order), as rewrite_fstab()'s pass 1.
+fstab_mount_table() {
+    sudo awk '
+        function nearest(path,   mp, best, bestlen) {
+            best = "/"; bestlen = 0;
+            for (mp in onroot) {
+                if (mp == "/" || length(mp) <= bestlen) continue;
+                if (path == mp || substr(path, 1, length(mp) + 1) == mp "/")
+                    { best = mp; bestlen = length(mp) }
+            }
+            return best;
+        }
+        BEGIN { onroot["/"] = 1 }
+        $0 ~ /^[[:space:]]*#/ || NF < 3 { next }
+        {
+            if ($4 ~ /(^|,)bind(,|$)/) { nb++; bsrc[nb] = $1; bmp[nb] = $2; next }
+            if ($3 == "swap" || substr($2, 1, 1) != "/" || $2 == "/") next;
+            if (!($2 in kind)) order[++n] = $2;
+            kind[$2] = "fs"; src[$2] = $1; onroot[$2] = 0;
+        }
+        END {
+            for (i = 1; i <= nb; i++) {
+                if (!(bmp[i] in kind)) order[++n] = bmp[i];
+                kind[bmp[i]] = "bind"; src[bmp[i]] = bsrc[i];
+                onroot[bmp[i]] = onroot[nearest(bsrc[i])];
+            }
+            for (i = 1; i <= n; i++)
+                printf "%s\t%s\t%s\t%d\n", order[i], kind[order[i]], src[order[i]], onroot[order[i]];
+        }' "$1"
+}
+
+# fstab_realpath <path> — translate <path> from the namespace of the running
+#   source system into the path the same data has in the raw root filesystem,
+#   following bind mounts as far as they go. Prints the translated path and
+#   returns 0 when the data really is on the root filesystem (so the root rsync
+#   can see it); returns 1 when it sits on another filesystem, which -x never
+#   enters and no rule can reach. Reads the caller-set FSTAB_TABLE.
+fstab_realpath() {
+    local path=$1 hops=0 mp kind src onroot
+    local best best_kind best_src bestlen rest
+    while [ "$hops" -lt 16 ]; do
+        best=""; best_kind=""; best_src=""; bestlen=0
+        while IFS=$'\t' read -r mp kind src onroot; do
+            [ -n "$mp" ] || continue
+            [ "${#mp}" -gt "$bestlen" ] || continue
+            if [ "$path" = "$mp" ] || [ "${path#"$mp"/}" != "$path" ]; then
+                best=$mp; bestlen=${#mp}; best_kind=$kind; best_src=$src
+            fi
+        done <<<"$FSTAB_TABLE"
+        # Nothing but / above it: the path is already a root-filesystem path.
+        [ -n "$best" ] || { printf '%s\n' "$path"; return 0; }
+        [ "$best_kind" = bind ] || return 1
+        rest=${path#"$best"}
+        path="$best_src$rest"
+        hops=$((hops + 1))
+    done
+    return 1    # a bind that points into itself; nothing sane to report
+}
+
+# -----------------------------------------------------------------------------
+# Regenerable caches
+# -----------------------------------------------------------------------------
+# A browser cache is the one part of a home directory that is pure derived data.
+# ~/.cache/google-chrome is nothing but Default/Cache (the HTTP cache),
+# Default/Code Cache (compiled JS) and a GPU shader cache: a gigabyte of small
+# files, measured at 948 MB / 21,539 files here, that Chrome rebuilds on demand.
+# Nothing in it is unique -- passwords, cookies, bookmarks and extensions all
+# live in ~/.config/google-chrome, which IS copied -- so it is dropped from the
+# transfer by default, and from the target too when there is a stale one there
+# to delete. --keep-cache turns that off and copies it like anything else.
+CACHE_DROP_NAMES=(google-chrome google-chrome-headless)
+
+# cache_drop_paths — print the cache directories to drop, as absolute paths in
+#   the transfer (i.e. in the raw root filesystem), one per line. Candidates are
+#   named in the running system's namespace -- /root/.cache, every /home/*/.cache
+#   and any .cache the fstab mounts somewhere -- and then translated by
+#   fstab_realpath, which is what finds /var/local/<...>/cache behind a bound
+#   ~/.cache and drops a .cache that lives on another filesystem entirely.
+#   Reads caller globals (SRC, FSTAB_TABLE, CACHE_DROP_NAMES).
+cache_drop_paths() {
+    local d cand real name mp kind src onroot
+    local -a cands=(/root/.cache)
+    for d in "$SRC"/home/*/; do
+        [ -d "$d" ] || continue
+        d=${d%/}
+        cands+=("/home/${d##*/}/.cache")
+    done
+    while IFS=$'\t' read -r mp kind src onroot; do
+        if [ "${mp##*/}" = .cache ]; then cands+=("$mp"); fi
+    done <<<"$FSTAB_TABLE"
+    for cand in "${cands[@]}"; do
+        real=$(fstab_realpath "$cand") || continue
+        for name in "${CACHE_DROP_NAMES[@]}"; do
+            if sudo test -d "$SRC$real/$name"; then printf '%s\n' "$real/$name"; fi
+        done
+    done | sort -u
+}
+
+# probe_source_layout — everything the summary needs to know about the source's
+#   own mount layout, read through the transient read-only mount that
+#   probe_source_swapfiles() already holds: the caches this run will drop, and
+#   the --exclude-from rules that cannot match because a bind puts their data
+#   somewhere else. Best-effort exactly like the swap preview: CACHE_PROBED
+#   stays 0 when the source cannot be read here (a dry run against an image
+#   attaches no loop device), and the summary then says so rather than promise a
+#   drop it could not confirm. Fills FSTAB_TABLE, CACHE_PREVIEW and
+#   EXCLUDE_AUDIT; scan_cache_drops() is the authoritative pass.
+probe_source_layout() {
+    CACHE_PREVIEW=(); CACHE_PROBED=0; EXCLUDE_AUDIT=()
+    [ -f "$SRC/etc/fstab" ] || return 0
+    FSTAB_TABLE=$(fstab_mount_table "$SRC/etc/fstab")
+    if [ $KEEP_CACHE -eq 0 ]; then
+        mapfile -t CACHE_PREVIEW < <(cache_drop_paths)
+        CACHE_PROBED=1
+    fi
+    if [ -n "$EXCLUDE_FROM" ]; then
+        mapfile -t EXCLUDE_AUDIT < <(exclude_rules_unmatchable)
+    fi
+}
+
+# scan_cache_drops — the authoritative pass, run in Phase 3 with the source
+#   really mounted (the sibling of scan_swapfiles): fills CACHE_DROPS with the
+#   paths and CACHE_FILTERS with the rsync rules that drop them.
+#   The rule is "H" (hide) and NOT --exclude, because an exclude is also a
+#   receiver-side PROTECT rule: under --update's --delete the copy already on
+#   the target would survive, which is the opposite of what dropping a cache is
+#   for. Hidden is sender-side only, so the target's copy goes the way of
+#   everything else the source no longer has. (This is the mirror image of the
+#   "- /boot/" + "P /boot/" pair in Phase 3, which wants exactly the protection
+#   that would be wrong here.) Without --update there is no --delete and nothing
+#   to delete either: the target root has just been formatted.
+scan_cache_drops() {
+    local p
+    CACHE_DROPS=(); CACHE_FILTERS=()
+    [ $KEEP_CACHE -eq 0 ] || return 0
+    [ -f "$SRC/etc/fstab" ] || return 0
+    FSTAB_TABLE=$(fstab_mount_table "$SRC/etc/fstab")
+    mapfile -t CACHE_DROPS < <(cache_drop_paths)
+    for p in ${CACHE_DROPS[@]+"${CACHE_DROPS[@]}"}; do
+        info "Dropping regenerable cache $p (never copied; removed from the target if present)."
+        CACHE_FILTERS+=(--filter="H $p/")
+    done
+}
+
+# cache_filters_from_preview — the same rules as scan_cache_drops(), built from
+#   what the pre-confirmation probe found instead of from a mounted source. A
+#   dry run never mounts anything in Phase 3, and the assembled rsync command it
+#   prints is the thing worth reviewing, so it should carry the real rules.
+cache_filters_from_preview() {
+    local p
+    CACHE_DROPS=(); CACHE_FILTERS=()
+    [ $KEEP_CACHE -eq 0 ] || return 0
+    if [ "$CACHE_PROBED" -eq 0 ]; then
+        echo "[dry-run] ...and the source's mount layout could not be read here either, so the command below omits the --filter='H ...' rule that would drop each regenerable browser cache"
+        return 0
+    fi
+    for p in ${CACHE_PREVIEW[@]+"${CACHE_PREVIEW[@]}"}; do
+        CACHE_DROPS+=("$p")
+        CACHE_FILTERS+=(--filter="H $p/")
+    done
+}
+
+# exclude_rules_unmatchable — audit an --exclude-from file against the source's
+#   real mount layout and print the rules that cannot match, tab separated:
+#     bind\t<rule>\t<the path that data really has>
+#       the rule's data IS in the transfer, under another name. This is the one
+#       that matters: a private key or a browser profile the author believes is
+#       being stripped from an impersonal clone, and is not.
+#     foreign\t<rule>\t
+#       the rule names a path on another filesystem, which -x never enters, so
+#       the rule is a harmless no-op rather than a hole.
+#   Only anchored rules ("/...") can be judged: an unanchored pattern matches on
+#   name alone and is not tied to any mount point. Reads EXCLUDE_FROM and
+#   FSTAB_TABLE.
+exclude_rules_unmatchable() {
+    local rule real
+    local -a rules=()
+    local -A have=()
+    [ -n "$EXCLUDE_FROM" ] || return 0
+    while IFS= read -r rule; do
+        rule=${rule%$'\r'}
+        case $rule in
+            ''|'#'*|';'*|'+ '*|'+_'*) continue ;;
+        esac
+        rule=${rule#- }; rule=${rule#-_}
+        [ "${rule#/}" != "$rule" ] || continue
+        rules+=("$rule"); have[$rule]=1
+    done < "$EXCLUDE_FROM"
+    for rule in ${rules[@]+"${rules[@]}"}; do
+        if real=$(fstab_realpath "$rule"); then
+            [ "$real" != "$rule" ] || continue
+            # Already handled: the file carries the translated path as well, so
+            # the pair covers this layout and the plain one, and there is
+            # nothing left to report. This is what lets an exclude file be
+            # fixed once and stop being announced on every subsequent sync.
+            [ -z "${have[$real]:-}" ] || continue
+            printf 'bind\t%s\t%s\n' "$rule" "$real"
+        else
+            printf 'foreign\t%s\t\n' "$rule"
+        fi
+    done
+}
+
+# report_exclude_audit — render that audit under the summary's "Excludes:" row.
+#   The bind rows are the point of the exercise: each names a rule whose data IS
+#   in the transfer under a different path, so the rule as written strips
+#   nothing -- which is how a private key or a browser profile ends up on a
+#   clone meant to be impersonal. The foreign rows are counted only: they name
+#   paths on other filesystems, which -x never enters, so they are no-ops.
+report_exclude_audit() {
+    local row kind rule real foreign=0
+    local -a hits=()
+    for row in ${EXCLUDE_AUDIT[@]+"${EXCLUDE_AUDIT[@]}"}; do
+        IFS=$'\t' read -r kind rule real <<<"$row"
+        if [ "$kind" = bind ]; then hits+=("$rule -> $real"); else foreign=$((foreign+1)); fi
+    done
+    if [ ${#hits[@]} -gt 0 ]; then
+        summary_row "" "WARNING: ${#hits[@]} rule(s) strip nothing -- the source binds their data in from elsewhere:"
+        for row in "${hits[@]}"; do summary_row "" "  $row"; done
+    fi
+    if [ "$foreign" -gt 0 ]; then
+        summary_row "" "$foreign rule(s) name paths on another filesystem, which -x never enters (no-ops)"
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -1290,6 +1541,15 @@ verify_install() {
             fstab_disabled "$sf" "$MNT/etc/fstab"
     done
 
+    # A cache is dropped by hiding it from the sender rather than excluding it,
+    # so that --update's --delete takes the target's stale copy with it. Prove
+    # that: an --exclude here would silently leave the old cache in place.
+    local cache_path
+    for cache_path in ${CACHE_DROPS[@]+"${CACHE_DROPS[@]}"}; do
+        vcheck "dropped cache $cache_path is absent from the target" \
+            sudo test ! -e "$MNT$cache_path"
+    done
+
     if [ "$fails" -gt 0 ]; then
         echo "  $fails verification check(s) FAILED."
         return 1
@@ -1337,6 +1597,9 @@ NO_TRIM=0
 # nothing else -- its contents are written by grub-install and write_esp_menu on
 # every run either way, since the ESP is generated here, never copied.
 KEEP_EFI=0
+# Copy the regenerable browser caches like any other data instead of dropping
+# them (--keep-cache). See CACHE_DROP_NAMES.
+KEEP_CACHE=0
 SPARSE=0
 ASSUME_YES=0
 MNT_AUTO=0
@@ -1366,6 +1629,17 @@ declare -A SWAPFILE_TGT_SIZE=()
 # file, and whether the probe managed to read the source's fstab at all.
 SWAP_PREVIEW=()
 SWAP_PROBED=0
+
+# The source's own mount layout (fstab_mount_table), the regenerable caches this
+# run drops -- what the pre-confirmation probe found, what Phase 3 resolved for
+# real, and the rsync rules that do it -- and the --exclude-from rules that
+# cannot match the transfer.
+FSTAB_TABLE=""
+CACHE_PREVIEW=()
+CACHE_PROBED=0
+CACHE_DROPS=()
+CACHE_FILTERS=()
+EXCLUDE_AUDIT=()
 
 # Where rewrite_fstab()'s awk records what it disabled, for the report printed
 # right afterwards. Held globally only so cleanup() can remove the directory
@@ -1412,6 +1686,7 @@ while [ $# -gt 0 ]; do
         --update)         UPDATE=1; shift ;;
         --no-trim)        NO_TRIM=1; shift ;;
         --sparse)         SPARSE=1; shift ;;
+        --keep-cache)     KEEP_CACHE=1; shift ;;
         --yes|-y)         ASSUME_YES=1; shift ;;
         -h|--help)
             cat <<USAGE
@@ -1492,7 +1767,20 @@ Other:
                               under --update the listed paths are also purged from
                               the target (rsync --delete-excluded). A swap file
                               listed here is dropped rather than re-created, and
-                              its fstab entry is commented out.
+                              its fstab entry is commented out. Its paths are
+                              paths in the SOURCE'S ROOT FILESYSTEM, which is
+                              what the transfer sees: a rule for a directory the
+                              source bind-mounts in from elsewhere (~/.cache and
+                              friends on a shared-/data disk) matches nothing,
+                              and the summary says which rules those are.
+  --keep-cache                Copy the regenerable browser caches instead of
+                              dropping them. By default ~/.cache/google-chrome
+                              (and -headless) is neither copied nor left behind
+                              on the target: it holds only the HTTP cache, the
+                              compiled-JS cache and a shader cache, all of which
+                              Chrome rebuilds on demand. Passwords, cookies,
+                              bookmarks and extensions live in ~/.config and are
+                              copied either way.
   --brand NAME                Brand the GRUB menu title with NAME instead of the
                               target disk's reported model (useful when the medium
                               sits in a USB card reader, whose model string —
@@ -2362,6 +2650,26 @@ if [ "$swap_shown" -eq 0 ]; then
         summary_row "swap:" "none given (the source's fstab could not be read here to check for a swap file)"
     fi
 fi
+# Cache: the regenerable browser caches dropped from this transfer -- and from
+# the target, since the rule that drops them is sender-side only. Named in full,
+# because what the transfer sees is a path in the source's ROOT filesystem, not
+# the ~/.cache a running system shows when that is a bind mount.
+if [ $MIGRATE_ROOT -eq 1 ]; then
+    if [ $KEEP_CACHE -eq 1 ]; then
+        summary_row "Cache:" "kept (--keep-cache): browser caches are copied like anything else"
+    elif [ "$CACHE_PROBED" -eq 0 ]; then
+        summary_row "Cache:" "not checked (the source's fstab could not be read here to locate its caches)"
+    elif [ ${#CACHE_PREVIEW[@]} -eq 0 ]; then
+        summary_row "Cache:" "nothing to drop (no browser cache in the source's root filesystem)"
+    else
+        cache_shown=0
+        for cache_path in "${CACHE_PREVIEW[@]}"; do
+            if [ $cache_shown -eq 0 ]; then cache_shown=1; summary_row "Cache:" "DROP $cache_path"
+            else summary_row "" "DROP $cache_path"; fi
+        done
+        summary_row "" "(regenerable; never copied, and removed from the target if present)"
+    fi
+fi
 echo "  Menu:     GRUB title branded \"$TGT_MODEL\" ($BRAND_ORIGIN)"
 # The entry this run registers in the menu on the ESP, the systems already
 # registered there that it will keep, and the command line it will boot with --
@@ -2426,6 +2734,7 @@ if [ -n "$EXCLUDE_FROM" ]; then
     else
         echo "  Excludes: --exclude-from=$EXCLUDE_FROM (listed paths not copied)"
     fi
+    report_exclude_audit
 fi
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "  (dry-run mode — destructive commands will be printed, not executed)"
@@ -2661,15 +2970,23 @@ if [ $MIGRATE_ROOT -eq 1 ]; then
     # arguments are then the one part missing from the command printed below.
     if [ "$DRY_RUN" -eq 0 ]; then
         scan_swapfiles
+        scan_cache_drops
     else
         echo "[dry-run] ...and the command below therefore omits one --exclude= per swap file listed there (each is re-created afterwards with fallocate + mkswap${EXCLUDE_FROM:+, or dropped if $EXCLUDE_FROM excludes it})"
+        # The caches were resolved before the confirmation gate, off a transient
+        # read-only mount, so the printed command can carry their real rules.
+        cache_filters_from_preview
     fi
     echo "Rsyncing root filesystem..."
     # $MNT/boot/efi is the target's mounted ESP, which the EFI pass below owns:
     # -x keeps the sender out of it and, just as importantly, stops --delete
     # recursing into it on the receiving side. BOOT_FILTERS does the same for
     # /boot when that is a filesystem of its own rather than a directory here.
-    run sudo rsync "${RSYNC_OPTS[@]}" "${BOOT_FILTERS[@]}" \
+    # CACHE_FILTERS come first: rule order decides, and a cache dropped by
+    # default should stay dropped even if an --exclude-from file happens to
+    # carry a "+" line that would otherwise re-include it. --keep-cache is the
+    # one way to keep them, and it empties this array.
+    run sudo rsync "${CACHE_FILTERS[@]}" "${RSYNC_OPTS[@]}" "${BOOT_FILTERS[@]}" \
         --exclude={"/dev/*","/proc/*","/sys/*","/tmp/*","/run/*","/media/*","/mnt/*","/lost+found"} \
         "${SWAP_EXCLUDES[@]}" \
         "$SRC/" "$MNT/"

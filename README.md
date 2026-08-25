@@ -105,6 +105,21 @@ $ ./install.sh --image Ubuntu26-Portable-16GB.img --target /dev/sda --exclude-fr
 
 This works with or without `--update`. On an `--update` re-sync it additionally passes `--delete-excluded`, so any listed paths that already exist on the target are *removed* (rsync otherwise protects excluded files from deletion, which would leave stale personal data behind).
 
+Write those paths as the **source's root filesystem** sees them, not as the running system does. rsync is handed that filesystem raw — mounted read-only, with none of its bind mounts replayed — so on a disk whose slots share one `/data`, a rule for `/home/tigran/.ssh/id_ed25519` matches nothing at all: `/home/tigran` is a bind of `/data/tigran`, and what the transfer actually carries is `/var/local/tigran-state/ssh/id_ed25519`, bound in from the root filesystem. That is a quiet way to ship a private key on a clone meant to be impersonal, so `install.sh` translates every rule through the source's own `fstab` and names the ones that cannot match, before the confirmation gate:
+
+```
+  Excludes: --exclude-from=exclude-personal.txt (listed paths purged from target via --delete-excluded)
+            WARNING: 2 rule(s) cannot match -- the source binds their
+            data in from another path, so as written they strip nothing:
+              /home/tigran/.ssh/id_ed25519* -> /var/local/tigran-state/ssh/id_ed25519*
+              /home/tigran/.config/google-chrome/ -> /var/local/tigran-state/config/google-chrome/
+            64 rule(s) name paths on another filesystem, which -x never enters (no-ops)
+```
+
+Adding the translated path silences the warning for that rule; keep the home-relative one beside it and the file still works against a source with an ordinary home directory. (`exclude-personal.txt` carries both.)
+
 A **swap file** is never copied. `rsync -S` would turn its gigabytes of zeros into holes on the target, and the kernel then refuses it on the next boot with `swapon: /var/swap: skipping - it appears to have holes`. So every swap file listed in the source's `/etc/fstab` is excluded from the transfer and re-created on the target instead — same size, same label and UUID, `0600 root:root`, freshly `mkswap`ed — which is also much faster than shipping all those zeros over USB. If your `--exclude-from` file lists the swap file (as `exclude-personal.txt` does), it is dropped instead: no swap file is created and its `fstab` entry is commented out, so a minimal boot disk stays swapless and does not boot into a failing `swapon`.
+
+A **browser cache** is dropped by default. `~/.cache/google-chrome` holds nothing but `Default/Cache` (the HTTP cache), `Default/Code Cache` (compiled JavaScript) and a GPU shader cache — 948 MB in 21,539 files here, all of which Chrome rebuilds on demand. Passwords, cookies, bookmarks and extensions live in `~/.config/google-chrome`, which is copied like anything else, so nothing is lost by leaving the cache behind. It is found the same way as everything else about the source's layout — through its `fstab`, so a bound `~/.cache` is followed to the path the transfer really carries — and it is dropped with an rsync `H` (hide) rule rather than an `--exclude`, because an exclude also *protects* the receiver's copy: on an `--update` re-sync the stale cache already on the target is deleted too. `--keep-cache` copies them instead.
 
 Always preview a run with `--dry-run` first; it prints every destructive command instead of executing it. See `./install.sh --help` for the full set of options.

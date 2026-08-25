@@ -110,3 +110,40 @@
 /usr/share/applications/AmneziaVPN.desktop
 /usr/share/pixmaps/AmneziaVPN.png
 /usr/bin/libreoffice
+
+# --- The same paths again, as this machine's ROOT filesystem sees them -------
+# rsync is handed the source's root filesystem RAW: mounted read-only, with none
+# of its bind mounts replayed. Here /home/tigran is a bind of /data/tigran (the
+# DATA partition, which rsync -x never enters, so every plain /home/tigran/...
+# rule above is a harmless no-op) -- but .cache, .config, .local, .ssh, .nv and
+# .cupy are bound in from /var/local/tigran-state/, which IS on the root
+# filesystem and IS copied. Under their home-relative names those rules match
+# nothing, so without the lines below an "impersonal" clone would carry the SSH
+# private keys and the whole Chrome profile. install.sh reports any rule in this
+# position before the confirmation gate.
+# The home-relative rules above are kept on purpose: they are the correct ones
+# for a source with an ordinary home directory, such as the reference .img.
+/var/local/tigran-state/cache/*
+/var/local/tigran-state/nv/
+/var/local/tigran-state/ssh/authorized_keys
+/var/local/tigran-state/ssh/known_hosts*
+/var/local/tigran-state/ssh/sockets/*
+/var/local/tigran-state/ssh/id_ed25519*
+/var/local/tigran-state/config/VirtualBox/
+/var/local/tigran-state/config/AmneziaVPN.ORG/
+/var/local/tigran-state/config/libreoffice/
+/var/local/tigran-state/config/rclone/
+/var/local/tigran-state/local/share/uv/
+/var/local/tigran-state/local/state/claude/
+/var/local/tigran-state/local/share/keyrings/*
+/var/local/tigran-state/local/share/applications/claude-code-url-handler.desktop
+/var/local/tigran-state/local/share/applications/com.github.githubapp.desktop
+/var/local/tigran-state/local/share/fonts/Adobe-Garamond-Premier-Pro-Opticals/
+/var/local/tigran-state/local/share/fonts/Busy.me/
+/var/local/tigran-state/local/share/claude/
+/var/local/tigran-state/cupy/
+/var/local/tigran-state/config/google-chrome/
+/var/local/tigran-state/local/share/TelegramDesktop/
+/var/local/tigran-state/local/share/com.github.githubapp/
+/var/local/tigran-state/local/share/Trash/*
+/var/local/tigran-state/local/bin/
