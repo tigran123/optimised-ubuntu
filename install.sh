@@ -383,23 +383,32 @@ swapfile_excluded() {
 #   transient read-only mount of SRC_ROOT on SRC -- the same trick
 #   probe_target_brand() uses on the target, and for the same reason: the answer
 #   is needed before Phase 3 mounts anything for real.
-#   Fills SWAP_PREVIEW and sets SWAP_PROBED; scan_swapfiles() still does the
-#   authoritative pass later. Best-effort by design: SWAP_PROBED stays 0 when
-#   the source cannot be mounted, which in a dry run is the normal case for an
-#   image (no loop device is attached, so SRC_ROOT does not exist yet).
+#   Fills SWAP_PREVIEW (one "<fstab path> <bytes|?> keep|drop|offroot <transfer
+#   path|carrier>" row per swap file) and sets SWAP_PROBED; scan_swapfiles()
+#   still does the authoritative pass later. Best-effort by design: SWAP_PROBED
+#   stays 0 when the source cannot be mounted, which in a dry run is the normal
+#   case for an image (no loop device is attached, so SRC_ROOT does not exist).
 probe_source_swapfiles() {
     SWAP_PREVIEW=(); SWAP_PROBED=0
-    local sf size state
+    local sf real size state
     [ -b "$SRC_ROOT" ] || return 0
     MOUNTS_DONE=1   # from here on cleanup() must sweep $SRC, interrupts included
     sudo mount -r -o noatime "$SRC_ROOT" "$SRC" 2>/dev/null || return 0
     SWAP_PROBED=1
+    # The caches, the --exclude-from audit and -- the reason this comes first --
+    # FSTAB_TABLE, which the swap loop below needs to tell /var/swap (in the
+    # transfer) from /data/swap (on a partition of its own, and not).
+    probe_source_layout
     if [ -f "$SRC/etc/fstab" ]; then
         while read -r sf; do
             [ -n "$sf" ] || continue
-            size=$(sudo stat -c %s "$SRC$sf" 2>/dev/null) || size=""
-            if swapfile_excluded "$sf"; then state=drop; else state=keep; fi
-            SWAP_PREVIEW+=("$sf ${size:-?} $state")
+            if ! real=$(fstab_realpath "$sf"); then
+                SWAP_PREVIEW+=("$sf ? offroot $real")
+                continue
+            fi
+            size=$(sudo stat -c %s "$SRC$real" 2>/dev/null) || size=""
+            if swapfile_excluded "$real"; then state=drop; else state=keep; fi
+            SWAP_PREVIEW+=("$sf ${size:-?} $state $real")
         done < <(swapfile_entries "$SRC/etc/fstab")
     fi
     # The source root is mounted anyway, and its /etc/default/grub is the file
@@ -407,10 +416,6 @@ probe_source_swapfiles() {
     # options now, so the summary can show the command line the disk will boot
     # with (see probe_menu_cmdline, which only mounts anything if this did not).
     MENU_CMDLINE_PREVIEW=$(grub_cmdline_options "$SRC")
-    # The same mount answers the rest of what the summary needs from the source:
-    # which regenerable caches this run drops, and which --exclude-from rules
-    # cannot match because a bind puts their data somewhere else.
-    probe_source_layout
     sudo umount "$SRC" || true
 }
 
@@ -418,17 +423,37 @@ probe_source_swapfiles() {
 #   ones to rebuild (SWAPFILES) and the ones the --exclude-from file removes
 #   (SWAPFILES_DROPPED: an impersonal/minimal disk is meant to have no swap at
 #   all, so those are neither copied nor re-created, and rewrite_fstab comments
-#   their entries out). SWAP_EXCLUDES keeps every swap file out of the rsync.
+#   their entries out). SWAP_EXCLUDES keeps every swap file out of the rsync,
+#   and SWAPFILE_REAL records where each one is in the transfer -- the fstab path
+#   for an ordinary swap file, a translated one when a bind puts it elsewhere.
+#   A swap file that is not in the transfer at all is skipped outright; see the
+#   comment on the fstab_realpath call. SWAPFILES/SWAPFILES_DROPPED keep the
+#   *fstab* paths, because rewrite_fstab() and the fstab checks match on those.
 #   Reads caller globals (SRC, MNT, EXCLUDE_FROM).
 scan_swapfiles() {
-    local sf
+    local sf real
     local -a found=()
     SWAPFILES=(); SWAPFILES_DROPPED=(); SWAP_EXCLUDES=(); SWAPFILE_TGT_SIZE=()
+    SWAPFILE_REAL=()
     [ -f "$SRC/etc/fstab" ] || return 0
+    FSTAB_TABLE=$(fstab_mount_table "$SRC/etc/fstab")
     mapfile -t found < <(swapfile_entries "$SRC/etc/fstab")
     for sf in "${found[@]}"; do
-        SWAP_EXCLUDES+=("--exclude=$sf")
-        if swapfile_excluded "$sf"; then
+        # Only the source's ROOT filesystem is mounted at $SRC, so a swap file on
+        # a mount of its own -- /data/swap, with /data a partition -- is not under
+        # it. rsync never sees it, there is nothing to exclude, and re-creating it
+        # would fallocate gigabytes into the ROOT filesystem under a directory the
+        # target mounts /data over at boot: invisible, unusable, never reclaimed,
+        # and Phase 4 then disables the very fstab entry that named it. It belongs
+        # to whoever owns that filesystem. The same walk also finds the real path
+        # of a swap file that IS in the transfer under another name, behind a bind.
+        if ! real=$(fstab_realpath "$sf"); then
+            info "Swap file $sf is on $real, a filesystem of its own -- not in the transfer, left alone."
+            continue
+        fi
+        SWAPFILE_REAL[$sf]=$real
+        SWAP_EXCLUDES+=("--exclude=$real")
+        if swapfile_excluded "$real"; then
             info "Swap file $sf is excluded by $EXCLUDE_FROM -- dropped (its fstab entry will be disabled)."
             SWAPFILES_DROPPED+=("$sf")
         else
@@ -437,8 +462,8 @@ scan_swapfiles() {
             # Remember the size of the copy already on the target: it is the
             # fallback when the source has no swap file, and --delete-excluded
             # (--update plus --exclude-from) removes it during the transfer.
-            if sudo test -f "$MNT$sf"; then
-                SWAPFILE_TGT_SIZE[$sf]=$(sudo stat -c %s "$MNT$sf")
+            if sudo test -f "$MNT$real"; then
+                SWAPFILE_TGT_SIZE[$sf]=$(sudo stat -c %s "$MNT$real")
             fi
         fi
     done
@@ -449,20 +474,18 @@ scan_swapfiles() {
 #   mkswap'ed. Reads caller globals (SRC, MNT, SWAPFILES) and records what it
 #   did in SWAPFILES_REBUILT for verify_install().
 rebuild_swapfiles() {
-    local sf src_file tgt_file size label uuid
+    local sf real src_file tgt_file size label uuid
     local -a mkswap_args
     [ ${#SWAPFILES[@]} -gt 0 ] || return 0
     for sf in "${SWAPFILES[@]}"; do
-        src_file="$SRC$sf"
-        tgt_file="$MNT$sf"
-
-        # rsync -x stays on the root filesystem, so a swap file on a separate
-        # mount was never part of this transfer and is not ours to touch.
-        if sudo test -e "$src_file" && \
-           [ "$(sudo stat -c %d "$src_file")" != "$(sudo stat -c %d "$SRC")" ]; then
-            echo "Note: swap file $sf lives outside the root filesystem -- not rebuilt." >&2
-            continue
-        fi
+        # Where the file is in the transfer, which is not always where fstab
+        # mounts it. scan_swapfiles() already dropped every swap file that is not
+        # in the transfer at all, and did it by asking the source's own fstab --
+        # not by stat'ing a file that, being on an unmounted filesystem, was
+        # never there to stat in the first place.
+        real=${SWAPFILE_REAL[$sf]:-$sf}
+        src_file="$SRC$real"
+        tgt_file="$MNT$real"
 
         # Size: the source's file is the authority; fall back to the size the
         # target's copy had before the sync, and never invent one.
@@ -756,16 +779,18 @@ cache_filters_from_preview() {
 #   reviewing before committing to a multi-hour transfer; it should be the set
 #   that runs.
 swap_excludes_from_preview() {
-    local entry sf
+    local entry sf state real
     SWAP_EXCLUDES=()
     if [ "$SWAP_PROBED" -eq 0 ]; then
         echo "[dry-run] ...and the same probe could not name the swap files, so the command below omits one --exclude= per swap file (each is re-created afterwards with fallocate + mkswap${EXCLUDE_FROM:+, or dropped if $EXCLUDE_FROM excludes it})"
         return 0
     fi
     for entry in ${SWAP_PREVIEW[@]+"${SWAP_PREVIEW[@]}"}; do
-        sf=${entry%% *}
+        read -r sf _ state real <<<"$entry"
         [ -n "$sf" ] || continue
-        SWAP_EXCLUDES+=("--exclude=$sf")
+        # Not in the transfer, so there is nothing for an --exclude= to match.
+        [ "$state" != offroot ] || continue
+        SWAP_EXCLUDES+=("--exclude=${real:-$sf}")
     done
 }
 
@@ -1642,11 +1667,12 @@ verify_install() {
 
     local sf
     for sf in "${SWAPFILES_REBUILT[@]}"; do
-        vcheck "swap file $sf is fully allocated and formatted" swapfile_ok "$MNT$sf"
+        vcheck "swap file $sf is fully allocated and formatted" \
+            swapfile_ok "$MNT${SWAPFILE_REAL[$sf]:-$sf}"
     done
     for sf in "${SWAPFILES_DROPPED[@]}"; do
         vcheck "dropped swap file $sf is absent from the target" \
-            sudo test ! -e "$MNT$sf"
+            sudo test ! -e "$MNT${SWAPFILE_REAL[$sf]:-$sf}"
         vcheck "dropped swap file $sf is disabled in fstab" \
             fstab_disabled "$sf" "$MNT/etc/fstab"
     done
@@ -1735,6 +1761,7 @@ SWAPFILES_DROPPED=()
 SWAPFILES_REBUILT=()
 SWAP_EXCLUDES=()
 declare -A SWAPFILE_TGT_SIZE=()
+declare -A SWAPFILE_REAL=()
 # What the pre-confirmation probe found: "<path> <bytes|?> <keep|drop>" per swap
 # file, and whether the probe managed to read the source's fstab at all.
 SWAP_PREVIEW=()
@@ -2743,14 +2770,22 @@ if [ -n "$SWAP_DEV" ]; then
     if [ "$DO_MKSWAP" -eq 1 ]; then echo "reformat  $SWAP_DEV"; else echo "reuse     $SWAP_DEV"; fi
 fi
 for swap_entry in "${SWAP_PREVIEW[@]}"; do
-    read -r swap_path swap_bytes swap_state <<<"$swap_entry"
+    read -r swap_path swap_bytes swap_state swap_real <<<"$swap_entry"
     if [ "$swap_bytes" = "?" ]; then swap_size="size unknown"; else swap_size=$(human_size "$swap_bytes"); fi
     swap_label
-    if [ "$swap_state" = drop ]; then
-        echo "DROP      file $swap_path (excluded by $EXCLUDE_FROM; its fstab entry is disabled)"
-    else
-        echo "re-create file $swap_path ($swap_size, never copied)"
-    fi
+    case $swap_state in
+        # On a filesystem of its own: not in the transfer, so this run neither
+        # copies nor re-creates it. Said out loud because the fstab entry that
+        # names it may still be disabled in Phase 4 along with its carrier, and
+        # a swapless boot is worth knowing about before the gate rather than after.
+        offroot) echo "LEAVE     file $swap_path is on $swap_real, a filesystem of its own -- not in the transfer" ;;
+        drop)    echo "DROP      file $swap_path (excluded by $EXCLUDE_FROM; its fstab entry is disabled)" ;;
+        *)       if [ "$swap_real" != "$swap_path" ]; then
+                     echo "re-create file $swap_path, which the transfer carries at $swap_real ($swap_size, never copied)"
+                 else
+                     echo "re-create file $swap_path ($swap_size, never copied)"
+                 fi ;;
+    esac
 done
 if [ "$swap_shown" -eq 0 ]; then
     if [ $MIGRATE_ROOT -eq 0 ]; then
