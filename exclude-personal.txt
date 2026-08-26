@@ -115,8 +115,11 @@
 # rsync is handed the source's root filesystem RAW: mounted read-only, with none
 # of its bind mounts replayed. Here /home/tigran is a bind of /data/tigran (the
 # DATA partition, which rsync -x never enters, so every plain /home/tigran/...
-# rule above is a harmless no-op) -- but .cache, .config, .local, .ssh, .nv and
-# .cupy are bound in from /var/local/tigran-state/, which IS on the root
+# rule above copies nothing -- which is not the same as costing nothing: /data
+# is on the disk being installed, so its fstab entry and this bind survive, and
+# the booted clone reads the same home directory through them; what makes the
+# clone impersonal is the rules below) -- but .cache, .config, .local, .ssh,
+# .nv and .cupy are bound in from /var/local/tigran-state/, which IS on the root
 # filesystem and IS copied. Under their home-relative names those rules match
 # nothing, so without the lines below an "impersonal" clone would carry the SSH
 # private keys and the whole Chrome profile. install.sh reports any rule in this

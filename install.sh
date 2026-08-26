@@ -542,39 +542,48 @@ fstab_mounts_boot() {
 # declare, never ours to guess.
 
 # fstab_mount_table <fstab> — one row per mount point, tab separated:
-#   <mountpoint>\t<fs|bind>\t<source>\t<onroot>, where onroot is 1 when files
-#   under that mount point live on the ROOT filesystem (so: only for a bind
-#   whose source resolves onto /). "/" itself and swap entries are not emitted.
-#   Binds resolve in file order, each joining the table as it goes, so a bind
-#   riding another bind is judged by the one it rides on -- the same rule, for
-#   the same reason (mount -a walks fstab in order), as rewrite_fstab()'s pass 1.
+#   <mountpoint>\t<fs|bind>\t<source>. "/" itself and swap entries are not
+#   emitted; a trailing slash on either path is stripped, since fstab accepts
+#   "/home/user/.cache/" and a mount point carrying one would match nothing in
+#   fstab_realpath() and would not look like a ".cache" to cache_drop_paths().
+#   An entry whose path uses fstab's octal escapes (\040 for a space, ...) is
+#   announced and skipped rather than emitted as a row that could never match --
+#   the same call swapfile_entries() makes, for the same reason: decoding them is
+#   not worth it for something this rare, and mangling them silently is worse.
+#   "rbind" counts as a bind: a recursive bind puts the data in exactly the same
+#   place, and treating it as a filesystem of its own would report a rule whose
+#   data IS in the transfer as an out-of-reach no-op.
+#   Rows are emitted filesystems first, binds after, but order carries no meaning
+#   for the readers: fstab_realpath() picks the longest matching mount point and
+#   follows binds itself, which is where "a bind riding another bind is judged by
+#   the one it rides on" actually happens.
 fstab_mount_table() {
     sudo awk '
-        function nearest(path,   mp, best, bestlen) {
-            best = "/"; bestlen = 0;
-            for (mp in onroot) {
-                if (mp == "/" || length(mp) <= bestlen) continue;
-                if (path == mp || substr(path, 1, length(mp) + 1) == mp "/")
-                    { best = mp; bestlen = length(mp) }
-            }
-            return best;
+        function trim_slash(p) { sub(/\/+$/, "", p); return p == "" ? "/" : p }
+        function escaped(p) {
+            if (p !~ /\\/) return 0;
+            print "Warning: fstab entry " p " has an escaped path -- not translated." > "/dev/stderr";
+            return 1;
         }
-        BEGIN { onroot["/"] = 1 }
         $0 ~ /^[[:space:]]*#/ || NF < 3 { next }
         {
-            if ($4 ~ /(^|,)bind(,|$)/) { nb++; bsrc[nb] = $1; bmp[nb] = $2; next }
-            if ($3 == "swap" || substr($2, 1, 1) != "/" || $2 == "/") next;
-            if (!($2 in kind)) order[++n] = $2;
-            kind[$2] = "fs"; src[$2] = $1; onroot[$2] = 0;
+            mp = trim_slash($2); source = trim_slash($1);
+            if (substr(mp, 1, 1) != "/" || mp == "/") next;
+            if ($4 ~ /(^|,)r?bind(,|$)/) {
+                if (escaped($1) || escaped($2)) next;
+                nb++; bsrc[nb] = source; bmp[nb] = mp; next;
+            }
+            if ($3 == "swap" || escaped($2)) next;
+            if (!(mp in kind)) order[++n] = mp;
+            kind[mp] = "fs"; src[mp] = source;
         }
         END {
             for (i = 1; i <= nb; i++) {
                 if (!(bmp[i] in kind)) order[++n] = bmp[i];
                 kind[bmp[i]] = "bind"; src[bmp[i]] = bsrc[i];
-                onroot[bmp[i]] = onroot[nearest(bsrc[i])];
             }
             for (i = 1; i <= n; i++)
-                printf "%s\t%s\t%s\t%d\n", order[i], kind[order[i]], src[order[i]], onroot[order[i]];
+                printf "%s\t%s\t%s\n", order[i], kind[order[i]], src[order[i]];
         }' "$1"
 }
 
@@ -582,14 +591,18 @@ fstab_mount_table() {
 #   source system into the path the same data has in the raw root filesystem,
 #   following bind mounts as far as they go. Prints the translated path and
 #   returns 0 when the data really is on the root filesystem (so the root rsync
-#   can see it); returns 1 when it sits on another filesystem, which -x never
-#   enters and no rule can reach. Reads the caller-set FSTAB_TABLE.
+#   can see it). Returns 1 when it sits on another filesystem, which -x never
+#   enters and no rule can reach, and then prints that filesystem's mount point
+#   instead -- "on another filesystem" is a great deal more useful with the name
+#   of the filesystem attached, and a caller reading the value through a command
+#   substitution cannot be told through a global. Reads the caller-set
+#   FSTAB_TABLE.
 fstab_realpath() {
-    local path=$1 hops=0 mp kind src onroot
+    local path=$1 hops=0 mp kind src
     local best best_kind best_src bestlen rest
     while [ "$hops" -lt 16 ]; do
         best=""; best_kind=""; best_src=""; bestlen=0
-        while IFS=$'\t' read -r mp kind src onroot; do
+        while IFS=$'\t' read -r mp kind src; do
             [ -n "$mp" ] || continue
             [ "${#mp}" -gt "$bestlen" ] || continue
             if [ "$path" = "$mp" ] || [ "${path#"$mp"/}" != "$path" ]; then
@@ -598,7 +611,7 @@ fstab_realpath() {
         done <<<"$FSTAB_TABLE"
         # Nothing but / above it: the path is already a root-filesystem path.
         [ -n "$best" ] || { printf '%s\n' "$path"; return 0; }
-        [ "$best_kind" = bind ] || return 1
+        [ "$best_kind" = bind ] || { printf '%s\n' "$best"; return 1; }
         rest=${path#"$best"}
         path="$best_src$rest"
         hops=$((hops + 1))
@@ -627,14 +640,14 @@ CACHE_DROP_NAMES=(google-chrome google-chrome-headless)
 #   ~/.cache and drops a .cache that lives on another filesystem entirely.
 #   Reads caller globals (SRC, FSTAB_TABLE, CACHE_DROP_NAMES).
 cache_drop_paths() {
-    local d cand real name mp kind src onroot
+    local d cand real name mp kind src
     local -a cands=(/root/.cache)
     for d in "$SRC"/home/*/; do
         [ -d "$d" ] || continue
         d=${d%/}
         cands+=("/home/${d##*/}/.cache")
     done
-    while IFS=$'\t' read -r mp kind src onroot; do
+    while IFS=$'\t' read -r mp kind src; do
         if [ "${mp##*/}" = .cache ]; then cands+=("$mp"); fi
     done <<<"$FSTAB_TABLE"
     for cand in "${cands[@]}"; do
@@ -652,18 +665,23 @@ cache_drop_paths() {
 #   somewhere else. Best-effort exactly like the swap preview: CACHE_PROBED
 #   stays 0 when the source cannot be read here (a dry run against an image
 #   attaches no loop device), and the summary then says so rather than promise a
-#   drop it could not confirm. Fills FSTAB_TABLE, CACHE_PREVIEW and
-#   EXCLUDE_AUDIT; scan_cache_drops() is the authoritative pass.
+#   drop it could not confirm. EXCLUDE_PROBED is the same flag for the audit, and
+#   it has to be its own: an empty EXCLUDE_AUDIT is what a clean exclude file
+#   looks like too, so without it "not checked" and "nothing to report" print
+#   identically and the operator confirms believing the file was verified.
+#   Fills FSTAB_TABLE, CACHE_PREVIEW and EXCLUDE_AUDIT; scan_cache_drops() is the
+#   authoritative pass.
 probe_source_layout() {
-    CACHE_PREVIEW=(); CACHE_PROBED=0; EXCLUDE_AUDIT=()
+    CACHE_PREVIEW=(); CACHE_PROBED=0; EXCLUDE_AUDIT=(); EXCLUDE_PROBED=0
     [ -f "$SRC/etc/fstab" ] || return 0
-    FSTAB_TABLE=$(fstab_mount_table "$SRC/etc/fstab")
+    FSTAB_TABLE=$(fstab_mount_table "$SRC/etc/fstab") || true
     if [ $KEEP_CACHE -eq 0 ]; then
         mapfile -t CACHE_PREVIEW < <(cache_drop_paths)
         CACHE_PROBED=1
     fi
     if [ -n "$EXCLUDE_FROM" ]; then
         mapfile -t EXCLUDE_AUDIT < <(exclude_rules_unmatchable)
+        EXCLUDE_PROBED=1
     fi
 }
 
@@ -679,15 +697,38 @@ probe_source_layout() {
 #   that would be wrong here.) Without --update there is no --delete and nothing
 #   to delete either: the target root has just been formatted.
 scan_cache_drops() {
-    local p
     CACHE_DROPS=(); CACHE_FILTERS=()
     [ $KEEP_CACHE -eq 0 ] || return 0
     [ -f "$SRC/etc/fstab" ] || return 0
     FSTAB_TABLE=$(fstab_mount_table "$SRC/etc/fstab")
     mapfile -t CACHE_DROPS < <(cache_drop_paths)
-    for p in ${CACHE_DROPS[@]+"${CACHE_DROPS[@]}"}; do
+    cache_filters_for ${CACHE_DROPS[@]+"${CACHE_DROPS[@]}"}
+}
+
+# rsync_pattern_escape <path> — quote the wildcard metacharacters in a literal
+#   path so rsync matches the path itself. A rule is a pattern, not a name: a
+#   directory really called "a[bc]" would otherwise be hidden as a character
+#   class matching "ab" and "ac" -- directories never probed, and under
+#   --update's --delete removed from the target as well. Same job
+#   rewrite_grub_distributor() does before interpolating into sed.
+rsync_pattern_escape() {
+    local p=$1
+    p=${p//\\/\\\\}
+    p=${p//\*/\\*}
+    p=${p//\?/\\?}
+    p=${p//\[/\\[}
+    printf '%s\n' "$p"
+}
+
+# cache_filters_for <path>... — the rsync rules that drop those caches, into
+#   CACHE_FILTERS. Shared by scan_cache_drops() and cache_filters_from_preview()
+#   so the dry run's printed command and the real run's cannot drift apart.
+cache_filters_for() {
+    local p
+    CACHE_FILTERS=()
+    for p in "$@"; do
         info "Dropping regenerable cache $p (never copied; removed from the target if present)."
-        CACHE_FILTERS+=(--filter="H $p/")
+        CACHE_FILTERS+=(--filter="H $(rsync_pattern_escape "$p")/")
     done
 }
 
@@ -695,17 +736,36 @@ scan_cache_drops() {
 #   what the pre-confirmation probe found instead of from a mounted source. A
 #   dry run never mounts anything in Phase 3, and the assembled rsync command it
 #   prints is the thing worth reviewing, so it should carry the real rules.
+#   CACHE_DROPS is deliberately left empty: its only reader is verify_install(),
+#   which a dry run never reaches.
 cache_filters_from_preview() {
-    local p
     CACHE_DROPS=(); CACHE_FILTERS=()
     [ $KEEP_CACHE -eq 0 ] || return 0
     if [ "$CACHE_PROBED" -eq 0 ]; then
         echo "[dry-run] ...and the source's mount layout could not be read here either, so the command below omits the --filter='H ...' rule that would drop each regenerable browser cache"
         return 0
     fi
-    for p in ${CACHE_PREVIEW[@]+"${CACHE_PREVIEW[@]}"}; do
-        CACHE_DROPS+=("$p")
-        CACHE_FILTERS+=(--filter="H $p/")
+    cache_filters_for ${CACHE_PREVIEW[@]+"${CACHE_PREVIEW[@]}"}
+}
+
+# swap_excludes_from_preview — the sibling of cache_filters_from_preview() for
+#   the swap files: SWAP_PREVIEW already holds every path scan_swapfiles() would
+#   exclude, read off the same transient mount before the confirmation gate, so a
+#   dry run can print the --exclude= arguments the real run will pass instead of
+#   announcing that they are missing. The printed option set is the thing worth
+#   reviewing before committing to a multi-hour transfer; it should be the set
+#   that runs.
+swap_excludes_from_preview() {
+    local entry sf
+    SWAP_EXCLUDES=()
+    if [ "$SWAP_PROBED" -eq 0 ]; then
+        echo "[dry-run] ...and the same probe could not name the swap files, so the command below omits one --exclude= per swap file (each is re-created afterwards with fallocate + mkswap${EXCLUDE_FROM:+, or dropped if $EXCLUDE_FROM excludes it})"
+        return 0
+    fi
+    for entry in ${SWAP_PREVIEW[@]+"${SWAP_PREVIEW[@]}"}; do
+        sf=${entry%% *}
+        [ -n "$sf" ] || continue
+        SWAP_EXCLUDES+=("--exclude=$sf")
     done
 }
 
@@ -715,19 +775,35 @@ cache_filters_from_preview() {
 #       the rule's data IS in the transfer, under another name. This is the one
 #       that matters: a private key or a browser profile the author believes is
 #       being stripped from an impersonal clone, and is not.
-#     foreign\t<rule>\t
+#     foreign\t<rule>\t<the mount point its data is on>
 #       the rule names a path on another filesystem, which -x never enters, so
-#       the rule is a harmless no-op rather than a hole.
-#   Only anchored rules ("/...") can be judged: an unanchored pattern matches on
-#   name alone and is not tied to any mount point. Reads EXCLUDE_FROM and
-#   FSTAB_TABLE.
+#       nothing it names is copied. That is not the same as "harmless": a
+#       filesystem the target keeps mounted (a shared /data on the target's own
+#       disk, which rewrite_fstab deliberately keeps) still carries that data on
+#       the booted clone, so the mount point is named rather than counted.
+#     unknown\t<rule>\t
+#       the rule's wildcard falls above its last component, so no mount point can
+#       be matched literally and there is nothing to translate it against. Such a
+#       rule is neither cleared nor condemned -- but it is said out loud, because
+#       silence here reads as "checked, and fine".
+#   Only anchored rules ("/...") can be judged at all: an unanchored pattern
+#   matches on name alone and is not tied to any mount point. rsync's own file
+#   syntax is honoured -- "- "/"+ " and their underscore forms, and a lone "!",
+#   which clears every rule read so far exactly as rsync clears its filter list,
+#   so the audit cannot warn about a rule the transfer has discarded.
+#   Reads EXCLUDE_FROM and FSTAB_TABLE.
 exclude_rules_unmatchable() {
-    local rule real
+    local rule real dir
     local -a rules=()
     local -A have=()
     [ -n "$EXCLUDE_FROM" ] || return 0
-    while IFS= read -r rule; do
+    # "|| [ -n "$rule" ]": read fails at EOF on a final line with no newline, and
+    # rsync honours that rule -- so dropping it here would leave the one rule the
+    # transfer applies as the one rule nobody audited.
+    while IFS= read -r rule || [ -n "$rule" ]; do
         rule=${rule%$'\r'}
+        # A lone "!" clears the filter list, so everything read so far is gone.
+        if [ "$rule" = '!' ]; then rules=(); have=(); continue; fi
         case $rule in
             ''|'#'*|';'*|'+ '*|'+_'*) continue ;;
         esac
@@ -737,7 +813,17 @@ exclude_rules_unmatchable() {
     done < "$EXCLUDE_FROM"
     for rule in ${rules[@]+"${rules[@]}"}; do
         if real=$(fstab_realpath "$rule"); then
-            [ "$real" != "$rule" ] || continue
+            if [ "$real" = "$rule" ]; then
+                # Nothing above it: a plain root-filesystem path, with nothing
+                # to say about it -- unless its wildcard sits in the directory
+                # portion, where no mount point could have matched literally and
+                # so this proves nothing. A trailing wildcard is fine: the
+                # directory it lives in is spelled out, which is all the walk
+                # needs.
+                dir=${rule%/*}
+                case $dir in *[\*\?\[]*) printf 'unknown\t%s\t\n' "$rule" ;; esac
+                continue
+            fi
             # Already handled: the file carries the translated path as well, so
             # the pair covers this layout and the plain one, and there is
             # nothing left to report. This is what lets an exclude file be
@@ -745,7 +831,8 @@ exclude_rules_unmatchable() {
             [ -z "${have[$real]:-}" ] || continue
             printf 'bind\t%s\t%s\n' "$rule" "$real"
         else
-            printf 'foreign\t%s\t\n' "$rule"
+            # On failure fstab_realpath prints the mount point that stopped it.
+            printf 'foreign\t%s\t%s\n' "$rule" "$real"
         fi
     done
 }
@@ -754,21 +841,44 @@ exclude_rules_unmatchable() {
 #   The bind rows are the point of the exercise: each names a rule whose data IS
 #   in the transfer under a different path, so the rule as written strips
 #   nothing -- which is how a private key or a browser profile ends up on a
-#   clone meant to be impersonal. The foreign rows are counted only: they name
-#   paths on other filesystems, which -x never enters, so they are no-ops.
+#   clone meant to be impersonal. The foreign rows are counted, with the
+#   filesystems they land on named: nothing there is copied, but "no-op" would
+#   be a promise this cannot make, since a mount the target keeps -- the shared
+#   /data of a slot-per-machine disk, kept by rewrite_fstab precisely because it
+#   is present when the system is -- still carries that data on the booted clone.
+#   The unknown rows are the ones the walk could not judge at all.
+#   Says "not checked" when the audit never ran (EXCLUDE_PROBED), because an
+#   empty audit is also what a clean exclude file looks like.
 report_exclude_audit() {
-    local row kind rule real foreign=0
-    local -a hits=()
+    local row kind rule real foreign=0 fs
+    local -a hits=() unknown=() fslist=()
+    if [ "$EXCLUDE_PROBED" -eq 0 ]; then
+        summary_row "" "not checked (the source's fstab could not be read here to audit these rules)"
+        return 0
+    fi
     for row in ${EXCLUDE_AUDIT[@]+"${EXCLUDE_AUDIT[@]}"}; do
         IFS=$'\t' read -r kind rule real <<<"$row"
-        if [ "$kind" = bind ]; then hits+=("$rule -> $real"); else foreign=$((foreign+1)); fi
+        case $kind in
+            bind)    hits+=("$rule -> $real") ;;
+            unknown) unknown+=("$rule") ;;
+            *)       foreign=$((foreign + 1))
+                     for fs in ${fslist[@]+"${fslist[@]}"}; do
+                         [ "$fs" != "${real:-?}" ] || continue 2
+                     done
+                     fslist+=("${real:-?}") ;;
+        esac
     done
     if [ ${#hits[@]} -gt 0 ]; then
         summary_row "" "WARNING: ${#hits[@]} rule(s) strip nothing -- the source binds their data in from elsewhere:"
         for row in "${hits[@]}"; do summary_row "" "  $row"; done
     fi
+    if [ ${#unknown[@]} -gt 0 ]; then
+        summary_row "" "WARNING: ${#unknown[@]} rule(s) have a wildcard above their last component, so no bind could be checked:"
+        for row in "${unknown[@]}"; do summary_row "" "  $row"; done
+    fi
     if [ "$foreign" -gt 0 ]; then
-        summary_row "" "$foreign rule(s) name paths on another filesystem, which -x never enters (no-ops)"
+        summary_row "" "$foreign rule(s) name paths on ${fslist[*]}, off the root filesystem: -x never copies them,"
+        summary_row "" "  but a mount the target keeps still carries that data on the clone (Phase 4 says which survived)"
     fi
 }
 
@@ -1640,6 +1750,7 @@ CACHE_PROBED=0
 CACHE_DROPS=()
 CACHE_FILTERS=()
 EXCLUDE_AUDIT=()
+EXCLUDE_PROBED=0
 
 # Where rewrite_fstab()'s awk records what it disabled, for the report printed
 # right afterwards. Held globally only so cleanup() can remove the directory
@@ -2965,16 +3076,15 @@ fi
 if [ $MIGRATE_ROOT -eq 1 ]; then
     # Swap files are never transferred (gigabytes of zeros, and under --sparse
     # rsync would punch them full of holes); they are re-created afterwards.
-    # A dry run has not mounted the source, so its fstab -- and with it the
-    # swap file paths -- cannot be read: say so, since their --exclude=
-    # arguments are then the one part missing from the command printed below.
+    # A dry run mounts nothing here, but the pre-confirmation probe did, off a
+    # transient read-only mount -- so both the swap paths and the caches are
+    # already known and the printed command can carry their real arguments
+    # rather than a note about what is missing from it.
     if [ "$DRY_RUN" -eq 0 ]; then
         scan_swapfiles
         scan_cache_drops
     else
-        echo "[dry-run] ...and the command below therefore omits one --exclude= per swap file listed there (each is re-created afterwards with fallocate + mkswap${EXCLUDE_FROM:+, or dropped if $EXCLUDE_FROM excludes it})"
-        # The caches were resolved before the confirmation gate, off a transient
-        # read-only mount, so the printed command can carry their real rules.
+        swap_excludes_from_preview
         cache_filters_from_preview
     fi
     echo "Rsyncing root filesystem..."

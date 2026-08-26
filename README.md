@@ -109,14 +109,18 @@ Write those paths as the **source's root filesystem** sees them, not as the runn
 
 ```
   Excludes: --exclude-from=exclude-personal.txt (listed paths purged from target via --delete-excluded)
-            WARNING: 2 rule(s) cannot match -- the source binds their
-            data in from another path, so as written they strip nothing:
+            WARNING: 2 rule(s) strip nothing -- the source binds their data in from elsewhere:
               /home/tigran/.ssh/id_ed25519* -> /var/local/tigran-state/ssh/id_ed25519*
               /home/tigran/.config/google-chrome/ -> /var/local/tigran-state/config/google-chrome/
-            64 rule(s) name paths on another filesystem, which -x never enters (no-ops)
+            64 rule(s) name paths on /data, off the root filesystem: -x never copies them,
+              but a mount the target keeps still carries that data on the clone (Phase 4 says which survived)
 ```
 
 Adding the translated path silences the warning for that rule; keep the home-relative one beside it and the file still works against a source with an ordinary home directory. (`exclude-personal.txt` carries both.)
+
+The second line is worth reading rather than skipping. "Off the root filesystem" means the transfer never carries that data — but it does *not* mean the clone will not have it. On a slot-per-machine disk the personal home lives on the shared `/data`, which is on the disk being installed, so `fstab` keeps both it and the `/home/tigran` bind that hangs off it (the Phase 4 report says which mounts survived): the rules cost nothing, and the booted clone reads the same home directory through the same bind. What makes a clone impersonal there is stripping the paths on the **root** filesystem — the ones the first warning is about.
+
+Two more things the audit can say. A rule whose wildcard falls *above* its last component (`/home/*/.ssh/known_hosts*`) cannot be matched against a mount point at all, so it is listed as unchecked rather than passed silently; a trailing wildcard is fine, since the directory it lives in is spelled out. And when the source cannot be read at the point the summary is printed — a `--dry-run` against an image, which has no loop device attached — the block says `not checked` instead of nothing, because an empty audit is also what a clean file looks like.
 
 A **swap file** is never copied. `rsync -S` would turn its gigabytes of zeros into holes on the target, and the kernel then refuses it on the next boot with `swapon: /var/swap: skipping - it appears to have holes`. So every swap file listed in the source's `/etc/fstab` is excluded from the transfer and re-created on the target instead — same size, same label and UUID, `0600 root:root`, freshly `mkswap`ed — which is also much faster than shipping all those zeros over USB. If your `--exclude-from` file lists the swap file (as `exclude-personal.txt` does), it is dropped instead: no swap file is created and its `fstab` entry is commented out, so a minimal boot disk stays swapless and does not boot into a failing `swapon`.
 
