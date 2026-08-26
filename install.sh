@@ -416,6 +416,7 @@ probe_source_swapfiles() {
     # options now, so the summary can show the command line the disk will boot
     # with (see probe_menu_cmdline, which only mounts anything if this did not).
     MENU_CMDLINE_PREVIEW=$(grub_cmdline_options "$SRC")
+    probe_memtest "$SRC"
     sudo umount "$SRC" || true
 }
 
@@ -1285,14 +1286,17 @@ probe_target_brand() {
 #   MNT, free at this point, exactly as probe_target_brand() borrows it for the
 #   target root -- so the grub directory is $MNT/boot/grub here, the ESP's own
 #   /boot/grub, not the /boot/efi/boot/grub it becomes once the root is mounted.
-#   Fills ESP_MENU_ENTRIES ("<uuid><TAB><title>") and sets ESP_MENU_PROBED.
+#   Fills ESP_MENU_ENTRIES ("<uuid><TAB><title>") and sets ESP_MENU_PROBED, and
+#   notes whether the disk already carries a memtest image (ESP_MEMTEST) -- which
+#   is what lets the summary tell "this run adds it" from "it is already there".
 probe_esp_menu() {
-    ESP_MENU_ENTRIES=(); ESP_MENU_PROBED=0
+    ESP_MENU_ENTRIES=(); ESP_MENU_PROBED=0; ESP_MEMTEST=0
     local row
     [ -b "$TGT_EFI" ] || return 0
     MOUNTS_DONE=1   # from here on cleanup() must sweep $MNT, interrupts included
     sudo mount -r "$TGT_EFI" "$MNT" 2>/dev/null || return 0
     ESP_MENU_PROBED=1
+    [ ! -f "$MNT/boot/grub/memtest/$MEMTEST_IMAGE" ] || ESP_MEMTEST=1
     while IFS= read -r row; do
         [ -n "$row" ] && ESP_MENU_ENTRIES+=("$row")
     done < <(esp_entries "$MNT/boot/grub")
@@ -1313,7 +1317,20 @@ probe_menu_cmdline() {
     MOUNTS_DONE=1
     sudo mount -r -o noatime "$dev" "$MNT" 2>/dev/null || return 0
     MENU_CMDLINE_PREVIEW=$(grub_cmdline_options "$MNT")
+    probe_memtest "$MNT"
     sudo umount "$MNT" || true
+}
+
+# probe_memtest <mounted-root> — what the summary needs to say about the memory
+#   tester, off a root that is already mounted: whether that system carries the
+#   image at all, and whether it asks for the entry to be left out. Best-effort
+#   like its neighbours -- MEMTEST_PROBED stays 0 when no root could be read here,
+#   and the summary then says so rather than promise an entry it did not check.
+probe_memtest() {
+    MEMTEST_SRC=0; [ ! -f "$1/boot/$MEMTEST_IMAGE" ] || MEMTEST_SRC=1
+    MEMTEST_OFF=0
+    [ "$(grub_default_value "$1/etc/default/grub" GRUB_DISABLE_MEMTEST)" != true ] || MEMTEST_OFF=1
+    MEMTEST_PROBED=1
 }
 
 rewrite_grub_distributor() {
@@ -1344,6 +1361,7 @@ rewrite_grub_distributor() {
 #
 #   /boot/efi/boot/grub/grub.cfg              master menu, regenerated per run
 #   /boot/efi/boot/grub/entries/<uuid>.cfg    one file per registered rootfs
+#   /boot/efi/boot/grub/memtest/mt86+x64      the memory tester, one per disk
 #   /boot/efi/boot/grub/custom.cfg            optional, hand-written, sourced last
 #   /boot/efi/boot/grub/{x86_64-efi,i386-pc}/ modules, written by grub-install
 #
@@ -1351,6 +1369,16 @@ rewrite_grub_distributor() {
 # filesystem it just wrote -- and never edits another system's. The master is
 # rebuilt from whatever entry files are present, so registering, re-branding or
 # (by deleting a file) retiring a system is a local operation.
+#
+# The memory tester is the one menu item that belongs to no rootfs at all, so it
+# lives on the ESP beside the menu that offers it, at boot/grub/memtest/. Ubuntu's
+# memtest86+ package installs /boot/mt86+x64 and /boot/mt86+ia32; the same x64
+# image boots through GRUB's "linux" command on BOTH firmware paths, so the
+# four-way $grub_platform/cpuid block Ubuntu's 20_memtest86+ generates exists only
+# to choose between the two -- a choice a toolkit that deploys amd64 does not have
+# to make, since anything that can boot one of these disks is x86_64.
+MEMTEST_IMAGE=mt86+x64
+MEMTEST_TITLE="Memory test (memtest86+)"
 
 # grub_default_value <file> <KEY> — the last KEY="..." (or '...') assignment in
 #   an /etc/default/grub-style file. Read, never sourced: it is the target's
@@ -1430,7 +1458,8 @@ EOF
 #   installed never silently redefines the menu for the others; 5 and 0 only
 #   when writing a master from scratch. Each source is guarded, so an entry file
 #   deleted by hand retires that system instead of breaking the menu for all of
-#   them.
+#   them -- and the memtest block, emitted only when the image is actually on the
+#   ESP, is guarded the same way and for the same reason.
 esp_master_text() {
     local grubdir=$1 timeout="" default="" uuid title
     if [ -f "$grubdir/grub.cfg" ]; then
@@ -1447,13 +1476,80 @@ esp_master_text() {
         "" \
         "insmod part_gpt" \
         "insmod ext2" \
+        "" \
+        "# Graphics, for both firmware paths. With no video driver loaded GRUB on" \
+        "# UEFI falls back to the firmware's own text console -- an 80x25 box in" \
+        "# the middle of the panel, with whatever the firmware drew still around" \
+        "# it -- and, less visibly, cannot hand a framebuffer to what it boots:" \
+        "# the memory tester then reports \"No graphics display found\" and stops." \
+        "# BIOS hides both faults behind VGA text mode, which UEFI does not have." \
+        "# all_video pulls in efi_gop here and vbe/vga there, so one block serves" \
+        "# both, and the whole thing is guarded on the font gfxterm needs." \
+        "if loadfont \$prefix/fonts/unicode.pf2; then" \
+        "    insmod all_video" \
+        "    insmod gfxterm" \
+        "    set gfxmode=auto" \
+        "    terminal_output gfxterm" \
+        "fi" \
         ""
     while IFS="$(printf '\t')" read -r uuid title; do
         [ -n "$uuid" ] || continue
         printf '# %s\nif [ -f $prefix/entries/%s.cfg ]; then source $prefix/entries/%s.cfg; fi\n' \
             "$title" "$uuid" "$uuid"
     done < <(esp_entries "$grubdir")
+    # Driven by what is on the ESP, not by what this run's source had: a slot
+    # installed from a system without memtest86+ must not drop the entry for the
+    # disk. $prefix carries its own device, so no search and no ESP UUID are
+    # needed -- the same path syntax the entry sources above already rely on.
+    if [ -f "$grubdir/memtest/$MEMTEST_IMAGE" ]; then
+        printf '%s\n' \
+            "" \
+            "# The memory tester: shared by the disk, like the menu itself." \
+            "if [ -f \$prefix/memtest/$MEMTEST_IMAGE ]; then" \
+            "    menuentry \"$MEMTEST_TITLE\" --class memtest {" \
+            "        # memtest86+ draws a fixed 640x400 panel and never scales it," \
+            "        # so ask for the smallest mode that holds it rather than the" \
+            "        # one gfxterm is using: in a 2560x1440 framebuffer it would" \
+            "        # sit in a small rectangle in the middle. \"keep\" is the" \
+            "        # fallback for firmware offering no 640x480, and there must" \
+            "        # be one -- under UEFI the tester has no VGA text mode to" \
+            "        # fall back on, and stops with \"No graphics display found\"." \
+            "        set gfxpayload=640x480,keep" \
+            "        linux \$prefix/memtest/$MEMTEST_IMAGE" \
+            "    }" \
+            "fi"
+    fi
     printf '\n%s\n' 'if [ -f $prefix/custom.cfg ]; then source $prefix/custom.cfg; fi'
+}
+
+# sync_esp_memtest <grubdir> — put the memtest86+ image on the ESP, where the
+#   menu that offers it lives. It comes from the target's own freshly-synced
+#   /boot (which is the source's): this toolkit ships no binaries and reaches
+#   outside the source for nothing, so a source without memtest86+ installed
+#   simply gets no entry. The path is right for both layouts -- /boot is mounted
+#   at $MNT/boot whether it is a partition of its own or a directory inside /.
+#   GRUB_DISABLE_MEMTEST=true in the target's /etc/default/grub turns it off, the
+#   same knob Ubuntu's 20_memtest86+ reads.
+#   It never REMOVES an image, only adds or refreshes one, and that is deliberate:
+#   the ESP is shared by every rootfs on the disk, so a slot that does not want
+#   memtest must not unregister it for the slots that do -- the same rule that
+#   makes an install own exactly one entry file and carry "set timeout" over
+#   rather than redefine it. Retiring the tester disk-wide is
+#   "rm -rf boot/grub/memtest" on the ESP; the next master then rebuilds without
+#   the entry, exactly as deleting an entry file retires a system.
+sync_esp_memtest() {
+    local grubdir=$1 img="$MNT/boot/$MEMTEST_IMAGE"
+    if [ "$(grub_default_value "$MNT/etc/default/grub" GRUB_DISABLE_MEMTEST)" = true ]; then
+        info "GRUB_DISABLE_MEMTEST=true: not installing memtest (any image already on the ESP is left alone)."
+        return 0
+    fi
+    [ -f "$img" ] || return 0
+    info "Copying $MEMTEST_IMAGE onto the ESP for the \"$MEMTEST_TITLE\" entry..."
+    sudo mkdir -p "$grubdir/memtest"
+    # cp, not "install -m": install fchmod()s, and vfat rejects a mode its mount
+    # options did not grant. The ESP carries no modes of its own anyway -- which
+    # is why everything else written here (tee, mkdir) lets the mount decide.
+    sudo cp "$img" "$grubdir/memtest/$MEMTEST_IMAGE"
 }
 
 # write_esp_menu — register this system in the shared menu, after
@@ -1484,6 +1580,11 @@ write_esp_menu() {
             shown=1
         done
         echo "    $NEW_UUID_ROOT  GUI $title / TTY $title  (this install)"
+        if [ "$MEMTEST_OFF" -eq 1 ]; then
+            echo "    (no \"$MEMTEST_TITLE\" entry: GRUB_DISABLE_MEMTEST=true)"
+        elif [ "$MEMTEST_SRC" -eq 1 ] || [ "$ESP_MEMTEST" -eq 1 ]; then
+            echo "    plus \"$MEMTEST_TITLE\" -> \$prefix/memtest/$MEMTEST_IMAGE"
+        fi
         [ "$shown" -eq 1 ] || [ "$ESP_MENU_PROBED" -eq 1 ] || \
             echo "    (the ESP could not be read here, so entries already on it are not listed)"
         return 0
@@ -1499,6 +1600,9 @@ write_esp_menu() {
     if [ -n "${TGT_ROOT_UUID_NOW:-}" ] && [ "$TGT_ROOT_UUID_NOW" != "$NEW_UUID_ROOT" ]; then
         sudo rm -f "$grubdir/entries/$TGT_ROOT_UUID_NOW.cfg"
     fi
+    # Before the master is built, since the master offers the entry only when the
+    # image is really there.
+    sync_esp_memtest "$grubdir"
     # Build the master before truncating it: it carries over its own timeout.
     master=$(esp_master_text "$grubdir")
     printf '%s\n' "$master" | sudo tee "$grubdir/grub.cfg" >/dev/null
@@ -1639,6 +1743,13 @@ verify_install() {
         sudo grep -qF "set=root $NEW_UUID_BOOT" "$espentry"
     vcheck "the ESP master menu sources it" \
         sudo grep -qF "entries/$NEW_UUID_ROOT.cfg" "$espgrub/grub.cfg"
+    # Only when the image is really there: an ESP that never got one is entitled
+    # to a menu without the entry, the same way the label check runs only when a
+    # label was asked for.
+    if sudo test -f "$espgrub/memtest/$MEMTEST_IMAGE"; then
+        vcheck "the ESP menu offers \"$MEMTEST_TITLE\"" \
+            sudo grep -qF "memtest/$MEMTEST_IMAGE" "$espgrub/grub.cfg"
+    fi
     # Every other system that was on this ESP before the run must still be on
     # it: rebuilding the shared master is the one step that could quietly
     # unregister the machines this install was not about.
@@ -1748,9 +1859,15 @@ NO_TGT_BOOT=0
 
 # The systems already registered in the shared ESP menu (probe_esp_menu), the
 # boot options this system's entry will carry (probe_menu_cmdline / the source
-# swap probe), and the UUIDs verify_install needs before they exist.
+# swap probe), whether the memory tester is on the disk already or comes with
+# this run (probe_esp_menu / probe_memtest), and the UUIDs verify_install needs
+# before they exist.
 ESP_MENU_ENTRIES=()
 ESP_MENU_PROBED=0
+ESP_MEMTEST=0
+MEMTEST_SRC=0
+MEMTEST_OFF=0
+MEMTEST_PROBED=0
 MENU_CMDLINE_PREVIEW=""
 NEW_UUID_ROOT=""
 
@@ -2007,6 +2124,13 @@ Notes:
     rootfs per machine behind a single ESP:
       $0 --source /dev/sde --target-efi /dev/sde2 --keep-efi \\
          --target-bios-boot /dev/sde1 --target-root /dev/sde5 --brand Laptop
+  * That menu also offers "Memory test (memtest86+)" when the source has the
+    memtest86+ package installed: /boot/mt86+x64 is copied to memtest/ on the
+    ESP, so the tester belongs to the disk too and survives installs of slots
+    that do not carry it. One entry covers BIOS and UEFI alike -- the same image
+    boots on both. GRUB_DISABLE_MEMTEST=true in a system's /etc/default/grub
+    keeps that install from adding it, but never removes one already there;
+    retiring it disk-wide is "rm -rf /boot/efi/boot/grub/memtest".
   * A separate /boot earns its keep on a machine whose BIOS cannot boot from
     NVMe: BIOS Boot, the ESP and /boot go on a disk that BIOS can read, while /
     -- everything the running system actually reads -- stays on the NVMe.
@@ -2822,6 +2946,21 @@ echo "  Menu:     GRUB title branded \"$TGT_MODEL\" ($BRAND_ORIGIN)"
 # the three things a shared-ESP disk must not be guessed about.
 summary_row "" "entry \"GUI $TGT_MODEL\" / \"TTY $TGT_MODEL\" in the ESP menu"
 summary_row "" "boots $(esp_cmdline_from "${MENU_CMDLINE_PREVIEW:-<options from /etc/default/grub, read at install time>}")"
+# The memory tester belongs to the disk rather than to this rootfs, so what the
+# run does with it depends on the source AND on what the ESP already carries.
+if [ "$MEMTEST_PROBED" -eq 0 ]; then
+    summary_row "" "memtest: not checked (no root could be read here to look for /boot/$MEMTEST_IMAGE)"
+elif [ "$MEMTEST_OFF" -eq 1 ] && [ "$ESP_MEMTEST" -eq 1 ]; then
+    summary_row "" "GRUB_DISABLE_MEMTEST=true, but the image already on the ESP is left alone -- so \"$MEMTEST_TITLE\" stays in the menu"
+elif [ "$MEMTEST_OFF" -eq 1 ]; then
+    summary_row "" "no \"$MEMTEST_TITLE\" (GRUB_DISABLE_MEMTEST=true)"
+elif [ "$MEMTEST_SRC" -eq 1 ]; then
+    summary_row "" "plus \"$MEMTEST_TITLE\" ($MEMTEST_IMAGE, copied to the ESP)"
+elif [ "$ESP_MEMTEST" -eq 1 ]; then
+    summary_row "" "plus \"$MEMTEST_TITLE\", already on the ESP (this source has no image to refresh it with)"
+else
+    summary_row "" "no \"$MEMTEST_TITLE\": the source has no /boot/$MEMTEST_IMAGE (apt install memtest86+ to get one)"
+fi
 esp_menu_kept=0
 for esp_row in ${ESP_MENU_ENTRIES[@]+"${ESP_MENU_ENTRIES[@]}"}; do
     IFS="$(printf '\t')" read -r esp_uuid esp_title <<<"$esp_row"

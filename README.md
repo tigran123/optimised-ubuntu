@@ -95,6 +95,22 @@ $ ./install.sh --image Ubuntu26-Portable-16GB.img --keep-efi \
 
 `--brand` is worth passing here: without it every slot on the disk is named after the disk's own model, and the menu ends up listing the same title three times. `--target-root-label` is its counterpart on the disk itself: it labels this slot's root filesystem `laptop` rather than the `root` that every slot otherwise carries, so `lsblk` tells them apart at a glance. It does not make the disk scannable — a rootfs labelled anything but `root` is not what a whole-disk scan looks for, and such a disk is addressed partition by partition either way. The summary printed before the confirmation gate names the entry being registered, the command line it will boot with, and every system already registered on that ESP that the run will keep.
 
+### The memory tester
+
+The menu also offers **Memory test (memtest86+)** when the source has Ubuntu's `memtest86+` package installed — a portable disk that boots on arbitrary machines is exactly where a RAM tester earns its keep, since you can plug it into a machine that will not boot at all and still test it. The image (`/boot/mt86+x64`, about 157 KB) is copied onto the ESP at `boot/grub/memtest/`, beside the menu that offers it, and the entry loads it with GRUB's own `linux` command. The same file works under UEFI and legacy BIOS alike, so there is one entry rather than the four Ubuntu's `20_memtest86+` generates — those exist only to choose between the 64- and 32-bit images, and anything that can boot one of these disks is 64-bit.
+
+The entry asks GRUB for a 640x480 framebuffer (`set gfxpayload=640x480,keep`). It needs one at all because under UEFI there is no VGA text mode to fall back on — without a framebuffer memtest86+ prints `No graphics display found` and stops — and it needs a small one because the tester draws a fixed 640x400 panel and never scales it, so on a 2560x1440 screen it would occupy a rectangle in the middle. `keep` is the fallback for firmware with no 640x480 mode. The master menu loads GRUB's video drivers for that reason — which also means the menu itself now fills the screen under UEFI, instead of sitting in an 80x25 box with the firmware's leftovers around it.
+
+Like the menu itself, the tester belongs to the **disk**, not to a rootfs: install a second slot from a system that has no `memtest86+` and the entry stays, because the master is rebuilt from what is on the ESP rather than from what the newest source happened to carry.
+
+`GRUB_DISABLE_MEMTEST=true` in a system's `/etc/default/grub` — Ubuntu's own switch — stops *that* system's install from putting the image on the disk. It does not remove one that is already there, for the same reason an install never touches another system's menu entry: one slot must not take a disk-wide feature away from the others. To retire the tester for the whole disk, delete it from the ESP and let the next install rebuild the menu without it:
+
+```
+$ sudo rm -rf /boot/efi/boot/grub/memtest
+```
+
+If the entry is missing and you want it, `sudo apt install memtest86+` on the source and re-run the install.
+
 The `fstab` of such a system survives the copy: a mount whose UUID is on the disk being installed is kept (a shared `/data` partition is present exactly when the system is), and so are the bind mounts hanging off it. Mounts naming *another* machine's disk are still commented out, along with the binds that depend on them — a clone that boots elsewhere must not block on a device that is not there.
 
 To produce an *impersonal* clone (stripped of personal data), pass `--exclude-from FILE`, which hands the file to `rsync --exclude-from`. List one path per line (see the included `exclude-personal.txt` for the kind of thing I strip — caches, histories, credentials, downloads, etc.):
