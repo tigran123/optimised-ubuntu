@@ -1,32 +1,13 @@
 #!/bin/bash
 # install.sh — flash a portable OS image or scattered partitions onto a target.
-#
-# Three things can be combined freely:
-#   * a unified source: a whole block device or a disk-image file (.img);
-#   * a scattered source: independent --source-efi/--source-root partitions,
-#     plus --source-boot when that system keeps /boot on its own filesystem;
-#   * a unified target (--target, auto-partitioned) or independent --target-*
-#     partitions.
+# Source and target are each either unified (a device or an .img) or scattered
+# (--source-*/--target-* partitions); the four combinations all work.
 #
 # Per-role rule: each --target-X defaults to its --source-X, so a role whose
-# target equals its source is left untouched (in-place), while a role whose
-# target differs is migrated (formatted + copied). This makes "move only / to a
-# new partition, keeping BIOS Boot and EFI where they are" a first-class
-# operation. See --help for examples.
-#
-# /boot inside / is the default layout, and a separate /boot is EXPLICIT on both
-# sides: only --source-boot says a source has one, only --target-boot gives a
-# target one. Nothing is inferred from a partition table -- a /boot partition a
-# disk happens to carry is left alone unless it is named. The layout is for a
-# machine whose BIOS cannot boot from NVMe: BIOS Boot, the ESP and /boot live on
-# its SATA disk, / on the (four times faster) NVMe. Either layout converts to
-# the other: --no-target-boot folds a source's separate /boot into the target's
-# root, --target-boot splits it back out.
-#
-# With --update, a differing role is *synced* instead of migrated: the target
-# filesystem is kept as-is (no mkfs) and rsync runs with --delete, so an
-# existing clone is refreshed in place rather than rebuilt from scratch. This
-# subsumes the old backup.sh disk-to-disk clone.
+# target equals its source is left in place and one that differs is migrated
+# (mkfs + copy) -- or, under --update, synced (no mkfs, rsync --delete).
+# A separate /boot is explicit on both sides, never inferred from a partition
+# table. See --help for the options and CLAUDE.md for the reasoning.
 set -euo pipefail
 
 # -----------------------------------------------------------------------------
@@ -95,10 +76,9 @@ supports_discard() {
     [ -n "$gran" ] && [ "$gran" -gt 0 ]
 }
 
-# Wait for udev to publish a disk's partition nodes. udevadm settle watches the
-# global event queue, which a concurrent instance's partitioning storm can
-# stall; poll the one disk we care about instead. Best-effort: on timeout the
-# caller's own validation produces the precise error.
+# Wait for udev to publish a disk's partition nodes. Polls this one disk rather
+# than udevadm settle, whose global queue a concurrent instance can stall.
+# Best-effort: on timeout the caller's own validation gives the precise error.
 wait_for_partitions() {
     local disk=$1 _i
     for _i in $(seq 1 20); do
@@ -113,22 +93,22 @@ wait_for_partitions() {
 # -----------------------------------------------------------------------------
 # Cross-instance locking
 # -----------------------------------------------------------------------------
-# Several instances may run concurrently (e.g. flashing multiple disks from one
-# source). Every disk we write gets an exclusive flock, every disk we only read
-# a shared one, so instances can share a source but never write the same disk.
-# Keys are canonical parent disks, so a partition-level and a whole-disk run of
-# the same device collide. Lock files live in /run/lock (tmpfs) and are never
-# unlinked: removing a lock file another process holds open reopens the classic
-# unlink+flock race. The fds stay open for the life of the process, so locks
-# release atomically on any exit, including SIGKILL.
+# Instances may run concurrently (flashing several disks from one source): every
+# disk written gets an exclusive flock, every disk only read a shared one. Keys
+# are canonical parent disks, so a partition-level and a whole-disk run collide.
+# Lock files in /run/lock are never unlinked (unlink+flock is a classic race);
+# the fds stay open for the life of the process, so locks release on any exit.
 declare -A LOCK_MODE=()
+# The fd each key is held on, so acquire_locks() can run again once a later
+# decision adds a key (a filesystem an fstab entry is remapped onto). Re-flocking
+# a held key would block on ourselves: another fd is another lock holder.
+declare -A LOCK_FD=()
 
 # add_lock <device-or-file> <sh|ex> — register a lock key; ex wins over sh.
 add_lock() {
     local key parent
-    # Roles that do not exist (e.g. no BIOS Boot partition) arrive as an empty
-    # string. Check it here rather than trusting readlink: uutils' readlink
-    # resolves "" to the working directory and exits 0, locking the cwd.
+    # An absent role arrives as "", which uutils readlink -f resolves to the
+    # working directory (exit 0) -- it would lock the cwd. Check it here.
     [ -n "${1:-}" ] || return 0
     key=$(readlink -f "$1" 2>/dev/null) || return 0
     [ -n "$key" ] || return 0
@@ -147,6 +127,7 @@ acquire_locks() {
     [ ${#LOCK_MODE[@]} -gt 0 ] || return 0
     mapfile -t keys < <(printf '%s\n' "${!LOCK_MODE[@]}" | sort)
     for key in "${keys[@]}"; do
+        [ -z "${LOCK_FD[$key]:-}" ] || continue    # already held by this run
         file="/run/lock/portable-install-$(printf '%s' "$key" | tr '/ ' '__').lock"
         if ! exec {fd}>>"$file"; then
             die "Cannot open lock file $file (stale file owned by another user?)"
@@ -154,66 +135,52 @@ acquire_locks() {
         if [ "${LOCK_MODE[$key]}" = "ex" ]; then flag=-x; else flag=-s; fi
         flock -n "$flag" "$fd" || \
             die "Another install.sh instance is using $key (lock: $file)"
+        LOCK_FD[$key]=$fd
     done
 }
 
+# validate_partition_type <part> <gpt-type> <label> — check one named partition
+#   and die if it is not what the caller asked for. Every call site wants that,
+#   and an unexpected layout must fail here rather than at mount time.
 validate_partition_type() {
-    local part=$1
-    local exp_type=$2
-    local label=$3
-
-    if [ ! -b "$part" ]; then
-        echo "  [FAIL] $label partition ($part) is not a valid block device."
-        return 1
-    fi
-
-    local ptype
+    local part=$1 exp_type=$2 label=$3 ptype
+    [ -b "$part" ] || die "$label partition ($part) is not a valid block device."
     ptype=$(lsblk -n -d -o PARTTYPE "$part" 2>/dev/null | tr '[:upper:]' '[:lower:]')
-    if [ "$ptype" != "$exp_type" ]; then
-        echo "  [FAIL] $label partition ($part) has type $ptype. Expected $exp_type."
-        return 1
-    fi
+    [ "$ptype" = "$exp_type" ] || \
+        die "$label partition ($part) has type ${ptype:-none}, expected $exp_type."
     echo "  [PASS] $label partition ($part) validated."
-    return 0
 }
 
-# scan_disk_roles <disk> <VAR_PREFIX>
-#   Scan a whole disk (or attached loop device) and assign its BIOS Boot, EFI
-#   and root partitions into <PREFIX>_BIOS/_EFI/_ROOT by GPT type and filesystem
-#   label, rather than assuming fixed partition numbers. This lets a disk
-#   carrying an inline swap or data partition — or any other non-canonical
-#   ordering — resolve correctly.
-#
-#   Used for both sides: a unified source, and a unified --target under --update
-#   (where the existing layout must be discovered, not imposed, since we neither
-#   repartition nor reformat it).
-#
-#   EFI is the ESP. Root is the Linux-filesystem partition labelled "root" —
-#   which this toolkit's own mkfs always writes — or, failing that, a *lone*
-#   unlabelled Linux partition. Everything else on the disk is none of our
-#   business and is ignored: a data partition, a separate /boot (a role, but a
-#   named one -- see --source-boot/--target-boot -- never a discovered one),
-#   another distro's rootfs. Ambiguity is never resolved by guessing (an
-#   earlier version claimed the first unclaimed Linux partition as
-#   /boot, which happily adopted — and then reformatted — a data partition):
-#   two or more candidates with no "root" label is a fatal error naming them,
-#   and so is more than one partition labelled "root" (a disk carrying a rootfs
-#   per machine behind one shared ESP has exactly that layout).
-#   Dies likewise if the ESP or root is missing, so an unexpected layout fails
-#   here rather than at mount time.
+# validate_target_roles — the target partitions this run was given: ESP and root
+#   always, BIOS Boot and /boot when named.
+validate_target_roles() {
+    [ -z "$TGT_BIOS" ] || validate_partition_type "$TGT_BIOS" "$GUID_BIOS" "Target BIOS"
+    validate_partition_type "$TGT_EFI" "$GUID_EFI" "Target EFI"
+    [ -z "$TGT_BOOT" ] || validate_partition_type "$TGT_BOOT" "$GUID_LINUX" "Target Boot"
+    validate_partition_type "$TGT_ROOT" "$GUID_LINUX" "Target Root"
+}
+
+# scan_disk_roles <disk> <VAR_PREFIX> — fill <PREFIX>_BIOS/_EFI/_ROOT from a
+#   whole disk by GPT type and filesystem label, never by partition number.
+#   Used for a unified source and for a unified --target under --update, whose
+#   existing layout must be discovered rather than imposed.
+#   Root is the Linux partition labelled "root" (what this toolkit's mkfs
+#   writes) or, failing that, a *lone* unlabelled one. Everything else on the
+#   disk is ignored -- data, swap, another distro, a separate /boot (a named
+#   role, never a discovered one). **Ambiguity dies rather than guesses**: two
+#   unlabelled candidates, or two labelled "root" (the slot-per-machine disk),
+#   are both fatal, as is a missing ESP or root -- an unexpected layout must
+#   fail here, not at mount time.
 scan_disk_roles() {
     local disk=$1 pfx=$2
     local dev ptype fstype label
     local -a linux_parts=() root_parts=()
     local bios="" efi="" root=""
 
-    # One lsblk for the whole disk, rather than one per partition per column.
-    # Default IFS on purpose: lsblk emits no tabs in any output mode (-l pads
-    # its columns with spaces), and word splitting collapses that padding. A row
-    # whose PARTTYPE is empty shifts its remaining fields left, but that only
-    # happens for the whole-disk row (skipped below) and for the non-partition
-    # children -l flattens into the list (dm/LVM/crypt), whose FSTYPE can never
-    # look like a GUID -- they fall through the case untouched either way.
+    # One lsblk for the whole disk. Default IFS on purpose: lsblk pads with
+    # spaces, never tabs. An empty PARTTYPE shifts the later fields left, but
+    # only on the whole-disk row (skipped) and on dm/LVM/crypt children, whose
+    # FSTYPE can never look like a GUID -- both fall through the case anyway.
     while read -r dev ptype fstype label; do
         [ "$dev" = "$disk" ] && continue
         ptype=${ptype,,}
@@ -226,27 +193,19 @@ scan_disk_roles() {
                 [ "$fstype" = swap ] && continue   # a Linux-typed swap: not /
                 case "$label" in
                     root) root_parts+=("$dev") ;;
-                    # A separate /boot. It is a role again, but never a
-                    # discovered one: --source-boot/--target-boot name it, so
-                    # all this scan owes it is not to mistake it for a root
-                    # filesystem or let it make the disk look ambiguous. Unnamed
-                    # by the caller, it is left on the disk, unused.
+                    # A separate /boot is named by --source-boot/--target-boot,
+                    # never discovered: skip it so it neither passes for a root
+                    # filesystem nor makes the disk look ambiguous.
                     boot) ;;
                     *)    linux_parts+=("$dev") ;;
                 esac ;;
         esac
     done < <(lsblk -lnpo NAME,PARTTYPE,FSTYPE,LABEL "$disk")
 
-    # One "root" label settles it, and every other Linux partition on the disk
-    # is then someone else's (data, an unnamed /boot, a second distro). Only
-    # when nothing is labelled does the scan fall back to "there is exactly one
-    # candidate, so that is it" — and more than one candidate is an error, not
-    # a coin toss: picking wrong here means reformatting the wrong partition.
-    #
-    # Several partitions labelled 'root' is the same error, and a live layout
-    # now that one disk can carry a rootfs per machine behind a shared ESP: an
-    # earlier version let the last one win, so a whole-disk --target --update
-    # silently synced onto whichever slot lsblk listed last.
+    # One "root" label settles it; only an unlabelled disk falls back to "there
+    # is exactly one candidate". More than one of either is fatal, never a coin
+    # toss -- picking wrong here reformats the wrong partition, and two labelled
+    # "root" is the live layout of a slot-per-machine disk.
     if [ ${#root_parts[@]} -eq 1 ]; then
         root="${root_parts[0]}"
     elif [ ${#root_parts[@]} -gt 1 ]; then
@@ -274,20 +233,14 @@ Name it explicitly with --source-root/--target-root, or label it:
     printf -v "${pfx}_ROOT" '%s' "$root"
 }
 
-# scan_image_roles_dryrun <image>
-#   Role partition NUMBERS for a .img in a dry run, where no loop device is
-#   attached and lsblk therefore has nothing to scan. parted reads the partition
-#   table straight out of the file (no root, no loop needed), so the printed
-#   summary reflects the image's real layout instead of a canonical guess.
-#   Prints "<efi>:<root>", or nothing if the table could not be read.
-#   Limits: without a loop device the filesystems cannot be probed, so a
-#   Linux-typed *swap* partition is only recognised when parted names its type,
-#   and filesystem LABELS are invisible -- parted's own name field is the GPT
-#   partition name ("primary" for everything this toolkit creates), not the
-#   ext4 label scan_disk_roles() keys on. Root is therefore the first Linux
-#   partition, which is the layout this toolkit produces (BIOS, ESP, root, then
-#   any extras). A real run resolves it by label and may disagree; since this
-#   only feeds the dry run's printed summary, say so rather than guess silently.
+# scan_image_roles_dryrun <image> — role partition NUMBERS for a .img in a dry
+#   run, where no loop device is attached: parted reads the table out of the
+#   file itself. Prints "<efi>:<root>", or nothing if it cannot be read.
+#   Filesystem labels are invisible without a loop (parted's name field is the
+#   GPT name, "primary" here), so root is the FIRST Linux partition -- the
+#   layout this toolkit produces. A real run resolves it by label and may
+#   disagree, so more than one candidate warns rather than guesses silently.
+#   This only feeds the dry run's printed summary.
 scan_image_roles_dryrun() {
     local img=$1 num fstype flags
     local -a linux_nums=()
@@ -329,13 +282,10 @@ blkid_uuid() {
 # -----------------------------------------------------------------------------
 # Swap files
 # -----------------------------------------------------------------------------
-# A swap FILE (as opposed to a swap partition) is never worth copying: it is one
-# multi-gigabyte run of zeros, so transferring it ships gigabytes over a slow USB
-# link to produce something fallocate re-creates from metadata alone. Under
-# --sparse it is worse than pointless -- rsync's -S turns that run of zeros into
-# holes and the kernel then refuses the file at boot ("swapon: /var/swap:
-# skipping - it appears to have holes"). So it is never transferred at all: it is
-# excluded from the rsync and re-created on the target from scratch.
+# A swap FILE is never copied: it is a multi-gigabyte run of zeros that
+# fallocate re-creates from metadata alone, and under --sparse rsync's -S would
+# punch it full of holes, which swapon then refuses ("skipping - it appears to
+# have holes"). It is excluded from the rsync and re-created on the target.
 
 # swapfile_entries <fstab> — print the swap FILE paths listed in an fstab, one
 #   per line. Only plain paths qualify: swap partitions (/dev/..., UUID=,
@@ -343,9 +293,8 @@ blkid_uuid() {
 swapfile_entries() {
     awk '$1 ~ /^#/ { next }
          $3 == "swap" && $1 ~ /^\// && $1 !~ /^\/dev\// {
-             # fstab octal escapes (\040 for a space, ...) would have to be
-             # decoded to be usable as a path; such a swap file is vanishingly
-             # rare, so say so and skip it rather than mangle it.
+             # An fstab octal escape (\040 etc.) would have to be decoded to
+             # be usable: too rare to be worth it, so say so and skip.
              if ($1 ~ /\\/) {
                  print "Warning: swap file " $1 " has an escaped path -- not rebuilt." > "/dev/stderr";
                  next;
@@ -354,17 +303,13 @@ swapfile_entries() {
          }' "$1"
 }
 
-# swapfile_excluded <path> — true when the user's --exclude-from file removes
-#   this path from the transfer. Asked of rsync itself with a one-file dry run,
-#   so wildcards, "+" include lines and rule ordering are honoured exactly as in
-#   the real transfer rather than re-implemented here: the path is excluded
-#   exactly when rsync no longer lists it. The destination is a deliberately
-#   NON-existent directory -- against the real target, rsync's quick check would
-#   skip an unchanged file already sitting there and the empty output would read
-#   as "excluded". Nothing is written: --dry-run creates neither. (Limit: a rule
-#   excluding a whole parent directory is not detected, since --relative always
-#   sends implied dirs; that only matters for an exclude file that guts /var,
-#   which could not boot anyway.)
+# swapfile_excluded <path> — true when --exclude-from removes this path from the
+#   transfer. Asked of rsync itself (a one-file dry run) so wildcards, "+" lines
+#   and rule order behave exactly as in the real transfer. The destination is
+#   deliberately NON-existent: against the real target rsync's quick check would
+#   skip an unchanged file and the empty output would read as "excluded".
+#   Limit: a rule excluding a whole parent directory is not detected, --relative
+#   always sending implied dirs. That needs an exclude file that guts /var.
 swapfile_excluded() {
     local sf=$1 listed rc=0
     [ -n "$EXCLUDE_FROM" ] || return 1
@@ -376,18 +321,14 @@ swapfile_excluded() {
     return 0
 }
 
-# probe_source_swapfiles — name the swap FILES this run will re-create (or drop)
-#   *before* the confirmation gate, so the summary does not say "swap: none"
-#   about a disk that is about to get a multi-gigabyte swap file. The source's
-#   fstab is the only place that information lives, so read it through a
-#   transient read-only mount of SRC_ROOT on SRC -- the same trick
-#   probe_target_brand() uses on the target, and for the same reason: the answer
-#   is needed before Phase 3 mounts anything for real.
-#   Fills SWAP_PREVIEW (one "<fstab path> <bytes|?> keep|drop|offroot <transfer
-#   path|carrier>" row per swap file) and sets SWAP_PROBED; scan_swapfiles()
-#   still does the authoritative pass later. Best-effort by design: SWAP_PROBED
-#   stays 0 when the source cannot be mounted, which in a dry run is the normal
-#   case for an image (no loop device is attached, so SRC_ROOT does not exist).
+# probe_source_swapfiles — the swap FILES this run re-creates or drops, read
+#   BEFORE the confirmation gate through a transient read-only mount of SRC_ROOT
+#   (the same trick probe_target_brand() uses), so the summary cannot say
+#   "swap: none" about a disk about to receive a multi-gigabyte swap file.
+#   Fills SWAP_PREVIEW ("<fstab path> <bytes|?> keep|drop|offroot <transfer
+#   path|carrier>" per file) and SWAP_PROBED; scan_swapfiles() is the
+#   authoritative pass later. Best-effort: SWAP_PROBED stays 0 when the source
+#   cannot be mounted -- a dry run against an image, which has no loop device.
 probe_source_swapfiles() {
     SWAP_PREVIEW=(); SWAP_PROBED=0
     local sf real size state
@@ -411,25 +352,21 @@ probe_source_swapfiles() {
             SWAP_PREVIEW+=("$sf ${size:-?} $state $real")
         done < <(swapfile_entries "$SRC/etc/fstab")
     fi
-    # The source root is mounted anyway, and its /etc/default/grub is the file
-    # that lands on the target and feeds this system's menu entry: read the boot
-    # options now, so the summary can show the command line the disk will boot
-    # with (see probe_menu_cmdline, which only mounts anything if this did not).
+    # The mount is already here, and this source's /etc/default/grub is what
+    # feeds the menu entry: read the boot options now (probe_menu_cmdline only
+    # mounts anything if this did not).
     MENU_CMDLINE_PREVIEW=$(grub_cmdline_options "$SRC")
     probe_memtest "$SRC"
     sudo umount "$SRC" || true
 }
 
-# scan_swapfiles — read the source's fstab and split its swap files into the
-#   ones to rebuild (SWAPFILES) and the ones the --exclude-from file removes
-#   (SWAPFILES_DROPPED: an impersonal/minimal disk is meant to have no swap at
-#   all, so those are neither copied nor re-created, and rewrite_fstab comments
-#   their entries out). SWAP_EXCLUDES keeps every swap file out of the rsync,
-#   and SWAPFILE_REAL records where each one is in the transfer -- the fstab path
-#   for an ordinary swap file, a translated one when a bind puts it elsewhere.
-#   A swap file that is not in the transfer at all is skipped outright; see the
-#   comment on the fstab_realpath call. SWAPFILES/SWAPFILES_DROPPED keep the
-#   *fstab* paths, because rewrite_fstab() and the fstab checks match on those.
+# scan_swapfiles — split the source's swap files into the ones to rebuild
+#   (SWAPFILES) and the ones --exclude-from removes (SWAPFILES_DROPPED: neither
+#   copied nor re-created, and their fstab entries are commented out -- an
+#   exclude file builds a deliberately swapless disk). SWAP_EXCLUDES keeps every
+#   one out of the rsync; SWAPFILE_REAL records where each is in the transfer,
+#   which is the fstab path unless a bind moved it. SWAPFILES* keep the *fstab*
+#   paths, which is what rewrite_fstab() and the checks match on.
 #   Reads caller globals (SRC, MNT, EXCLUDE_FROM).
 scan_swapfiles() {
     local sf real
@@ -440,16 +377,17 @@ scan_swapfiles() {
     FSTAB_TABLE=$(fstab_mount_table "$SRC/etc/fstab")
     mapfile -t found < <(swapfile_entries "$SRC/etc/fstab")
     for sf in "${found[@]}"; do
-        # Only the source's ROOT filesystem is mounted at $SRC, so a swap file on
-        # a mount of its own -- /data/swap, with /data a partition -- is not under
-        # it. rsync never sees it, there is nothing to exclude, and re-creating it
-        # would fallocate gigabytes into the ROOT filesystem under a directory the
-        # target mounts /data over at boot: invisible, unusable, never reclaimed,
-        # and Phase 4 then disables the very fstab entry that named it. It belongs
-        # to whoever owns that filesystem. The same walk also finds the real path
-        # of a swap file that IS in the transfer under another name, behind a bind.
+        # Only the ROOT filesystem is mounted at $SRC, so /data/swap (with /data
+        # a partition) is not under it: rsync never sees it, and re-creating it
+        # would fallocate gigabytes into the root filesystem under a directory
+        # the target mounts /data over at boot -- invisible and never reclaimed.
+        # The same walk finds the transfer path of one a bind moved.
         if ! real=$(fstab_realpath "$sf"); then
-            info "Swap file $sf is on $real, a filesystem of its own -- not in the transfer, left alone."
+            if remap_creates_swapfile "$sf"; then
+                info "Swap file $sf is on $real, a filesystem of its own -- not in the transfer, but $real was resolved at the gate, so it is created directly on the filesystem chosen for it."
+            else
+                info "Swap file $sf is on $real, a filesystem of its own -- not in the transfer, left alone."
+            fi
             continue
         fi
         SWAPFILE_REAL[$sf]=$real
@@ -471,19 +409,15 @@ scan_swapfiles() {
 }
 
 # rebuild_swapfiles — re-create every kept swap file on the freshly synced
-#   target: same size as the source's, same label/UUID, 0600 root:root, freshly
-#   mkswap'ed. Reads caller globals (SRC, MNT, SWAPFILES) and records what it
-#   did in SWAPFILES_REBUILT for verify_install().
+#   target: the source's size, 0600 root:root, plain mkswap (see below).
+#   Reads SRC/MNT/SWAPFILES; records SWAPFILES_REBUILT for verify_install().
 rebuild_swapfiles() {
-    local sf real src_file tgt_file size label uuid
-    local -a mkswap_args
+    local sf real src_file tgt_file size
     [ ${#SWAPFILES[@]} -gt 0 ] || return 0
     for sf in "${SWAPFILES[@]}"; do
         # Where the file is in the transfer, which is not always where fstab
-        # mounts it. scan_swapfiles() already dropped every swap file that is not
-        # in the transfer at all, and did it by asking the source's own fstab --
-        # not by stat'ing a file that, being on an unmounted filesystem, was
-        # never there to stat in the first place.
+        # mounts it; scan_swapfiles() already dropped the ones that are not in
+        # the transfer at all, by reading the fstab rather than stat'ing.
         real=${SWAPFILE_REAL[$sf]:-$sf}
         src_file="$SRC$real"
         tgt_file="$MNT$real"
@@ -501,24 +435,59 @@ rebuild_swapfiles() {
             continue
         fi
 
-        # Keep the swap area's identity, so anything referring to it by label
-        # or UUID (fstab, resume=) still resolves on the clone.
-        label=""; uuid=""
-        if sudo test -f "$src_file"; then
-            label=$(sudo blkid -p -s LABEL -o value "$src_file" 2>/dev/null || true)
-            uuid=$(sudo blkid -p -s UUID -o value "$src_file" 2>/dev/null || true)
-        fi
-        mkswap_args=(-q)
-        [ -n "$label" ] && mkswap_args+=(-L "$label")
-        [ -n "$uuid" ]  && mkswap_args+=(-U "$uuid")
-
+        # Plain mkswap: the source area's label and UUID are deliberately NOT
+        # carried over. A swap FILE is named by its path -- what its fstab entry
+        # uses, and what survives the file being remade by hand -- so a label or
+        # UUID on one names nothing anybody looks up. Hibernation would want an
+        # identity outliving the file; that belongs to a swap PARTITION.
         info "Re-creating swap file $sf ($size bytes)..."
         run sudo rm -f "$tgt_file"
         run sudo fallocate -l "$size" "$tgt_file"
         run sudo chown root:root "$tgt_file"
         run sudo chmod 600 "$tgt_file"
-        run sudo mkswap "${mkswap_args[@]}" "$tgt_file"
+        run sudo mkswap -q "$tgt_file"
         SWAPFILES_REBUILT+=("$sf")
+    done
+}
+
+# remap_creates_swapfile <fstab path> — true when this run puts that swap file on
+#   the filesystem a resolved mount points at (so it is not simply "left alone").
+remap_creates_swapfile() {
+    local row path
+    for row in ${REMAP_SWAP_CREATE[@]+"${REMAP_SWAP_CREATE[@]}"}; do
+        IFS=$'\t' read -r path _ <<<"$row"
+        [ "$path" = "$1" ] && return 0
+    done
+    return 1
+}
+
+# create_remap_swapfiles — the swap files belonging on a filesystem this run
+#   resolved a mount onto, and missing from it. Same recipe as
+#   rebuild_swapfiles(), on a filesystem outside the transfer: its fstab entry
+#   survives Phase 4 because the carrier does, and a live entry naming a file
+#   that is not there boots into a failing swapon -a. Sizes come from
+#   probe_remap_choice() and are never invented -- one it could not read is not
+#   in this list at all.
+create_remap_swapfiles() {
+    local row path dev rel size root
+    [ ${#REMAP_SWAP_CREATE[@]} -gt 0 ] || return 0
+    for row in "${REMAP_SWAP_CREATE[@]}"; do
+        IFS=$'\t' read -r path dev rel size <<<"$row"
+        if ! remap_open "$dev" rw; then
+            echo "Warning: $dev could not be mounted read-write here, so swap file $path was not created; swapon -a will fail on the target." >&2
+            continue
+        fi
+        root=$REMAP_OPEN_PATH
+        info "Creating swap file $path on $dev ($size bytes)..."
+        run sudo rm -f "$root$rel"
+        run sudo fallocate -l "$size" "$root$rel"
+        run sudo chown root:root "$root$rel"
+        run sudo chmod 600 "$root$rel"
+        run sudo mkswap -q "$root$rel"
+        if [ "$DRY_RUN" -eq 0 ] && ! swapfile_ok "$root$rel"; then
+            echo "Warning: the swap file just created at $path on $dev is not usable (swapon would refuse it)." >&2
+        fi
+        remap_close rw
     done
 }
 
@@ -540,11 +509,27 @@ fstab_disabled() {
         END { exit !found }' "$2"
 }
 
-# fstab_mounts_boot <fstab> — true when the file carries a LIVE /boot entry,
-#   i.e. that system keeps /boot on a filesystem of its own. Used to check the
-#   source's real layout against --source-boot before anything is copied, to
-#   decide whether rewrite_fstab() must insert a /boot entry, and to verify what
-#   was written into the target's fstab.
+# fstab_mounts_from <mount point> <spec> <fstab> — true when a LIVE entry mounts
+#   that mount point from exactly that spec. What verify_install() asks of a
+#   resolved mount: not that the line exists, but that it names the chosen
+#   filesystem.
+fstab_mounts_from() {
+    sudo awk -v mp="$1" -v spec="$2" '
+        $1 !~ /^#/ && $2 == mp && $1 == spec { found = 1 } END { exit !found }' "$3"
+}
+
+# fstab_live_entry <path> <fstab> — true when a LIVE entry mounts <path>, or, for
+#   a swap file (which mounts nowhere), names it as its device.
+fstab_live_entry() {
+    sudo awk -v p="$1" '
+        $1 !~ /^#/ && ($2 == p || ($3 == "swap" && $1 == p)) { found = 1 }
+        END { exit !found }' "$2"
+}
+
+# fstab_mounts_boot <fstab> — true when the file carries a LIVE /boot entry:
+#   that system keeps /boot on a filesystem of its own. Checks the source
+#   against --source-boot, tells rewrite_fstab() whether to insert an entry,
+#   and verifies what was written.
 fstab_mounts_boot() {
     sudo awk '$1 !~ /^#/ && $2 == "/boot" { found = 1 } END { exit !found }' "$1"
 }
@@ -552,35 +537,22 @@ fstab_mounts_boot() {
 # -----------------------------------------------------------------------------
 # Bind-aware paths
 # -----------------------------------------------------------------------------
-# The rsync sees the source's root filesystem RAW: mounted read-only at $SRC
-# with none of its bind mounts replayed. A path as the running system shows it
-# is therefore not necessarily the path the same data has in the transfer. On a
-# disk whose slots share one /data, ~/.cache is a bind of /var/local/<...>/cache
-# -- on the root filesystem, and copied -- while /home/<user> itself is a bind
-# of a directory on the data partition, which -x never enters at all. So a rule
-# written as /home/<user>/.cache/... matches nothing, and one written as
-# /home/<user>/.ssh/id_ed25519 silently fails to strip a private key. Both
-# helpers below translate between the two namespaces, with the source's own
-# fstab as the authority -- the same principle as fstab_mounts_boot() and
-# swapfile_entries(), and for the same reason: the layout is the source's to
-# declare, never ours to guess.
+# The rsync sees the source's root filesystem RAW, with no bind mounts replayed,
+# so a path as the running system shows it is not the path the same data has in
+# the transfer. On a slot-per-machine disk ~/.cache is a bind of
+# /var/local/<...>/cache (copied) while /home/<user> is a bind of the data
+# partition, which -x never enters -- so a rule naming
+# /home/<user>/.ssh/id_ed25519 silently strips nothing. The helpers below
+# translate between the namespaces, with the source's fstab as the authority.
 
 # fstab_mount_table <fstab> — one row per mount point, tab separated:
-#   <mountpoint>\t<fs|bind>\t<source>. "/" itself and swap entries are not
-#   emitted; a trailing slash on either path is stripped, since fstab accepts
-#   "/home/user/.cache/" and a mount point carrying one would match nothing in
-#   fstab_realpath() and would not look like a ".cache" to cache_drop_paths().
-#   An entry whose path uses fstab's octal escapes (\040 for a space, ...) is
-#   announced and skipped rather than emitted as a row that could never match --
-#   the same call swapfile_entries() makes, for the same reason: decoding them is
-#   not worth it for something this rare, and mangling them silently is worse.
-#   "rbind" counts as a bind: a recursive bind puts the data in exactly the same
-#   place, and treating it as a filesystem of its own would report a rule whose
-#   data IS in the transfer as an out-of-reach no-op.
-#   Rows are emitted filesystems first, binds after, but order carries no meaning
-#   for the readers: fstab_realpath() picks the longest matching mount point and
-#   follows binds itself, which is where "a bind riding another bind is judged by
-#   the one it rides on" actually happens.
+#   <mountpoint>\t<fs|bind>\t<source>. "/" and swap entries are not emitted, and
+#   a trailing slash is stripped (fstab accepts "/home/user/.cache/", which would
+#   then match nothing). An octal-escaped path (\040) is announced and skipped
+#   rather than emitted as a row that could never match. "rbind" counts as a
+#   bind: it puts the data in the same place, and calling it a filesystem would
+#   report a rule that DOES match as an out-of-reach no-op. Row order carries no
+#   meaning -- fstab_realpath() picks the longest match and follows binds.
 fstab_mount_table() {
     sudo awk '
         function trim_slash(p) { sub(/\/+$/, "", p); return p == "" ? "/" : p }
@@ -611,16 +583,13 @@ fstab_mount_table() {
         }' "$1"
 }
 
-# fstab_realpath <path> — translate <path> from the namespace of the running
-#   source system into the path the same data has in the raw root filesystem,
-#   following bind mounts as far as they go. Prints the translated path and
-#   returns 0 when the data really is on the root filesystem (so the root rsync
-#   can see it). Returns 1 when it sits on another filesystem, which -x never
-#   enters and no rule can reach, and then prints that filesystem's mount point
-#   instead -- "on another filesystem" is a great deal more useful with the name
-#   of the filesystem attached, and a caller reading the value through a command
-#   substitution cannot be told through a global. Reads the caller-set
-#   FSTAB_TABLE.
+# fstab_realpath <path> — translate <path> from the running system's namespace
+#   into the path the same data has in the raw root filesystem, following binds.
+#   Prints it and returns 0 when the data really is on the root filesystem (so
+#   the rsync can see it); returns 1 when it is on another filesystem and prints
+#   THAT filesystem's mount point instead -- far more useful, and a caller
+#   reading through a command substitution cannot be told through a global.
+#   Reads the caller-set FSTAB_TABLE.
 fstab_realpath() {
     local path=$1 hops=0 mp kind src
     local best best_kind best_src bestlen rest
@@ -646,23 +615,19 @@ fstab_realpath() {
 # -----------------------------------------------------------------------------
 # Regenerable caches
 # -----------------------------------------------------------------------------
-# A browser cache is the one part of a home directory that is pure derived data.
-# ~/.cache/google-chrome is nothing but Default/Cache (the HTTP cache),
-# Default/Code Cache (compiled JS) and a GPU shader cache: a gigabyte of small
-# files, measured at 948 MB / 21,539 files here, that Chrome rebuilds on demand.
-# Nothing in it is unique -- passwords, cookies, bookmarks and extensions all
-# live in ~/.config/google-chrome, which IS copied -- so it is dropped from the
-# transfer by default, and from the target too when there is a stale one there
-# to delete. --keep-cache turns that off and copies it like anything else.
+# ~/.cache/google-chrome is pure derived data: an HTTP cache, a compiled-JS
+# cache and a shader cache (948 MB in 21,539 files here) that Chrome rebuilds on
+# demand, while the passwords, cookies and extensions live in ~/.config and are
+# copied either way. So it is dropped from the transfer by default, and from the
+# target when a stale one is there. --keep-cache copies it like anything else.
 CACHE_DROP_NAMES=(google-chrome google-chrome-headless)
 
-# cache_drop_paths — print the cache directories to drop, as absolute paths in
-#   the transfer (i.e. in the raw root filesystem), one per line. Candidates are
-#   named in the running system's namespace -- /root/.cache, every /home/*/.cache
-#   and any .cache the fstab mounts somewhere -- and then translated by
-#   fstab_realpath, which is what finds /var/local/<...>/cache behind a bound
-#   ~/.cache and drops a .cache that lives on another filesystem entirely.
-#   Reads caller globals (SRC, FSTAB_TABLE, CACHE_DROP_NAMES).
+# cache_drop_paths — the cache directories to drop, as paths in the transfer,
+#   one per line. Candidates are named in the RUNNING system's namespace
+#   (/root/.cache, every /home/*/.cache, any .cache the fstab mounts) and then
+#   put through fstab_realpath, which finds /var/local/<...>/cache behind a
+#   bound ~/.cache and drops one that lives on another filesystem entirely.
+#   Reads SRC, FSTAB_TABLE, CACHE_DROP_NAMES.
 cache_drop_paths() {
     local d cand real name mp kind src
     local -a cands=(/root/.cache)
@@ -682,19 +647,15 @@ cache_drop_paths() {
     done | sort -u
 }
 
-# probe_source_layout — everything the summary needs to know about the source's
-#   own mount layout, read through the transient read-only mount that
-#   probe_source_swapfiles() already holds: the caches this run will drop, and
-#   the --exclude-from rules that cannot match because a bind puts their data
-#   somewhere else. Best-effort exactly like the swap preview: CACHE_PROBED
-#   stays 0 when the source cannot be read here (a dry run against an image
-#   attaches no loop device), and the summary then says so rather than promise a
-#   drop it could not confirm. EXCLUDE_PROBED is the same flag for the audit, and
-#   it has to be its own: an empty EXCLUDE_AUDIT is what a clean exclude file
-#   looks like too, so without it "not checked" and "nothing to report" print
-#   identically and the operator confirms believing the file was verified.
-#   Fills FSTAB_TABLE, CACHE_PREVIEW and EXCLUDE_AUDIT; scan_cache_drops() is the
-#   authoritative pass.
+# probe_source_layout — what the summary needs from the source's own mount
+#   layout, read through the transient mount probe_source_swapfiles() holds: the
+#   caches to drop, the --exclude-from rules a bind makes unmatchable, and the
+#   mounts that can be resolved instead of disabled. Best-effort like the swap
+#   preview -- CACHE_PROBED/EXCLUDE_PROBED stay 0 when the source cannot be read
+#   here, and each needs its own flag: an empty audit is also what a clean
+#   exclude file looks like, so "not checked" must not print as "nothing found".
+#   Fills FSTAB_TABLE, CACHE_PREVIEW, EXCLUDE_AUDIT and the REMAP_* tables;
+#   scan_cache_drops() is the authoritative pass.
 probe_source_layout() {
     CACHE_PREVIEW=(); CACHE_PROBED=0; EXCLUDE_AUDIT=(); EXCLUDE_PROBED=0
     [ -f "$SRC/etc/fstab" ] || return 0
@@ -707,19 +668,15 @@ probe_source_layout() {
         mapfile -t EXCLUDE_AUDIT < <(exclude_rules_unmatchable)
         EXCLUDE_PROBED=1
     fi
+    probe_fstab_remap
 }
 
-# scan_cache_drops — the authoritative pass, run in Phase 3 with the source
-#   really mounted (the sibling of scan_swapfiles): fills CACHE_DROPS with the
-#   paths and CACHE_FILTERS with the rsync rules that drop them.
-#   The rule is "H" (hide) and NOT --exclude, because an exclude is also a
-#   receiver-side PROTECT rule: under --update's --delete the copy already on
-#   the target would survive, which is the opposite of what dropping a cache is
-#   for. Hidden is sender-side only, so the target's copy goes the way of
-#   everything else the source no longer has. (This is the mirror image of the
-#   "- /boot/" + "P /boot/" pair in Phase 3, which wants exactly the protection
-#   that would be wrong here.) Without --update there is no --delete and nothing
-#   to delete either: the target root has just been formatted.
+# scan_cache_drops — the authoritative pass, Phase 3, source really mounted (the
+#   sibling of scan_swapfiles): fills CACHE_DROPS and CACHE_FILTERS.
+#   The rule is "H" (hide), NOT --exclude: an exclude is also a receiver-side
+#   PROTECT, so under --update's --delete the stale copy on the target would
+#   survive -- the opposite of the point. Hide is sender-side only. (The mirror
+#   image of the "- /boot/" + "P /boot/" pair, which wants that protection.)
 scan_cache_drops() {
     CACHE_DROPS=(); CACHE_FILTERS=()
     [ $KEEP_CACHE -eq 0 ] || return 0
@@ -729,12 +686,10 @@ scan_cache_drops() {
     cache_filters_for ${CACHE_DROPS[@]+"${CACHE_DROPS[@]}"}
 }
 
-# rsync_pattern_escape <path> — quote the wildcard metacharacters in a literal
-#   path so rsync matches the path itself. A rule is a pattern, not a name: a
-#   directory really called "a[bc]" would otherwise be hidden as a character
-#   class matching "ab" and "ac" -- directories never probed, and under
-#   --update's --delete removed from the target as well. Same job
-#   rewrite_grub_distributor() does before interpolating into sed.
+# rsync_pattern_escape <path> — quote the wildcards in a literal path. A rule is
+#   a pattern, not a name: a directory really called "a[bc]" would otherwise
+#   hide "ab" and "ac" -- never probed, and under --update's --delete removed
+#   from the target too.
 rsync_pattern_escape() {
     local p=$1
     p=${p//\\/\\\\}
@@ -756,12 +711,10 @@ cache_filters_for() {
     done
 }
 
-# cache_filters_from_preview — the same rules as scan_cache_drops(), built from
-#   what the pre-confirmation probe found instead of from a mounted source. A
-#   dry run never mounts anything in Phase 3, and the assembled rsync command it
-#   prints is the thing worth reviewing, so it should carry the real rules.
-#   CACHE_DROPS is deliberately left empty: its only reader is verify_install(),
-#   which a dry run never reaches.
+# cache_filters_from_preview — the same rules from the pre-gate probe instead of
+#   a mounted source, so the rsync command a dry run prints is the one that runs.
+#   CACHE_DROPS stays empty on purpose: only verify_install() reads it, and a dry
+#   run never gets there.
 cache_filters_from_preview() {
     CACHE_DROPS=(); CACHE_FILTERS=()
     [ $KEEP_CACHE -eq 0 ] || return 0
@@ -772,13 +725,10 @@ cache_filters_from_preview() {
     cache_filters_for ${CACHE_PREVIEW[@]+"${CACHE_PREVIEW[@]}"}
 }
 
-# swap_excludes_from_preview — the sibling of cache_filters_from_preview() for
-#   the swap files: SWAP_PREVIEW already holds every path scan_swapfiles() would
-#   exclude, read off the same transient mount before the confirmation gate, so a
-#   dry run can print the --exclude= arguments the real run will pass instead of
-#   announcing that they are missing. The printed option set is the thing worth
-#   reviewing before committing to a multi-hour transfer; it should be the set
-#   that runs.
+# swap_excludes_from_preview — the sibling of cache_filters_from_preview():
+#   SWAP_PREVIEW already holds every path scan_swapfiles() would exclude, so a
+#   dry run prints the real --exclude= arguments rather than announcing that
+#   they are missing.
 swap_excludes_from_preview() {
     local entry sf state real
     SWAP_EXCLUDES=()
@@ -789,34 +739,33 @@ swap_excludes_from_preview() {
     for entry in ${SWAP_PREVIEW[@]+"${SWAP_PREVIEW[@]}"}; do
         read -r sf _ state real <<<"$entry"
         [ -n "$sf" ] || continue
-        # Not in the transfer, so there is nothing for an --exclude= to match.
-        [ "$state" != offroot ] || continue
+        # Only a swap file the rsync can see gets an --exclude=; every other
+        # state is one on a filesystem of its own, whose fourth field is a
+        # device, not a transfer path. Listed the right way round on purpose: a
+        # state added later must opt IN to being excluded.
+        case "$state" in keep|drop) ;; *) continue ;; esac
         SWAP_EXCLUDES+=("--exclude=${real:-$sf}")
     done
 }
 
 # exclude_rules_unmatchable — audit an --exclude-from file against the source's
-#   real mount layout and print the rules that cannot match, tab separated:
+#   mount layout; print the rules that cannot match, tab separated:
 #     bind\t<rule>\t<the path that data really has>
 #       the rule's data IS in the transfer, under another name. This is the one
 #       that matters: a private key or a browser profile the author believes is
 #       being stripped from an impersonal clone, and is not.
 #     foreign\t<rule>\t<the mount point its data is on>
-#       the rule names a path on another filesystem, which -x never enters, so
-#       nothing it names is copied. That is not the same as "harmless": a
-#       filesystem the target keeps mounted (a shared /data on the target's own
-#       disk, which rewrite_fstab deliberately keeps) still carries that data on
+#       the rule names a path on another filesystem, which -x never copies. Not
+#       the same as harmless: a mount the target keeps still carries that data on
 #       the booted clone, so the mount point is named rather than counted.
 #     unknown\t<rule>\t
-#       the rule's wildcard falls above its last component, so no mount point can
-#       be matched literally and there is nothing to translate it against. Such a
-#       rule is neither cleared nor condemned -- but it is said out loud, because
-#       silence here reads as "checked, and fine".
-#   Only anchored rules ("/...") can be judged at all: an unanchored pattern
-#   matches on name alone and is not tied to any mount point. rsync's own file
-#   syntax is honoured -- "- "/"+ " and their underscore forms, and a lone "!",
-#   which clears every rule read so far exactly as rsync clears its filter list,
-#   so the audit cannot warn about a rule the transfer has discarded.
+#       the wildcard falls above the rule's last component, so there is no
+#       literal mount point to translate it against. Neither cleared nor
+#       condemned, but said out loud: silence here reads as "checked, and fine".
+#   Only anchored rules ("/...") can be judged: an unanchored pattern matches on
+#   name alone, tied to no mount point. rsync's file syntax is honoured -- "- "
+#   and "+ " (and their underscore forms), and a lone "!", which clears the list
+#   so far, so the audit cannot warn about a rule the transfer discarded.
 #   Reads EXCLUDE_FROM and FSTAB_TABLE.
 exclude_rules_unmatchable() {
     local rule real dir
@@ -840,20 +789,17 @@ exclude_rules_unmatchable() {
     for rule in ${rules[@]+"${rules[@]}"}; do
         if real=$(fstab_realpath "$rule"); then
             if [ "$real" = "$rule" ]; then
-                # Nothing above it: a plain root-filesystem path, with nothing
-                # to say about it -- unless its wildcard sits in the directory
-                # portion, where no mount point could have matched literally and
-                # so this proves nothing. A trailing wildcard is fine: the
-                # directory it lives in is spelled out, which is all the walk
-                # needs.
+                # A plain root-filesystem path: nothing to report, unless the
+                # wildcard sits in the DIRECTORY portion, where no mount point
+                # could have matched literally and the walk proves nothing. A
+                # trailing wildcard is fine -- its directory is spelled out.
                 dir=${rule%/*}
                 case $dir in *[\*\?\[]*) printf 'unknown\t%s\t\n' "$rule" ;; esac
                 continue
             fi
-            # Already handled: the file carries the translated path as well, so
-            # the pair covers this layout and the plain one, and there is
-            # nothing left to report. This is what lets an exclude file be
-            # fixed once and stop being announced on every subsequent sync.
+            # The file already carries the translated path too, so the pair
+            # covers both layouts: an exclude file fixed once stops being
+            # announced on every later sync.
             [ -z "${have[$real]:-}" ] || continue
             printf 'bind\t%s\t%s\n' "$rule" "$real"
         else
@@ -864,17 +810,12 @@ exclude_rules_unmatchable() {
 }
 
 # report_exclude_audit — render that audit under the summary's "Excludes:" row.
-#   The bind rows are the point of the exercise: each names a rule whose data IS
-#   in the transfer under a different path, so the rule as written strips
-#   nothing -- which is how a private key or a browser profile ends up on a
-#   clone meant to be impersonal. The foreign rows are counted, with the
-#   filesystems they land on named: nothing there is copied, but "no-op" would
-#   be a promise this cannot make, since a mount the target keeps -- the shared
-#   /data of a slot-per-machine disk, kept by rewrite_fstab precisely because it
-#   is present when the system is -- still carries that data on the booted clone.
-#   The unknown rows are the ones the walk could not judge at all.
-#   Says "not checked" when the audit never ran (EXCLUDE_PROBED), because an
-#   empty audit is also what a clean exclude file looks like.
+#   The bind rows are the point: a rule whose data IS in the transfer under
+#   another name strips nothing, which is how a private key survives on a clone
+#   meant to be impersonal. The foreign rows are counted and their filesystems
+#   named -- "no-op" would be a promise this cannot make, since a mount the
+#   target keeps still carries that data on the booted clone. Says "not checked"
+#   when the audit never ran: an empty audit is also what a clean file looks like.
 report_exclude_audit() {
     local row kind rule real foreign=0 fs
     local -a hits=() unknown=() fslist=()
@@ -909,6 +850,560 @@ report_exclude_audit() {
 }
 
 # -----------------------------------------------------------------------------
+# Mounts resolved at install time
+# -----------------------------------------------------------------------------
+# rewrite_fstab() comments out every mount whose filesystem is not on a disk
+# this run writes to, with its binds and swap files -- right for a clone that
+# must not block at boot, and exactly the edit the operator then undoes by hand,
+# since the target wants ITS data partition. Which one cannot be derived
+# (several disks here are labelled "data"), so it is ASKED before the gate and
+# written in Phase 4; no answer means today's behaviour, exactly. Only the
+# carrier is chosen -- everything on it follows from pass 1 marking it kept.
+
+# fstab_entries_all <fstab> — every line that is a mount ENTRY, live or
+#   commented out, one tab-separated row each:
+#     <live|tagged|comment>\t<spec>\t<mount point>\t<type>\t<options>
+#   "tagged" is a line this toolkit disabled, "comment" one a human did. The
+#   field test is strict -- four fields, a plausible type (or bind), a spec that
+#   names a device -- so that prose cannot qualify: Ubuntu's fstab header
+#   mentions "UUID=" and must never read as a mount.
+fstab_entries_all() {
+    sudo awk '
+        function known_type(t) {
+            return t ~ /^(ext[234]|xfs|btrfs|f2fs|jfs|reiserfs|vfat|exfat|ntfs3?|udf|iso9660|auto|none|swap)$/;
+        }
+        {
+            state = "live"; line = $0;
+            if (line ~ /^[[:space:]]*#/) {
+                state = (line ~ /^[[:space:]]*#[[:space:]]*\[PORTABLE-SYNC-DISABLED\]/) ? "tagged" : "comment";
+                # Strip the marker(s), stacked ones included.
+                while (sub(/^[[:space:]]*#[[:space:]]*/, "", line) ||
+                       sub(/^\[PORTABLE-SYNC-DISABLED\][[:space:]]+/, "", line)) { }
+            }
+            n = split(line, f);
+            if (n < 4) next;
+            if (!known_type(f[3]) && f[4] !~ /(^|,)r?bind(,|$)/) next;
+            if (f[1] !~ /^(\/|UUID=|LABEL=|PARTUUID=|PARTLABEL=)/) next;
+            # A swap entry mounts nowhere ("none"); everything else has to name
+            # an absolute mount point.
+            if (f[3] != "swap" && substr(f[2], 1, 1) != "/") next;
+            sub(/\/+$/, "", f[2]);
+            if (f[2] == "") f[2] = "/";
+            printf "%s\t%s\t%s\t%s\t%s\n", state, f[1], f[2], f[3], f[4];
+        }' "$1"
+}
+
+# spec_uuid <spec> — the filesystem UUID an fstab spec names, or nothing.
+spec_uuid() {
+    case "$1" in
+        UUID=*)              printf '%s' "${1#UUID=}" ;;
+        /dev/disk/by-uuid/*) printf '%s' "${1#/dev/disk/by-uuid/}" ;;
+    esac
+}
+
+# remap_keep_uuids — the UUIDs still there when the target boots, as far as can
+#   be known BEFORE Phase 2. A fresh unified --target is repartitioned, so
+#   nothing on that disk survives; otherwise the layout is kept and
+#   target_disk_uuids() is the answer Phase 4 will reach.
+remap_keep_uuids() {
+    if [ "$UNIFIED_TARGET" -eq 1 ] && [ "$UPDATE" -eq 0 ]; then printf ' '
+    else target_disk_uuids; fi
+}
+
+# probe_fstab_remap — the mounts worth asking about, off the transient mount
+#   probe_source_swapfiles() holds. A mount qualifies when it is device-backed,
+#   is none of this script's own roles, and is either live with a UUID that will
+#   not be on the target's disk(s), or commented out in the source's fstab -- by
+#   us on an earlier run or by hand, which is how a system already through this
+#   migration carries its /data. Its binds and swap files are collected with it
+#   (matched on the SOURCE side, which is what sits on the carrier), so one
+#   answer covers the group. Fills REMAP_MPS + the REMAP_* tables, REMAP_PROBED.
+probe_fstab_remap() {
+    REMAP_MPS=(); REMAP_PROBED=0
+    REMAP_STATE=(); REMAP_UUID=(); REMAP_LABEL=(); REMAP_SPECWAS=()
+    REMAP_BINDS=(); REMAP_SWAPS=()
+    [ -f "$SRC/etc/fstab" ] || return 0
+    REMAP_PROBED=1
+
+    local -a rows=()
+    mapfile -t rows < <(fstab_entries_all "$SRC/etc/fstab")
+    [ ${#rows[@]} -gt 0 ] || return 0
+
+    local keep_uuids row state spec mp type opts uuid label rank
+    local -A remap_rank=()
+    keep_uuids=$(remap_keep_uuids)
+
+    # Carriers first: a bind can only be judged once the mount it rides on is
+    # known, and the source's fstab may well list it earlier in the file.
+    for row in "${rows[@]}"; do
+        IFS=$'\t' read -r state spec mp type opts <<<"$row"
+        [ "$type" != swap ] || continue
+        case "$opts" in *bind*) continue ;; esac
+        case "$mp" in /|/boot|/boot/efi) continue ;; esac
+        uuid=$(spec_uuid "$spec")
+        if [ "$state" = live ]; then
+            # Kept by rewrite_fstab as it stands: on a target disk, or named in a
+            # form (LABEL=, a /dev path) that resolves wherever the disk boots.
+            [ -n "$uuid" ] || continue
+            case "$keep_uuids" in *" $uuid "*) continue ;; esac
+        fi
+        # Which line IS the entry, when a mount point has several: the live one,
+        # else the one this toolkit disabled (it was live when the disk was last
+        # synced, and carries the UUID the source really used), else the one a
+        # human commented out. The awk applies the same order in Phase 4.
+        case "$state" in live) rank=3 ;; tagged) rank=2 ;; *) rank=1 ;; esac
+        if [ -n "${REMAP_STATE[$mp]:-}" ]; then
+            [ "$rank" -gt "${remap_rank[$mp]}" ] || continue
+        else
+            REMAP_MPS+=("$mp")
+        fi
+        remap_rank[$mp]=$rank
+        if [ "$state" = live ]; then REMAP_STATE[$mp]=live; else REMAP_STATE[$mp]=disabled; fi
+        REMAP_UUID[$mp]=$uuid
+        REMAP_SPECWAS[$mp]=$spec
+        # The label its candidates must carry: what the filesystem it names
+        # wears here (usually attached -- often a partition of the source's own
+        # disk), what the entry asks for by name, or the mount point's last
+        # component, which is the convention this exists for.
+        label=""
+        if [ -n "$uuid" ] && [ -e "/dev/disk/by-uuid/$uuid" ]; then
+            label=$(lsblk -dno LABEL "/dev/disk/by-uuid/$uuid" 2>/dev/null | xargs || true)
+        fi
+        case "$spec" in LABEL=*) [ -n "$label" ] || label=${spec#LABEL=} ;; esac
+        [ -n "$label" ] || label=${mp##*/}
+        REMAP_LABEL[$mp]=$label
+    done
+    [ ${#REMAP_MPS[@]} -gt 0 ] || return 0
+
+    # ...then what travels with each of them.
+    local carrier
+    for row in "${rows[@]}"; do
+        IFS=$'\t' read -r state spec mp type opts <<<"$row"
+        carrier=""
+        for carrier in "${REMAP_MPS[@]}"; do
+            [ "${spec#"$carrier"/}" != "$spec" ] && break || carrier=""
+        done
+        [ -n "$carrier" ] || continue
+        [ "$state" = live ] || state=disabled
+        case "$opts" in
+            *bind*) REMAP_BINDS[$carrier]+="$state $mp $spec"$'\n' ;;
+            *) if [ "$type" = swap ]; then REMAP_SWAPS[$carrier]+="$state $spec"$'\n'; fi ;;
+        esac
+    done
+}
+
+# remap_block_rows — one row per block device, unit-separated (\037):
+#   name<US>type<US>fstype<US>uuid<US>size<US>label<US>mountpoint.
+#   lsblk's raw output cannot be read with "read -r a b c" (empty columns
+#   collapse and shift every later field), and neither could tabs: tab is IFS
+#   *whitespace*, so a run of them is still one delimiter. All but the first two
+#   fields are optional, so the separator must be one read treats as a
+#   terminator. Pairs mode is the only unambiguous lsblk output; convert it here.
+remap_block_rows() {
+    lsblk -pPno NAME,TYPE,FSTYPE,UUID,SIZE,LABEL,MOUNTPOINT 2>/dev/null | awk '
+        function val(k,   p, s, q) {
+            p = index($0, k "=\"");
+            if (p == 0) return "";
+            s = substr($0, p + length(k) + 2);
+            q = index(s, "\"");
+            return q ? substr(s, 1, q - 1) : "";
+        }
+        {
+            printf "%s\037%s\037%s\037%s\037%s\037%s\037%s\n", val("NAME"),
+                   val("TYPE"), val("FSTYPE"), val("UUID"), val("SIZE"),
+                   val("LABEL"), val("MOUNTPOINT");
+        }'
+}
+
+# remap_candidates <label> <the source's uuid> — the filesystems that could
+#   carry this mount on the target: <device>\t<uuid>\t<fstype>\t<size>\t<note>.
+#   Whole-disk filesystems count (the bulk data disks here have no partition
+#   table). Ruled out: this run's own roles, anything on a disk it repartitions,
+#   an image's loop device, and container types. The candidate on the target's
+#   disk comes first -- it travels with the disk, and is the prompt's default.
+remap_candidates() {
+    local want=$1 srcuuid=${2:-}
+    local dev type fstype uuid size label mnt parent note
+    local -a first=() rest=()
+    local tdisks skip_disk="" roles
+    tdisks=" $(target_disks) "
+    if [ "$UNIFIED_TARGET" -eq 1 ] && [ "$UPDATE" -eq 0 ]; then
+        skip_disk=$(readlink -f "$TARGET" 2>/dev/null || true)
+    fi
+    # The partitions this run writes to, resolved once. /dev/null stands in for
+    # an absent role: uutils readlink resolves "" to the working directory.
+    roles=" $(readlink -f "$TGT_ROOT" "$TGT_EFI" "${TGT_BOOT:-/dev/null}" "${TGT_BIOS:-/dev/null}" 2>/dev/null | tr '\n' ' ')"
+    while IFS=$'\037' read -r dev type fstype uuid size label mnt; do
+        [ -n "$dev" ] && [ -n "$uuid" ] && [ -n "$fstype" ] || continue
+        [ "$label" = "$want" ] || continue
+        case "$fstype" in
+            swap|LVM2_member|crypto_LUKS|linux_raid_member|zfs_member|iso9660|squashfs) continue ;;
+        esac
+        parent=$(get_parent_disk "$dev")
+        # Never offer what this run writes to, wipes, or (an image's loop
+        # device) will not have at boot.
+        case "$roles" in *" $dev "*) continue ;; esac
+        if [ -n "$skip_disk" ] && { [ "$dev" = "$skip_disk" ] || [ "$parent" = "$skip_disk" ]; }; then
+            continue
+        fi
+        if [ -n "${LOOP_DEV:-}" ] && { [ "$dev" = "$LOOP_DEV" ] || [ "$parent" = "$LOOP_DEV" ]; }; then
+            continue
+        fi
+        note=""
+        if [ -n "$srcuuid" ] && [ "$uuid" = "$srcuuid" ]; then note="the source's own"; fi
+        [ -z "$mnt" ] || note="${note:+$note, }mounted here at $mnt"
+        case "$tdisks" in
+            *" ${parent:-$dev} "*|*" $dev "*)
+                note="${note:+$note, }on ${parent:-$dev}, this run's target disk"
+                first+=("$dev"$'\t'"$uuid"$'\t'"$fstype"$'\t'"$size"$'\t'"$note") ;;
+            *)  rest+=("$dev"$'\t'"$uuid"$'\t'"$fstype"$'\t'"$size"$'\t'"$note") ;;
+        esac
+    done < <(remap_block_rows)
+    first+=(${rest[@]+"${rest[@]}"})
+    [ ${#first[@]} -eq 0 ] || printf '%s\n' "${first[@]}"
+}
+
+# remap_open <dev> [rw] — open <dev>, putting a directory where its contents
+#   live in REMAP_OPEN_PATH. A global, not a printed value: the rw form goes
+#   through run(), whose dry-run output would be captured as the path. Uses the
+#   host's own mount point when it has one (the kernel refuses a second mount
+#   with different flags), else a transient mount remap_close() -- and cleanup()
+#   -- takes down. Someone else's read-only mount is refused for rw, not
+#   remounted: it is theirs.
+remap_open() {
+    local dev=$1 mode=${2:-ro} row mp opts
+    REMAP_OPEN_PATH=""
+    row=$(findmnt -fnro TARGET,OPTIONS --source "$dev" 2>/dev/null | head -n 1 || true)
+    if [ -n "$row" ]; then
+        mp=${row%% *}; opts=${row#* }
+        if [ "$mode" = rw ]; then
+            case ",$opts," in *,rw,*) REMAP_OPEN_PATH=$mp; return 0 ;; esac
+            return 1
+        fi
+        REMAP_OPEN_PATH=$mp
+        return 0
+    fi
+    REMAP_OPEN_MNT=$(mktemp -d /tmp/install-remap.XXXXXX) || { REMAP_OPEN_MNT=""; return 1; }
+    if [ "$mode" = rw ]; then
+        if run sudo mount -o noatime "$dev" "$REMAP_OPEN_MNT"; then
+            REMAP_OPEN_PATH=$REMAP_OPEN_MNT
+            return 0
+        fi
+    elif sudo mount -r -o noatime "$dev" "$REMAP_OPEN_MNT" 2>/dev/null; then
+        REMAP_OPEN_PATH=$REMAP_OPEN_MNT
+        return 0
+    fi
+    rmdir "$REMAP_OPEN_MNT" 2>/dev/null || true
+    REMAP_OPEN_MNT=""
+    return 1
+}
+
+remap_close() {
+    REMAP_OPEN_PATH=""
+    [ -n "$REMAP_OPEN_MNT" ] || return 0
+    if [ "${1:-ro}" = rw ]; then run sudo umount "$REMAP_OPEN_MNT"
+    else sudo umount "$REMAP_OPEN_MNT" 2>/dev/null || true; fi
+    rmdir "$REMAP_OPEN_MNT" 2>/dev/null || true
+    REMAP_OPEN_MNT=""
+}
+
+# remap_spec_dev <spec> — the device an fstab spec names on this machine, or
+#   nothing when it names one that is not here (which is legitimate: the disk is
+#   going to boot somewhere else).
+remap_spec_dev() {
+    local spec=$1 path=""
+    case "$spec" in
+        /dev/*)      path=$spec ;;
+        UUID=*)      path="/dev/disk/by-uuid/${spec#UUID=}" ;;
+        LABEL=*)     path="/dev/disk/by-label/${spec#LABEL=}" ;;
+        PARTUUID=*)  path="/dev/disk/by-partuuid/${spec#PARTUUID=}" ;;
+        PARTLABEL=*) path="/dev/disk/by-partlabel/${spec#PARTLABEL=}" ;;
+    esac
+    [ -n "$path" ] && [ -b "$path" ] || return 0
+    readlink -f "$path"
+}
+
+# remap_role_of <dev> — the role this run gives that device, if any. Naming one
+#   for another mount point cannot work: the target would carry two fstab
+#   entries for one filesystem, and a swap file written there would land on the
+#   partition GRUB boots from. For --remap, which names a device outright; the
+#   candidate list already rules them out.
+remap_role_of() {
+    local d parent
+    d=$(readlink -f "$1" 2>/dev/null) || return 0
+    [ -n "$d" ] || return 0
+    [ "$d" != "$(readlink -f "$TGT_ROOT" 2>/dev/null)" ] || { printf 'the root filesystem'; return 0; }
+    [ "$d" != "$(readlink -f "$TGT_EFI"  2>/dev/null)" ] || { printf 'the ESP'; return 0; }
+    if [ -n "$TGT_BOOT" ] && [ "$d" = "$(readlink -f "$TGT_BOOT" 2>/dev/null)" ]; then
+        printf '/boot'; return 0
+    fi
+    if [ -n "$TGT_BIOS" ] && [ "$d" = "$(readlink -f "$TGT_BIOS" 2>/dev/null)" ]; then
+        printf 'the BIOS Boot partition'; return 0
+    fi
+    # Not a role, but on a disk about to be repartitioned: the filesystem
+    # named will not exist when the target boots.
+    if [ "$UNIFIED_TARGET" -eq 1 ] && [ "$UPDATE" -eq 0 ]; then
+        parent=$(get_parent_disk "$d")
+        if [ "$d" = "$(readlink -f "$TARGET" 2>/dev/null)" ] || \
+           [ -n "$parent" ] && [ "$parent" = "$(readlink -f "$TARGET" 2>/dev/null)" ]; then
+            printf 'a partition of %s, which this run repartitions' "$TARGET"
+        fi
+    fi
+}
+
+# remap_choose <mountpoint> <spec> — record one answer: the spec Phase 4 writes,
+#   the device it names here, and every commented-out line that comes back with
+#   it. A swap entry mounts nowhere, so it is keyed by its own path, as in the awk.
+remap_choose() {
+    local mp=$1 spec=$2 st path src
+    REMAP_SPEC[$mp]=$spec
+    REMAP_DEV[$mp]=$(remap_spec_dev "$spec")
+    [ "${REMAP_STATE[$mp]}" = live ] || REMAP_ENABLE+=("$mp")
+    while read -r st path src; do
+        [ -n "$path" ] || continue
+        [ "$st" = live ] || REMAP_ENABLE+=("$path")
+    done <<<"${REMAP_BINDS[$mp]:-}"
+    while read -r st path; do
+        [ -n "$path" ] || continue
+        [ "$st" = live ] || REMAP_ENABLE+=("$path")
+    done <<<"${REMAP_SWAPS[$mp]:-}"
+}
+
+# remap_note <mountpoint> <text> — one more thing the summary should say about
+#   a resolved mount, in the order it was found out.
+remap_note() { REMAP_NOTES[$1]+="$2"$'\n'; }
+
+# remap_swap_preview_state <fstab path> <state> <detail> [bytes] — rewrite that
+#   swap file's row in the preview. probe_source_swapfiles() filed one on /data
+#   as "offroot", true of the transfer but not the whole story once /data is
+#   resolved: the swap block stays the one place swap is described.
+remap_swap_preview_state() {
+    local path=$1 state=$2 detail=$3 bytes=${4:-?} i sp sb ss sr
+    for i in "${!SWAP_PREVIEW[@]}"; do
+        read -r sp sb ss sr <<<"${SWAP_PREVIEW[$i]}"
+        [ "$sp" = "$path" ] || continue
+        SWAP_PREVIEW[$i]="$path $bytes $state $detail"
+    done
+}
+
+# probe_remap_choice <mountpoint> — read the chosen filesystem and answer the
+#   two questions that decide whether the target boots as expected: are the
+#   directories its binds point at there, and is the swap file it carries there?
+#   Read-only and best-effort -- one not attached here (a legitimate --remap
+#   UUID= for the machine the disk will boot on) is reported as unchecked.
+#   A missing swap file is created later at the size of the source's own, read
+#   in a second pass since only one filesystem is open at a time. Never invented.
+probe_remap_choice() {
+    local mp=$1 dev=${REMAP_DEV[$mp]:-} root rel st path src size row avail have
+    local -a missing=() need_size=()
+    local nbind=0
+    if [ -z "$dev" ]; then
+        remap_note "$mp" "not attached here, so its contents were not checked"
+        return 0
+    fi
+    if ! remap_open "$dev"; then
+        remap_note "$mp" "could not be mounted here, so its contents were not checked"
+        return 0
+    fi
+    root=$REMAP_OPEN_PATH
+    while read -r st path src; do
+        [ -n "$src" ] || continue
+        nbind=$((nbind + 1))
+        rel=${src#"$mp"}
+        sudo test -e "$root$rel" || missing+=("$src")
+    done <<<"${REMAP_BINDS[$mp]:-}"
+    if [ "$nbind" -gt 0 ]; then
+        if [ ${#missing[@]} -eq 0 ]; then
+            remap_note "$mp" "$dev carries all $nbind bind source(s)"
+        else
+            remap_note "$mp" "WARNING: $dev is missing ${missing[*]} -- those binds will fail at boot"
+        fi
+    fi
+    # What it has to spare: a size read off the source is not one this
+    # filesystem can necessarily hold, and fallocate finds that out after the copy.
+    avail=$(df -B1 --output=avail "$root" 2>/dev/null | tail -n 1 | xargs || true)
+    while read -r st path; do
+        [ -n "$path" ] || continue
+        rel=${path#"$mp"}
+        if sudo test -f "$root$rel" && swapfile_ok "$root$rel"; then
+            size=$(sudo stat -c %s "$root$rel")
+            remap_note "$mp" "swap file $path is already on $dev ($(human_size "$size"))"
+            remap_swap_preview_state "$path" remapkeep "$dev" "$size"
+        else
+            # An unusable file of that name gives its blocks back when removed,
+            # so they count as free space for the check.
+            have=$(sudo stat -c %s "$root$rel" 2>/dev/null || echo 0)
+            need_size+=("$path"$'\t'"$rel"$'\t'"$have")
+        fi
+    done <<<"${REMAP_SWAPS[$mp]:-}"
+    remap_close
+
+    # The sizes, off the source's own carrier -- the only authority for them.
+    local srcdev srcroot
+    if [ ${#need_size[@]} -gt 0 ]; then
+        srcdev=""
+        if [ -n "${REMAP_UUID[$mp]:-}" ] && [ -e "/dev/disk/by-uuid/${REMAP_UUID[$mp]}" ]; then
+            srcdev=$(readlink -f "/dev/disk/by-uuid/${REMAP_UUID[$mp]}")
+        fi
+        srcroot=""
+        if [ -n "$srcdev" ] && remap_open "$srcdev"; then srcroot=$REMAP_OPEN_PATH; fi
+        for row in "${need_size[@]}"; do
+            IFS=$'\t' read -r path rel have <<<"$row"
+            size=""
+            if [ -n "$srcroot" ] && sudo test -f "$srcroot$rel"; then
+                size=$(sudo stat -c %s "$srcroot$rel" 2>/dev/null || true)
+            fi
+            if [ -z "$size" ] || [ "$size" -le 0 ]; then
+                remap_note "$mp" "WARNING: swap file $path is not on $dev and its size cannot be read here -- not created, so swapon -a will fail on the target"
+                remap_swap_preview_state "$path" remapnone "$dev"
+                continue
+            fi
+            if [ -n "$avail" ] && [ $((avail + have)) -lt "$size" ]; then
+                remap_note "$mp" "WARNING: swap file $path needs $(human_size "$size") and $dev has $(human_size $((avail + have))) free -- not created, so swapon -a will fail on the target"
+                remap_swap_preview_state "$path" remapnone "$dev" "$size"
+                continue
+            fi
+            REMAP_SWAP_CREATE+=("$path"$'\t'"$dev"$'\t'"$rel"$'\t'"$size")
+            remap_note "$mp" "swap file $path will be created on $dev ($(human_size "$size"))"
+            remap_swap_preview_state "$path" remapmake "$dev" "$size"
+        done
+        remap_close
+    fi
+}
+
+# ask_fstab_remap — put each remappable mount to the operator, before the gate
+#   and so before anything is written. --remap answers without asking; --yes, a
+#   non-interactive stdin or no candidate leaves things as they are today, and
+#   the summary says which it was. A dry run still asks: the answer is what
+#   makes its preview accurate, and nothing here writes.
+ask_fstab_remap() {
+    [ ${#REMAP_MPS[@]} -gt 0 ] || return 0
+    local mp row dev uuid fstype size note ans n default_idx tcount role
+    local -a cands=()
+    for mp in "${REMAP_MPS[@]}"; do
+        if [ -n "${REMAP_ARG[$mp]+set}" ]; then
+            if [ "${REMAP_ARG[$mp]}" = none ]; then
+                remap_note "$mp" "left as the source has it (--remap $mp=none)"
+            else
+                # Only --remap can name one of this run's own partitions;
+                # remap_candidates() never offers one.
+                role=$(remap_role_of "$(remap_spec_dev "${REMAP_ARG[$mp]}")")
+                [ -z "$role" ] || \
+                    die "--remap $mp=${REMAP_ARG[$mp]} names $role of this very install. Mounting it at $mp as well would give the target two entries for one filesystem (and put anything written there onto the partition this run manages). Name a different filesystem, or --remap $mp=none."
+                remap_choose "$mp" "${REMAP_ARG[$mp]}"
+                probe_remap_choice "$mp"
+            fi
+            continue
+        fi
+        mapfile -t cands < <(remap_candidates "${REMAP_LABEL[$mp]}" "${REMAP_UUID[$mp]:-}")
+        if [ ${#cands[@]} -eq 0 ]; then
+            remap_note "$mp" "nothing labelled \"${REMAP_LABEL[$mp]}\" is attached here; --remap $mp=UUID=... names one anyway"
+            continue
+        fi
+        if [ "$ASSUME_YES" -eq 1 ] || [ ! -t 0 ]; then
+            if [ "$ASSUME_YES" -eq 1 ]; then note="--yes"; else note="stdin is not a terminal"; fi
+            remap_note "$mp" "not asked ($note); --remap $mp=DEVICE resolves it"
+            continue
+        fi
+
+        echo
+        if [ "${REMAP_STATE[$mp]}" = live ]; then
+            info "The source mounts $mp from ${REMAP_SPECWAS[$mp]}, which will not be on this target's disk(s)."
+            echo "    Left alone, that entry is commented out on the target$(remap_dependants_phrase "$mp")."
+        else
+            info "The source has $mp commented out (${REMAP_SPECWAS[$mp]})."
+            echo "    Left alone, it stays commented out on the target$(remap_dependants_phrase "$mp")."
+        fi
+        echo "    Filesystems labelled \"${REMAP_LABEL[$mp]}\" attached now:"
+        n=0; tcount=0; default_idx=""
+        for row in "${cands[@]}"; do
+            IFS=$'\t' read -r dev uuid fstype size note <<<"$row"
+            n=$((n + 1))
+            printf '      %d) %-16s %8s  %-5s %s%s\n' "$n" "$dev" "$size" "$fstype" "$uuid" "${note:+  ($note)}"
+            case "$note" in *"this run's target disk"*) tcount=$((tcount + 1)); default_idx=$n ;; esac
+        done
+        [ "$tcount" -eq 1 ] || default_idx=""
+        echo "      n) leave it as the source has it"
+        while true; do
+            printf '    Mount %s from [1-%d, n]%s: ' "$mp" "$n" "${default_idx:+ (default $default_idx)}"
+            if ! read -r ans; then echo; ans=""; fi
+            [ -n "$ans" ] || ans=${default_idx:-n}
+            case "$ans" in
+                n|N|none)
+                    remap_note "$mp" "left as the source has it (answered at the prompt)"
+                    break ;;
+                ''|*[!0-9]*)
+                    echo "    Please answer 1-$n, or n." ;;
+                *)
+                    if [ "$ans" -ge 1 ] && [ "$ans" -le "$n" ]; then
+                        IFS=$'\t' read -r dev uuid fstype size note <<<"${cands[$((ans - 1))]}"
+                        remap_choose "$mp" "/dev/disk/by-uuid/$uuid"
+                        probe_remap_choice "$mp"
+                        break
+                    fi
+                    echo "    Please answer 1-$n, or n." ;;
+            esac
+        done
+    done
+    remap_lock_choices
+}
+
+# remap_dependants_list <mountpoint> — "binds /Books, /Audio, swap /data/swap",
+#   the summary's version of what travels with a mount; empty when nothing does.
+remap_dependants_list() {
+    local mp=$1 st path src out="" binds=""
+    while read -r st path src; do
+        if [ -n "$path" ]; then binds="${binds:+$binds, }$path"; fi
+    done <<<"${REMAP_BINDS[$mp]:-}"
+    [ -z "$binds" ] || out="binds $binds"
+    while read -r st path; do
+        if [ -n "$path" ]; then out="${out:+$out, }swap $path"; fi
+    done <<<"${REMAP_SWAPS[$mp]:-}"
+    printf '%s' "$out"
+}
+
+# remap_dependants_phrase <mountpoint> — ", along with 3 bind mounts and 1 swap
+#   entry", or nothing at all when the mount carries neither.
+remap_dependants_phrase() {
+    local mp=$1 nb=0 ns=0 line out=""
+    while read -r line; do if [ -n "$line" ]; then nb=$((nb + 1)); fi; done <<<"${REMAP_BINDS[$mp]:-}"
+    while read -r line; do if [ -n "$line" ]; then ns=$((ns + 1)); fi; done <<<"${REMAP_SWAPS[$mp]:-}"
+    if [ "$nb" -eq 1 ]; then out="1 bind mount"
+    elif [ "$nb" -gt 1 ]; then out="$nb bind mounts"; fi
+    if [ "$ns" -eq 1 ]; then out="${out:+$out and }1 swap entry"
+    elif [ "$ns" -gt 1 ]; then out="${out:+$out and }$ns swap entries"; fi
+    [ -n "$out" ] || return 0
+    printf ', along with %s' "$out"
+}
+
+# remap_lock_choices — every disk a resolved mount points at gets a lock like any
+#   other disk this run touches: exclusive when a swap file has to be created on
+#   it, shared when it is only read. Locks are keyed by parent disk, so a chosen
+#   partition of the target's own disk is already covered and is skipped.
+remap_lock_choices() {
+    local mp dev key before row swapdev
+    before=" ${!LOCK_MODE[*]} "
+    for mp in "${REMAP_MPS[@]}"; do
+        dev=${REMAP_DEV[$mp]:-}
+        [ -n "$dev" ] || continue
+        key=sh
+        for row in ${REMAP_SWAP_CREATE[@]+"${REMAP_SWAP_CREATE[@]}"}; do
+            IFS=$'\t' read -r _ swapdev _ _ <<<"$row"
+            if [ "$swapdev" = "$dev" ]; then key=ex; fi
+        done
+        add_lock "$dev" "$key"
+    done
+    if [ "$DRY_RUN" -eq 1 ]; then
+        for key in "${!LOCK_MODE[@]}"; do
+            case "$before" in *" $key "*) continue ;; esac
+            echo "[dry-run] would flock (${LOCK_MODE[$key]}) $key"
+        done
+    else
+        acquire_locks
+    fi
+}
+
+# -----------------------------------------------------------------------------
 # Translation Operations
 # -----------------------------------------------------------------------------
 
@@ -929,14 +1424,11 @@ target_disks() {
     printf '%s' "${disks[*]-}"
 }
 
-# target_disk_uuids — the UUIDs of every filesystem on the disk(s) this install
-#   writes to, space-delimited with sentinel spaces at both ends for the awk
-#   lookups below. A mount naming one of them is not "foreign" in any sense that
-#   matters: it lives on the very disk being installed, so it is present exactly
-#   when this system is (a rootfs sharing its disk with a /data partition, the
-#   layout a disk carrying one rootfs per machine has). Everything else -- the
-#   source machine's other disks above all -- stays disabled, since a clone that
-#   boots elsewhere must not block on a device that is not there.
+# target_disk_uuids — every filesystem UUID on the disk(s) this install writes
+#   to, space-delimited with sentinel spaces for the awk lookups below. A mount
+#   naming one is present exactly when this system is (a rootfs sharing its disk
+#   with /data, the slot-per-machine layout). Everything else stays disabled: a
+#   clone that boots elsewhere must not block on a device that is not there.
 target_disk_uuids() {
     local disk u out=" "
     # Unquoted on purpose: target_disks() returns space-separated device paths,
@@ -951,49 +1443,73 @@ target_disk_uuids() {
     printf '%s' "$out"
 }
 
-# report_fstab_disables <records> — say what rewrite_fstab() just commented out:
-#   one line per entry, in fstab order, with the reason it went. Five mounts can
-#   vanish from a booting system's fstab in a single run -- a /data on the
-#   source's own disk and every bind hanging off it -- and the only way to find
-#   out used to be to read the file afterwards. A UUID row also names the device
-#   that UUID resolves to here, which is what makes the message actionable: it is
-#   almost always a partition of the source disk. Nothing is printed when the
-#   record file is empty. Reads the caller-set TGT_* globals via target_disks().
-report_fstab_disables() {
-    local file=$1 kind mp detail dev disks word
-    local width=14 n=0 uuid_rows=0
-    [ -s "$file" ] || return 0
-    while IFS=$'\t' read -r kind mp detail; do
-        [ ${#mp} -gt $width ] && width=${#mp}
-        n=$((n + 1))
+# report_scan <records> <kinds> — measure the rows of those kinds (space
+#   separated) in the record file rewrite_fstab()'s awk wrote: sets REPORT_N,
+#   REPORT_W (the mount-point column) and REPORT_WORD, and is false when there
+#   are none. Shared by the two reports below, which differ only in wording.
+report_scan() {
+    local file=$1 want=" $2 " kind mp _rest
+    REPORT_N=0; REPORT_W=14; REPORT_WORD=entries
+    [ -s "$file" ] || return 1
+    while IFS=$'\t' read -r kind mp _rest; do
+        case "$want" in *" $kind "*) ;; *) continue ;; esac
+        [ ${#mp} -le $REPORT_W ] || REPORT_W=${#mp}
+        REPORT_N=$((REPORT_N + 1))
     done < "$file"
-    word=entries; [ "$n" -eq 1 ] && word=entry
+    [ "$REPORT_N" -ne 1 ] || REPORT_WORD=entry
+    [ "$REPORT_N" -gt 0 ]
+}
+
+# report_fstab_retargets <records> — printed before report_fstab_disables():
+#   the mounts just pointed at a filesystem chosen at the gate, and the
+#   commented-out lines revived with them. A mount that was both gets a line for
+#   each: they are two different things to have happened to it.
+report_fstab_retargets() {
+    local file=$1 kind mp detail
+    report_scan "$file" "remap enable" || return 0
+    info "Resolved in the target's /etc/fstab ($REPORT_N $REPORT_WORD):"
+    while IFS=$'\t' read -r kind mp detail; do
+        case "$kind" in
+            remap)  printf '      %-*s now mounts from %s\n' "$REPORT_W" "$mp" "$detail" ;;
+            enable) printf '      %-*s brought back to life%s\n' "$REPORT_W" "$mp" "${detail:+ ($detail)}" ;;
+        esac
+    done < "$file"
+}
+
+# report_fstab_disables <records> — what rewrite_fstab() just commented out, one
+#   line per entry in fstab order, with the reason. Five mounts can leave a
+#   booting fstab in one run (a /data plus every bind on it), and reading the
+#   file afterwards used to be the only way to find out. A UUID row also names
+#   the device that UUID resolves to HERE, which is what makes it actionable.
+report_fstab_disables() {
+    local file=$1 kind mp detail dev disks
+    local uuid_rows=0
+    report_scan "$file" "uuid bind swapmount swapdrop boot" || return 0
     disks=$(target_disks)
-    info "Disabled in the target's /etc/fstab ($n $word):"
+    info "Disabled in the target's /etc/fstab ($REPORT_N $REPORT_WORD):"
     while IFS=$'\t' read -r kind mp detail; do
         case "$kind" in
             uuid)
                 dev=""
                 [ -e "/dev/disk/by-uuid/$detail" ] && dev=$(readlink -f "/dev/disk/by-uuid/$detail")
                 printf '      %-*s UUID=%s (%s) -- not on %s\n' \
-                       "$width" "$mp" "$detail" "${dev:-not attached}" "${disks:-any target disk}"
+                       "$REPORT_W" "$mp" "$detail" "${dev:-not attached}" "${disks:-any target disk}"
                 uuid_rows=$((uuid_rows + 1))
                 ;;
             bind)
-                printf '      %-*s bind on %s, disabled above\n' "$width" "$mp" "$detail" ;;
+                printf '      %-*s bind on %s, disabled above\n' "$REPORT_W" "$mp" "$detail" ;;
             swapmount)
-                printf '      %-*s swap file on %s, disabled above\n' "$width" "$mp" "$detail" ;;
+                printf '      %-*s swap file on %s, disabled above\n' "$REPORT_W" "$mp" "$detail" ;;
             swapdrop)
-                printf '      %-*s swap file dropped by --exclude-from\n' "$width" "$mp" ;;
+                printf '      %-*s swap file dropped by --exclude-from\n' "$REPORT_W" "$mp" ;;
             boot)
-                printf '      %-*s /boot is inside / on this target\n' "$width" "$mp" ;;
+                printf '      %-*s /boot is inside / on this target\n' "$REPORT_W" "$mp" ;;
         esac
     done < "$file"
     if [ "$uuid_rows" -gt 0 ]; then
-        echo "    A disk that boots elsewhere must not block on a device that is not there,"
-        echo "    so those are commented out rather than carried over. If this disk will"
-        echo "    always see them, uncomment by hand -- naming this disk's own equivalent"
-        echo "    filesystem, which does not have the source's UUID."
+        echo "    A disk that boots elsewhere must not block on a device that is not there."
+        echo "    If this one will always see them, uncomment by hand (or re-run and answer"
+        echo "    the prompt), naming this disk's own equivalent filesystem."
     fi
 }
 
@@ -1026,19 +1542,28 @@ rewrite_fstab() {
     local keep_uuids
     keep_uuids=$(target_disk_uuids)
 
-    # FSTAB_REPORT: one tab-separated record (kind, mount point, detail) per line
-    # the awk disables, rendered by report_fstab_disables() below. Written by
-    # root (sudo awk) into a file this shell owns, so reading and removing it
-    # needs no privilege of its own; cleanup() sweeps it if the run dies first.
-    #
-    # It lives in a private directory of our own, NOT straight in /tmp. /tmp is
-    # root-owned, world-writable and sticky, and fs.protected_regular (2 on
-    # Ubuntu) then refuses root an O_CREAT open of a file it does not own there
-    # -- so a report file this shell creates in /tmp is precisely one the sudo
-    # awk below cannot write. mawk treats a failed output redirection as fatal,
-    # so that killed the run in Phase 4 with the copy already done and the fstab
-    # not yet translated, all over a side-channel. A mktemp -d directory carries
-    # no sticky bit, so may_create_in_sticky() never applies inside it.
+    # remap_rows / enable_set: what ask_fstab_remap() resolved. The awk needs
+    # only these two -- the spec to write for a mount point, and the lines to
+    # revive -- since marking the carrier kept in pass 1 carries its binds and
+    # its swap file with it. Swap lines are keyed by their own path.
+    # Plain "${!ARR[@]}", never ${!ARR[@]+...}: with a +alternate modifier bash
+    # reads "!" as an INDIRECT reference, takes the array's value as a variable
+    # name and dies. A declared empty array expands to nothing under set -u.
+    local remap_rows="" enable_set=" " remap_mp
+    for remap_mp in "${!REMAP_SPEC[@]}"; do
+        remap_rows+="$remap_mp"$'\t'"${REMAP_SPEC[$remap_mp]}"$'\n'
+    done
+    for remap_mp in ${REMAP_ENABLE[@]+"${REMAP_ENABLE[@]}"}; do
+        enable_set+="$remap_mp "
+    done
+
+    # FSTAB_REPORT: one record (kind, mount point, detail) per line the awk
+    # changes, for the reports below. Written by the sudo awk into a file this
+    # shell owns; cleanup() sweeps it if the run dies first.
+    # In a private directory, NOT straight in /tmp: /tmp is sticky, and
+    # fs.protected_regular then refuses even root an O_CREAT open of a file it
+    # does not own -- and mawk treats a failed redirection as fatal, which once
+    # killed a run in Phase 4 with the copy done and the fstab not translated.
     FSTAB_REPORT_DIR=$(mktemp -d /tmp/install-report.XXXXXX) || FSTAB_REPORT_DIR=""
     if [ -n "$FSTAB_REPORT_DIR" ]; then
         FSTAB_REPORT="$FSTAB_REPORT_DIR/disabled"
@@ -1054,7 +1579,62 @@ rewrite_fstab() {
              -v map_boot="$map_boot" -v sep_boot="$TGT_SEP_BOOT" \
              -v has_boot="$has_boot" -v keep_uuids="$keep_uuids" \
              -v new_swap="${NEW_UUID_SWAP:-}" -v drop_swap="$drop_swap" \
+             -v remap="$remap_rows" -v enable="$enable_set" \
              -v report="$FSTAB_REPORT" '
+    # The mounts resolved at the gate, as "<mount point>\t<spec>" rows.
+    BEGIN {
+        nrow = split(remap, row, "\n");
+        for (i = 1; i <= nrow; i++) {
+            if (row[i] == "") continue;
+            t = index(row[i], "\t");
+            if (t == 0) continue;
+            mp = substr(row[i], 1, t - 1);
+            sp = substr(row[i], t + 1);
+            remap_plain[mp] = sp;
+            # sub() reads "&" as the matched text and "\\" as an escape, so keep
+            # a replacement-safe copy of the spec as well as the plain one.
+            gsub(/\\/, "\\\\", sp);
+            gsub(/&/, "\\\\&", sp);
+            remap_spec[mp] = sp;
+        }
+    }
+    # enabled(key) — is this one of the commented-out lines the operator asked
+    # for back? Mount point for an ordinary entry, path for a swap file.
+    function enabled(k) { return index(enable, " " k " ") > 0 }
+    # revive(line, pass) — the live mount line hiding under a comment marker,
+    # when this run was told to bring it back; "" for anything else, prose above
+    # all. Only the FIRST line per key is revived, so a stale duplicate cannot
+    # become a second mount of the same thing; the passes count separately.
+    function revive(s, pass,   p, g, k, istag) {
+        if (enable == " " || s !~ /^[[:space:]]*#/) return "";
+        p = s;
+        while (sub(/^[[:space:]]*#[[:space:]]*/, "", p) ||
+               sub(/^\[PORTABLE-SYNC-DISABLED\][[:space:]]+/, "", p)) { }
+        if (split(p, g) < 4) return "";
+        # The test the discovery pass applied when it offered this line: prose
+        # can carry four fields too, and must never read as a mount.
+        if (g[1] !~ /^(\/|UUID=|LABEL=|PARTUUID=|PARTLABEL=)/) return "";
+        if (g[3] !~ /^(ext[234]|xfs|btrfs|f2fs|jfs|reiserfs|vfat|exfat|ntfs3?|udf|iso9660|auto|none|swap)$/ &&
+            g[4] !~ /(^|,)r?bind(,|$)/) return "";
+        k = (g[3] == "swap") ? g[1] : g[2];
+        if (!enabled(k)) return "";
+        # With both a line this toolkit disabled and one a human commented out,
+        # the tagged one is the entry -- it was live at the last sync, and is
+        # what the discovery pass read. Pass 1 finds out there is one; it reads
+        # the whole file before pass 2 emits anything.
+        istag = (s ~ /\[PORTABLE-SYNC-DISABLED\]/);
+        if (pass == 1 && istag) has_tagged[k] = 1;
+        if (pass == 2 && has_tagged[k] && !istag) return "";
+        if (revived[pass, k]++) return "";
+        return p;
+    }
+    # retarget(line, spec) — point a line at the filesystem chosen for its mount
+    # point, leaving everything after the device spec (and its columns) alone.
+    function retarget(s, spec,   out) {
+        out = s;
+        if (!sub(/^[[:space:]]*[^[:space:]]+/, spec, out)) return s;
+        return out;
+    }
     # The UUID a line mounts by, or "" when it names none (a device path, a
     # swap file, tmpfs, a bind source).
     function line_uuid(s) {
@@ -1075,18 +1655,16 @@ rewrite_fstab() {
         if (u == new_efi || u == new_boot || u == new_root) return 1;
         return index(keep_uuids, " " u " ") > 0;
     }
-    # One record per line this run disables, in file order, for the report the
+    # One record per line this run changes, in file order, for the reports the
     # shell prints afterwards. Lines that arrived already tagged are NOT
-    # recorded: they are not news, and an --update re-sync of a disk installed
-    # this way would otherwise re-announce every one of them on every run.
+    # recorded: an --update re-sync would re-announce them on every run.
     function note(kind, mp, detail) {
         if (report == "") return;   # unreportable: still disable the line
         printf "%s\t%s\t%s\n", kind, mp, detail >> report;
     }
-    # The mount this path sits on: the longest of the mount points pass 1
-    # resolved that prefixes it. "/" always matches, so this never comes back
-    # empty -- and a path under a mount this run disables resolves to that
-    # mount, not to "/", so it goes down with it.
+    # The mount a path sits on: the longest mount point pass 1 resolved that
+    # prefixes it. "/" always matches, so this never comes back empty -- and a
+    # path under a disabled mount resolves to it, and goes down with it.
     function nearest_mount(path,   mp, best, bestlen) {
         best = "/"; bestlen = 0;
         for (mp in mp_kept) {
@@ -1098,40 +1676,61 @@ rewrite_fstab() {
     }
 
     # ---- Pass 1: which mounts survive -------------------------------------
-    # Read once to decide every device-backed mount, so that pass 2 can judge a
-    # bind by the mount its SOURCE sits on. A bind is not a filesystem: it is
-    # worth exactly as much as whatever carries the directory it points at.
+    # Decide every device-backed mount first, so pass 2 can judge a bind by the
+    # mount its SOURCE sits on: a bind is worth what carries the directory it
+    # points at, no more.
     NR == FNR {
-        if ($0 ~ /^# \[PORTABLE-SYNC-DISABLED\] /) {
-            payload = $0;
-            while (sub(/^# \[PORTABLE-SYNC-DISABLED\] /, "", payload)) { }
-            if (payload ~ /^[[:space:]]*#/) next;
-            split(payload, f);
-            if (substr(f[2], 1, 1) == "/") was_disabled[f[2]] = 1;
-            next;
+        # A revived line counts as live from here on, so it is not recorded as
+        # disabled and the binds riding on it are judged by it.
+        line = revive($0, 1);
+        if (line == "") {
+            if ($0 ~ /^# \[PORTABLE-SYNC-DISABLED\] /) {
+                payload = $0;
+                while (sub(/^# \[PORTABLE-SYNC-DISABLED\] /, "", payload)) { }
+                if (payload ~ /^[[:space:]]*#/) next;
+                split(payload, f);
+                if (substr(f[2], 1, 1) == "/") was_disabled[f[2]] = 1;
+                next;
+            }
+            if ($0 ~ /^[[:space:]]*#/) next;
+            line = $0;
         }
-        if ($0 ~ /^[[:space:]]*#/ || NF < 3) next;
-        line = xlate($0);
+        if (split(line, f) < 3) next;
+        line = xlate(line);
         split(line, f);
+        if (f[2] in remap_spec) { line = retarget(line, remap_spec[f[2]]); split(line, f) }
         if (f[4] ~ /(^|,)bind(,|$)/) { binds[++nbind] = f[1] SUBSEP f[2]; next }
         if (!sep_boot && f[2] == "/boot")   keep = 0;
         else if (f[3] == "swap")            keep = (index(drop_swap, " " f[1] " ") == 0);
+        # Resolved at the gate: kept by decision, whatever UUID it used to name.
+        else if (f[2] in remap_spec)        keep = 1;
         else                                keep = uuid_kept(line_uuid(line));
         if (substr(f[2], 1, 1) == "/") mp_kept[f[2]] = keep;
         next;
     }
 
-    # Binds resolve between the passes, in file order -- which is authoritative,
-    # since mount -a walks fstab in order and a bind whose source is mounted
-    # later would already be broken on the source system. Each resolved bind
-    # joins the mount table, so a bind hanging off another bind is judged by the
-    # one it rides on.
+    # Binds resolve between the passes, in file order -- authoritative, since
+    # mount -a walks fstab in order. Each resolved bind joins the mount table,
+    # so a bind riding another bind is judged by the one it rides on.
     FNR == 1 {
         for (mp in was_disabled) if (!(mp in mp_kept)) mp_kept[mp] = 0;
         for (i = 1; i <= nbind; i++) {
             split(binds[i], b, SUBSEP);
             bind_kept[b[2]] = mp_kept[nearest_mount(b[1])];
             mp_kept[b[2]] = bind_kept[b[2]];
+        }
+    }
+
+    # A line brought back at the gate: strip the marker(s) and let the body
+    # below judge it as live. $0 is rewritten, so the comment rules under this
+    # one no longer match it.
+    {
+        rev = revive($0, 2);
+        if (rev != "") {
+            $0 = rev;
+            if ($4 ~ /(^|,)bind(,|$)/) note("enable", $2, "bind on " nearest_mount($1));
+            else if ($3 == "swap")     note("enable", $1, "swap file on " nearest_mount($1));
+            else                       note("enable", $2, "");
         }
     }
 
@@ -1142,10 +1741,9 @@ rewrite_fstab() {
     /^# \[PORTABLE-SYNC-DISABLED\] / {
         payload = $0;
         while (sub(/^# \[PORTABLE-SYNC-DISABLED\] /, "", payload)) { }
-        # A comment underneath the marker was never a mount to disable: an
-        # older version tagged the stock Ubuntu header because it mentions
-        # "UUID=". Give it back, so an fstab already damaged that way heals on
-        # the next sync instead of carrying the marker forever.
+        # A comment under the marker was never a mount: an older version
+        # tagged the Ubuntu header for mentioning "UUID=". Give it back, so a
+        # file damaged that way heals on the next sync.
         if (payload ~ /^[[:space:]]*#/) { print payload; next; }
         split(payload, f);
         if (new_swap != "" && f[3] == "swap") next;
@@ -1153,17 +1751,14 @@ rewrite_fstab() {
         next;
     }
 
-    # Comments are prose, not mounts. Ubuntu ships an fstab header that mentions
-    # "UUID=", which the foreign-UUID disabler below would otherwise tag on
-    # every single sync until the header was buried under markers.
+    # Comments are prose, not mounts -- and the Ubuntu header mentions "UUID=",
+    # which the disabler below would otherwise tag on every sync.
     /^[[:space:]]*#/ { print; next }
 
     {
-        # This disk keeps /boot inside /, so a /boot entry inherited from a
-        # source that kept it elsewhere names a filesystem that does not exist
-        # here. Disable it before the UUID translation below, which would
-        # otherwise rewrite it into a bogus "mount the root filesystem at
-        # /boot" line.
+        # /boot lives inside / here, so an inherited /boot entry names a
+        # filesystem that does not exist. Disable it BEFORE the translation
+        # below, which would rewrite it into "mount / at /boot".
         if (!sep_boot && $2 == "/boot") {
             note("boot", $2, "");
             print "# [PORTABLE-SYNC-DISABLED] " $0;
@@ -1174,10 +1769,19 @@ rewrite_fstab() {
         if (map_boot) gsub(old_boot, new_boot);
         gsub(old_root, new_root);
 
-        # This disk has a separate /boot but the source kept /boot inside /, so
-        # no entry was inherited: add one directly after the root entry. Never
-        # at the end -- mount -a walks fstab in order, and a /boot line after
-        # /boot/efi would mount the ESP onto the bare directory and bury it.
+        # Resolved at the gate: point it at the chosen filesystem and keep it.
+        # Its binds and swap file need no case here -- pass 1 marked this mount
+        # kept, which is all either of them is judged by.
+        if ($2 in remap_spec) {
+            $0 = retarget($0, remap_spec[$2]);
+            note("remap", $2, remap_plain[$2]);
+            print $0;
+            next;
+        }
+
+        # A separate /boot the source did not have: insert its entry right
+        # after "/". Never at the end -- mount -a walks fstab in order, and a
+        # /boot line after /boot/efi would mount the ESP onto a bare directory.
         if (sep_boot && !has_boot && !boot_added && $2 == "/") {
             print $0;
             print "/dev/disk/by-uuid/" new_boot "  /boot  ext4  defaults,noatime  0 2";
@@ -1193,11 +1797,9 @@ rewrite_fstab() {
             next;
         }
 
-        # A swap file is worth exactly as much as the filesystem carrying it --
-        # the rule binds already follow. When that mount is one this run just
-        # disabled, the file is unreachable and swapon -a fails at boot, so the
-        # entry goes with it. Only a mount pass 1 actually judged counts: an
-        # unrecognised carrier leaves the entry alone rather than guessing.
+        # A swap file is worth what carries it, the rule binds already follow:
+        # under a disabled mount it is unreachable and swapon -a fails at boot.
+        # Only a carrier pass 1 judged counts; an unrecognised one is left alone.
         if ($3 == "swap" && substr($1, 1, 1) == "/" && $1 !~ /^\/dev\// &&
             $0 !~ /UUID=/) {
             carrier = nearest_mount($1);
@@ -1254,20 +1856,18 @@ rewrite_fstab() {
     sudo chown root:root "$MNT/etc/fstab"
     sudo chmod 644 "$MNT/etc/fstab"
 
+    report_fstab_retargets "$FSTAB_REPORT"
     report_fstab_disables "$FSTAB_REPORT"
     if [ -n "$FSTAB_REPORT_DIR" ]; then rm -rf "$FSTAB_REPORT_DIR"; fi
     FSTAB_REPORT=""
     FSTAB_REPORT_DIR=""
 }
 
-# probe_target_brand — read the brand already stamped into GRUB_DISTRIBUTOR of
-#   /etc/default/grub on the target root (TGT_ROOT) via a transient read-only
-#   mount on MNT, before rsync overwrites the file with the source's copy.
-#   Sets TGT_MODEL (empty when the mount fails or the expected
+# probe_target_brand — the brand already stamped into the target root's
+#   GRUB_DISTRIBUTOR, read through a transient read-only mount on MNT before
+#   rsync overwrites the file. Sets TGT_MODEL (empty if the mount fails or the
 #   "Desktop <brand> `( ." pattern is absent). Runs under --dry-run too, so the
-#   summary can show the brand it would keep — one of the two transient
-#   read-only mounts a dry run performs (probe_source_swapfiles() is the other). The kernel replays a dirty journal even for an ro mount of a
-#   writable device; harmless, as the real mount that follows would do the same.
+#   summary can show the brand it would keep.
 probe_target_brand() {
     TGT_MODEL=""
     MOUNTS_DONE=1   # from here on cleanup() must sweep $MNT, interrupts included
@@ -1279,16 +1879,13 @@ probe_target_brand() {
 }
 
 # probe_esp_menu — the systems already registered on the target ESP, read
-#   *before* the confirmation gate so the summary can say whose entries this run
-#   will keep, and so verify_install() can prove afterwards that it kept them.
-#   Skipped by the caller when the ESP is about to be formatted (nothing
-#   survives that) and silent when it cannot be mounted. The ESP is mounted on
-#   MNT, free at this point, exactly as probe_target_brand() borrows it for the
-#   target root -- so the grub directory is $MNT/boot/grub here, the ESP's own
-#   /boot/grub, not the /boot/efi/boot/grub it becomes once the root is mounted.
-#   Fills ESP_MENU_ENTRIES ("<uuid><TAB><title>") and sets ESP_MENU_PROBED, and
-#   notes whether the disk already carries a memtest image (ESP_MEMTEST) -- which
-#   is what lets the summary tell "this run adds it" from "it is already there".
+#   before the gate so the summary can say whose entries this run keeps and
+#   verify_install() can prove afterwards that it did. Skipped when the ESP is
+#   about to be formatted, silent when it cannot be mounted. The ESP goes on MNT
+#   (free at this point), so its grub directory is $MNT/boot/grub here, not the
+#   /boot/efi/boot/grub it becomes once the root is mounted. Fills
+#   ESP_MENU_ENTRIES ("<uuid><TAB><title>"), ESP_MENU_PROBED, and ESP_MEMTEST --
+#   which tells "this run adds the tester" from "it is already there".
 probe_esp_menu() {
     ESP_MENU_ENTRIES=(); ESP_MENU_PROBED=0; ESP_MEMTEST=0
     local row
@@ -1304,11 +1901,10 @@ probe_esp_menu() {
 }
 
 # probe_menu_cmdline — the kernel command line the menu entry will carry, for
-#   the summary. Same transient read-only mount trick, on whichever root is the
-#   authority: the source's /etc/default/grub when its rootfs is being copied
-#   (that file lands on the target verbatim), the target's own when the root is
-#   in place. Costs nothing when probe_source_swapfiles() already had the source
-#   mounted and filled it in.
+#   the summary. Same transient mount, on whichever root is the authority: the
+#   source's /etc/default/grub when its rootfs is copied (it lands verbatim),
+#   the target's own when the root is in place. Free when
+#   probe_source_swapfiles() already filled it in.
 probe_menu_cmdline() {
     [ -z "$MENU_CMDLINE_PREVIEW" ] || return 0
     local dev="$TGT_ROOT"
@@ -1321,11 +1917,10 @@ probe_menu_cmdline() {
     sudo umount "$MNT" || true
 }
 
-# probe_memtest <mounted-root> — what the summary needs to say about the memory
-#   tester, off a root that is already mounted: whether that system carries the
-#   image at all, and whether it asks for the entry to be left out. Best-effort
-#   like its neighbours -- MEMTEST_PROBED stays 0 when no root could be read here,
-#   and the summary then says so rather than promise an entry it did not check.
+# probe_memtest <mounted-root> — off an already-mounted root: whether that
+#   system carries the tester image, and whether it asks for the entry to be
+#   left out. MEMTEST_PROBED stays 0 when no root could be read, so the summary
+#   says so rather than promising an entry it never checked.
 probe_memtest() {
     MEMTEST_SRC=0; [ ! -f "$1/boot/$MEMTEST_IMAGE" ] || MEMTEST_SRC=1
     MEMTEST_OFF=0
@@ -1349,15 +1944,11 @@ rewrite_grub_distributor() {
 # -----------------------------------------------------------------------------
 # The standalone ESP: GRUB's boot directory, and the menu every rootfs shares
 # -----------------------------------------------------------------------------
-# GRUB's boot directory lives on the ESP (/boot/efi/boot/grub, i.e. /boot/grub
-# as seen from the ESP's own root), not on any rootfs: grub-install is told
-# --boot-directory=/boot/efi/boot for BOTH i386-pc and x86_64-efi, so the BIOS
-# core.img and the UEFI image resolve the same prefix and read the same menu.
-# That is what lets one disk carry a rootfs per machine -- desktop, laptop, iMac
-# -- behind a single ESP: the menu belongs to the disk, not to whichever system
-# was installed last.
-#
-# Its layout:
+# GRUB's boot directory lives on the ESP (/boot/efi/boot/grub), not on any
+# rootfs: grub-install is told --boot-directory=/boot/efi/boot for BOTH i386-pc
+# and x86_64-efi, so both resolve one prefix and read one menu. That is what
+# lets a disk carry a rootfs per machine behind a single ESP -- the menu belongs
+# to the disk, not to whichever system was installed last. Layout:
 #
 #   /boot/efi/boot/grub/grub.cfg              master menu, regenerated per run
 #   /boot/efi/boot/grub/entries/<uuid>.cfg    one file per registered rootfs
@@ -1365,18 +1956,16 @@ rewrite_grub_distributor() {
 #   /boot/efi/boot/grub/custom.cfg            optional, hand-written, sourced last
 #   /boot/efi/boot/grub/{x86_64-efi,i386-pc}/ modules, written by grub-install
 #
-# An install owns exactly one entry file -- the one named after the root
-# filesystem it just wrote -- and never edits another system's. The master is
-# rebuilt from whatever entry files are present, so registering, re-branding or
-# (by deleting a file) retiring a system is a local operation.
+# An install owns exactly one entry file -- named after the root filesystem it
+# just wrote -- and never edits another system's. The master is rebuilt from
+# whatever entry files are present, so registering, re-branding or (by deleting
+# a file) retiring a system is a local operation.
 #
-# The memory tester is the one menu item that belongs to no rootfs at all, so it
-# lives on the ESP beside the menu that offers it, at boot/grub/memtest/. Ubuntu's
-# memtest86+ package installs /boot/mt86+x64 and /boot/mt86+ia32; the same x64
-# image boots through GRUB's "linux" command on BOTH firmware paths, so the
-# four-way $grub_platform/cpuid block Ubuntu's 20_memtest86+ generates exists only
-# to choose between the two -- a choice a toolkit that deploys amd64 does not have
-# to make, since anything that can boot one of these disks is x86_64.
+# The memory tester belongs to no rootfs at all, so it lives on the ESP beside
+# the menu that offers it. The same x64 image boots through GRUB's "linux"
+# command on both firmware paths, so Ubuntu's four-way $grub_platform/cpuid
+# block exists only to choose between it and mt86+ia32 -- a choice a toolkit
+# deploying amd64 never has to make.
 MEMTEST_IMAGE=mt86+x64
 MEMTEST_TITLE="Memory test (memtest86+)"
 
@@ -1388,13 +1977,11 @@ grub_default_value() {
              s/^[[:space:]]*$2='(.*)'[[:space:]]*\$/\\1/p" "$1" 2>/dev/null | tail -n 1
 }
 
-# grub_cmdline_options <mounted-root> — the boot options that system asks for,
-#   composed the way update-grub composes them: GRUB_CMDLINE_LINUX then
-#   GRUB_CMDLINE_LINUX_DEFAULT, out of that system's own /etc/default/grub, so
-#   each rootfs keeps the quirks its machine needs (USB storage, IOMMU, console)
-#   instead of inheriting whichever machine the toolkit last ran on. root= is
-#   stripped: it is not an option to carry over but a fact about the filesystem
-#   this install just wrote, restated by esp_cmdline_from().
+# grub_cmdline_options <mounted-root> — that system's boot options, composed as
+#   update-grub does: GRUB_CMDLINE_LINUX then GRUB_CMDLINE_LINUX_DEFAULT from
+#   its OWN /etc/default/grub, so each rootfs keeps the quirks its machine needs.
+#   root= is stripped -- not an option to carry over but a fact about the
+#   filesystem just written, restated by esp_cmdline_from().
 grub_cmdline_options() {
     local f=$1/etc/default/grub
     printf '%s %s' "$(grub_default_value "$f" GRUB_CMDLINE_LINUX)" \
@@ -1429,9 +2016,9 @@ esp_entries() {
 }
 
 # esp_entry_text <title> <cmdline> <kernel-dir> — this system's entry file: the
-#   GUI pair the toolkit has always offered, keyed to the filesystem that holds
-#   /boot (NEW_UUID_BOOT: the /boot partition on a disk that has one, the root
-#   filesystem otherwise), with the kernel path to match.
+#   GUI/TTY pair, keyed to the filesystem holding /boot (NEW_UUID_BOOT -- the
+#   /boot partition when there is one, else the root filesystem), with the
+#   kernel path to match.
 esp_entry_text() {
     local title=$1 cmdline=$2 kdir=$3
     cat <<EOF
@@ -1453,13 +2040,10 @@ EOF
 }
 
 # esp_master_text <grubdir> — the master menu, rebuilt from the entry files
-#   present. timeout/default are carried over from the master already there, so
-#   a value set by hand survives every later install and the last system
-#   installed never silently redefines the menu for the others; 5 and 0 only
-#   when writing a master from scratch. Each source is guarded, so an entry file
-#   deleted by hand retires that system instead of breaking the menu for all of
-#   them -- and the memtest block, emitted only when the image is actually on the
-#   ESP, is guarded the same way and for the same reason.
+#   present. timeout/default are carried over from the master already there (5
+#   and 0 only when writing one from scratch), so the last system installed
+#   never redefines the menu for the others. Every source line is guarded, so an
+#   entry file deleted by hand retires that system instead of breaking the menu.
 esp_master_text() {
     local grubdir=$1 timeout="" default="" uuid title
     if [ -f "$grubdir/grub.cfg" ]; then
@@ -1477,14 +2061,11 @@ esp_master_text() {
         "insmod part_gpt" \
         "insmod ext2" \
         "" \
-        "# Graphics, for both firmware paths. With no video driver loaded GRUB on" \
-        "# UEFI falls back to the firmware's own text console -- an 80x25 box in" \
-        "# the middle of the panel, with whatever the firmware drew still around" \
-        "# it -- and, less visibly, cannot hand a framebuffer to what it boots:" \
-        "# the memory tester then reports \"No graphics display found\" and stops." \
-        "# BIOS hides both faults behind VGA text mode, which UEFI does not have." \
-        "# all_video pulls in efi_gop here and vbe/vga there, so one block serves" \
-        "# both, and the whole thing is guarded on the font gfxterm needs." \
+        "# Graphics, for both firmware paths. Without a video driver GRUB under" \
+        "# UEFI falls back to the firmware text console and can hand no" \
+        "# framebuffer to what it boots (the memory tester then stops with \"No" \
+        "# graphics display found\"); BIOS hides both behind VGA text mode." \
+        "# all_video resolves to efi_gop or vbe/vga, so one block serves both." \
         "if loadfont \$prefix/fonts/unicode.pf2; then" \
         "    insmod all_video" \
         "    insmod gfxterm" \
@@ -1497,23 +2078,19 @@ esp_master_text() {
         printf '# %s\nif [ -f $prefix/entries/%s.cfg ]; then source $prefix/entries/%s.cfg; fi\n' \
             "$title" "$uuid" "$uuid"
     done < <(esp_entries "$grubdir")
-    # Driven by what is on the ESP, not by what this run's source had: a slot
-    # installed from a system without memtest86+ must not drop the entry for the
-    # disk. $prefix carries its own device, so no search and no ESP UUID are
-    # needed -- the same path syntax the entry sources above already rely on.
+    # Driven by what is on the ESP, not by what this source had: a slot
+    # installed from a system without memtest86+ must not drop the disk's entry.
+    # $prefix carries its own device, so no search and no ESP UUID are needed.
     if [ -f "$grubdir/memtest/$MEMTEST_IMAGE" ]; then
         printf '%s\n' \
             "" \
             "# The memory tester: shared by the disk, like the menu itself." \
             "if [ -f \$prefix/memtest/$MEMTEST_IMAGE ]; then" \
             "    menuentry \"$MEMTEST_TITLE\" --class memtest {" \
-            "        # memtest86+ draws a fixed 640x400 panel and never scales it," \
-            "        # so ask for the smallest mode that holds it rather than the" \
-            "        # one gfxterm is using: in a 2560x1440 framebuffer it would" \
-            "        # sit in a small rectangle in the middle. \"keep\" is the" \
-            "        # fallback for firmware offering no 640x480, and there must" \
-            "        # be one -- under UEFI the tester has no VGA text mode to" \
-            "        # fall back on, and stops with \"No graphics display found\"." \
+            "        # memtest86+ draws a fixed 640x400 panel and never scales" \
+            "        # it, so ask for the smallest mode that holds it instead of" \
+            "        # gfxterm's. \"keep\" is the fallback where 640x480 is not" \
+            "        # offered: under UEFI there must be SOME framebuffer." \
             "        set gfxpayload=640x480,keep" \
             "        linux \$prefix/memtest/$MEMTEST_IMAGE" \
             "    }" \
@@ -1522,21 +2099,15 @@ esp_master_text() {
     printf '\n%s\n' 'if [ -f $prefix/custom.cfg ]; then source $prefix/custom.cfg; fi'
 }
 
-# sync_esp_memtest <grubdir> — put the memtest86+ image on the ESP, where the
-#   menu that offers it lives. It comes from the target's own freshly-synced
-#   /boot (which is the source's): this toolkit ships no binaries and reaches
-#   outside the source for nothing, so a source without memtest86+ installed
-#   simply gets no entry. The path is right for both layouts -- /boot is mounted
-#   at $MNT/boot whether it is a partition of its own or a directory inside /.
-#   GRUB_DISABLE_MEMTEST=true in the target's /etc/default/grub turns it off, the
-#   same knob Ubuntu's 20_memtest86+ reads.
-#   It never REMOVES an image, only adds or refreshes one, and that is deliberate:
-#   the ESP is shared by every rootfs on the disk, so a slot that does not want
-#   memtest must not unregister it for the slots that do -- the same rule that
-#   makes an install own exactly one entry file and carry "set timeout" over
-#   rather than redefine it. Retiring the tester disk-wide is
-#   "rm -rf boot/grub/memtest" on the ESP; the next master then rebuilds without
-#   the entry, exactly as deleting an entry file retires a system.
+# sync_esp_memtest <grubdir> — put the memtest86+ image on the ESP, beside the
+#   menu that offers it. It comes from the target's own freshly-synced /boot
+#   (mounted at $MNT/boot in either layout), so a source without the package
+#   simply gets no entry -- this toolkit ships no binaries.
+#   GRUB_DISABLE_MEMTEST=true turns it off, the knob Ubuntu's 20_memtest86+ reads.
+#   It ADDS or REFRESHES, never removes: the ESP is shared, so a slot that does
+#   not want the tester must not unregister it for the slots that do. Retiring it
+#   disk-wide is "rm -rf boot/grub/memtest", as deleting an entry file retires a
+#   system.
 sync_esp_memtest() {
     local grubdir=$1 img="$MNT/boot/$MEMTEST_IMAGE"
     if [ "$(grub_default_value "$MNT/etc/default/grub" GRUB_DISABLE_MEMTEST)" = true ]; then
@@ -1546,18 +2117,15 @@ sync_esp_memtest() {
     [ -f "$img" ] || return 0
     info "Copying $MEMTEST_IMAGE onto the ESP for the \"$MEMTEST_TITLE\" entry..."
     sudo mkdir -p "$grubdir/memtest"
-    # cp, not "install -m": install fchmod()s, and vfat rejects a mode its mount
-    # options did not grant. The ESP carries no modes of its own anyway -- which
-    # is why everything else written here (tee, mkdir) lets the mount decide.
+    # cp, not "install -m": install fchmod()s, and vfat rejects a mode its
+    # mount options did not grant. The ESP carries no modes of its own.
     sudo cp "$img" "$grubdir/memtest/$MEMTEST_IMAGE"
 }
 
 # write_esp_menu — register this system in the shared menu, after
-#   run_chroot_block has installed the modules grub-install puts there. Reads
-#   caller globals (MNT, TGT_MODEL, TGT_ROOT, TGT_SEP_BOOT, NEW_UUID_ROOT,
-#   NEW_UUID_BOOT, MENU_CMDLINE_PREVIEW); prints what it would write under
-#   --dry-run, where the ESP is not mounted and the command line can only come
-#   from the pre-confirmation probe.
+#   run_chroot_block() has put grub-install's modules there. Reads MNT,
+#   TGT_MODEL, TGT_ROOT, TGT_SEP_BOOT, NEW_UUID_ROOT/_BOOT and (under
+#   --dry-run, where the ESP is not mounted) MENU_CMDLINE_PREVIEW.
 write_esp_menu() {
     local grubdir="$MNT/boot/efi/boot/grub"
     local title=${TGT_MODEL//\"/} kdir="/boot" cmdline master
@@ -1613,16 +2181,13 @@ run_chroot_block() {
         sudo mount --bind "$i" "$MNT$i"
     done
 
-    # INSTALL_GRUB_BIOS / INSTALL_GRUB_EFI default to 1 (full install) for callers
-    # that don't set them; install.sh gates BIOS on a BIOS target being given.
-    # TGT_GRUB_DISK is resolved by the caller.
-    #
+    # INSTALL_GRUB_BIOS/_EFI default to 1; install.sh gates BIOS on a BIOS
+    # target being given, and the caller resolves TGT_GRUB_DISK.
     # --boot-directory=/boot/efi/boot puts GRUB's boot directory on the ESP for
-    # BOTH firmware paths, so one prefix -- and one menu -- serves BIOS and UEFI
-    # and belongs to the disk rather than to this rootfs. Nothing writes a
-    # routing stub any more: with the boot directory on the ESP itself,
-    # grub-install embeds a device-relative prefix in the image, which is why an
-    # ESP built this way holds EFI/BOOT/BOOTX64.EFI and no EFI/BOOT/grub.cfg.
+    # BOTH firmware paths, so one prefix and one menu serve BIOS and UEFI and
+    # belong to the disk rather than to this rootfs. No routing stub is needed:
+    # grub-install embeds a device-relative prefix, which is why such an ESP
+    # holds EFI/BOOT/BOOTX64.EFI and no EFI/BOOT/grub.cfg.
     sudo chroot "$MNT" /bin/bash <<EOF
 set -e
 echo "=> Inside chroot..."
@@ -1645,10 +2210,10 @@ if [ "${INSTALL_GRUB_EFI:-1}" = 1 ]; then
     fi
 fi
 
-# The menu GRUB actually reads is the one on the ESP, written by
-# write_esp_menu() once this chroot is done. This regenerates the rootfs's own
-# /boot/grub/grub.cfg, which nothing boots from any more but which keeps the
-# system self-describing (and is what a rescue "configfile" would find).
+# GRUB reads the menu on the ESP, written by write_esp_menu() after this
+# chroot. This regenerates the rootfs's own /boot/grub/grub.cfg, which nothing
+# boots from but which keeps the system self-describing (and is what a rescue
+# "configfile" would find).
 echo "=> Regenerating the rootfs menu..."
 update-grub
 
@@ -1659,15 +2224,13 @@ echo "=> Exiting chroot."
 EOF
 }
 
-# verify_install — post-install sanity checks on the still-mounted target tree:
-#   fstab and the regenerated grub.cfg must reference the new UUIDs (and no
-#   longer the old ones), the ESP must carry GRUB's boot directory with this
-#   system registered in the shared menu, and every system that was registered
-#   there before must still be. Catches a silently broken configuration while
-#   the disk is still on the desk rather than at boot time on another machine.
-#   Reads caller globals (MNT, SRC_SEP_BOOT/TGT_SEP_BOOT, ESP_MENU_ENTRIES,
-#   INSTALL_GRUB_BIOS, OLD_UUID_*/NEW_UUID_*, SWAP_DEV, NEW_UUID_SWAP).
-#   Returns non-zero if any check failed.
+# verify_install — post-install checks on the still-mounted target tree: fstab
+#   and grub.cfg must name the new UUIDs and not the old, the ESP must carry
+#   GRUB's boot directory with this system registered, and every system already
+#   registered there must still be. Catches a broken configuration while the
+#   disk is on the desk rather than at boot on another machine. Reads MNT,
+#   *_SEP_BOOT, ESP_MENU_ENTRIES, INSTALL_GRUB_BIOS, the UUID pairs, SWAP_DEV.
+#   Non-zero if any check failed.
 verify_install() {
     local fails=0
     vcheck() {
@@ -1680,9 +2243,8 @@ verify_install() {
         fi
     }
     absent() { ! sudo grep -qF "$1" "$2"; }
-    # Same, but blind to commented-out lines: a /boot entry inherited from the
-    # source and disabled by rewrite_fstab() legitimately still carries the old
-    # UUID.
+    # Same, but blind to comments: a /boot entry inherited from the source and
+    # disabled by rewrite_fstab() legitimately still carries the old UUID.
     absent_active() {
         ! sudo awk -v s="$1" '$0 !~ /^[[:space:]]*#/ && index($0, s) > 0 { found = 1 }
                               END { exit !found }' "$2"
@@ -1711,9 +2273,8 @@ verify_install() {
     fi
 
     vcheck "grub.cfg boots by the new root UUID"       sudo grep -qF "$NEW_UUID_ROOT" "$MNT/boot/grub/grub.cfg"
-    # update-grub prefixes its menu entries with a search for the filesystem
-    # holding /boot. With /boot inside / that is the root UUID, already checked
-    # above; a separate /boot is its own filesystem and worth checking.
+    # update-grub prefixes its entries with a search for the filesystem holding
+    # /boot: the root UUID (checked above) unless /boot is separate.
     if [ "$TGT_SEP_BOOT" -eq 1 ]; then
         vcheck "grub.cfg searches the /boot filesystem" \
             sudo grep -qF "$NEW_UUID_BOOT" "$MNT/boot/grub/grub.cfg"
@@ -1724,9 +2285,8 @@ verify_install() {
     vcheck "EFI fallback loader present (EFI/BOOT/BOOTX64.EFI)" \
         sudo test -f "$MNT/boot/efi/EFI/BOOT/BOOTX64.EFI"
 
-    # The standalone ESP: GRUB's boot directory, the menu it reads, and this
-    # system's entry in it. There is no routing stub to check -- with the boot
-    # directory on the ESP, grub-install embeds the prefix in the image.
+    # The standalone ESP: GRUB's boot directory, its menu, and this system's
+    # entry. No routing stub to check -- the prefix is embedded in the image.
     local espgrub="$MNT/boot/efi/boot/grub"
     local espentry="$espgrub/entries/$NEW_UUID_ROOT.cfg"
     vcheck "EFI GRUB modules on the ESP (boot/grub/x86_64-efi)" \
@@ -1743,16 +2303,15 @@ verify_install() {
         sudo grep -qF "set=root $NEW_UUID_BOOT" "$espentry"
     vcheck "the ESP master menu sources it" \
         sudo grep -qF "entries/$NEW_UUID_ROOT.cfg" "$espgrub/grub.cfg"
-    # Only when the image is really there: an ESP that never got one is entitled
-    # to a menu without the entry, the same way the label check runs only when a
-    # label was asked for.
+    # Only when the image is really there: an ESP that never got one is
+    # entitled to a menu without the entry.
     if sudo test -f "$espgrub/memtest/$MEMTEST_IMAGE"; then
         vcheck "the ESP menu offers \"$MEMTEST_TITLE\"" \
             sudo grep -qF "memtest/$MEMTEST_IMAGE" "$espgrub/grub.cfg"
     fi
-    # Every other system that was on this ESP before the run must still be on
-    # it: rebuilding the shared master is the one step that could quietly
-    # unregister the machines this install was not about.
+    # Every other system on this ESP must still be registered: rebuilding the
+    # shared master is the one step that could quietly unregister the machines
+    # this install was not about.
     local row uuid etitle
     for row in ${ESP_MENU_ENTRIES[@]+"${ESP_MENU_ENTRIES[@]}"}; do
         IFS="$(printf '\t')" read -r uuid etitle <<<"$row"
@@ -1763,18 +2322,31 @@ verify_install() {
             sudo sh -c 'test -f "$1" && grep -qF "$2" "$3"' _ \
                 "$espgrub/entries/$uuid.cfg" "entries/$uuid.cfg" "$espgrub/grub.cfg"
     done
-    # Proves the /boot content actually landed -- the one thing a layout change
-    # (a separate /boot folded into /, or split back out) can silently lose, and
-    # the backstop for a source that hides /boot in some way the Phase 3 fstab
-    # check cannot see (an unlisted mount, a bind).
+    # Proves the /boot content landed: the one thing a layout change can
+    # silently lose, and the backstop for a source that hides /boot in some way
+    # the Phase 3 fstab check cannot see (an unlisted mount, a bind).
     vcheck "a kernel image is present under /boot" \
         sudo sh -c 'ls "$1"/boot/vmlinuz-* >/dev/null 2>&1' _ "$MNT"
-    # Only when a label was actually asked for: an --update onto a disk whose root
-    # this toolkit never labelled is entitled to whatever it already carries.
+    # Only when a label was asked for: an --update onto a disk this toolkit
+    # never labelled is entitled to whatever it carries.
     if [ -n "$TGT_ROOT_LABEL" ]; then
         vcheck "the root filesystem is labelled \"$ROOT_LABEL\"" \
             root_label_is "$TGT_ROOT" "$ROOT_LABEL"
     fi
+
+    # The mounts resolved at the gate: live in the target's fstab, naming the
+    # chosen filesystem, with every revived line live too. The one part of the
+    # fstab the operator answered a question about.
+    local rmp
+    for rmp in ${REMAP_MPS[@]+"${REMAP_MPS[@]}"}; do
+        [ -n "${REMAP_SPEC[$rmp]:-}" ] || continue
+        vcheck "fstab mounts $rmp from ${REMAP_SPEC[$rmp]}" \
+            fstab_mounts_from "$rmp" "${REMAP_SPEC[$rmp]}" "$MNT/etc/fstab"
+    done
+    for rmp in ${REMAP_ENABLE[@]+"${REMAP_ENABLE[@]}"}; do
+        vcheck "fstab entry for $rmp is live again" \
+            fstab_live_entry "$rmp" "$MNT/etc/fstab"
+    done
 
     local sf
     for sf in "${SWAPFILES_REBUILT[@]}"; do
@@ -1788,9 +2360,8 @@ verify_install() {
             fstab_disabled "$sf" "$MNT/etc/fstab"
     done
 
-    # A cache is dropped by hiding it from the sender rather than excluding it,
-    # so that --update's --delete takes the target's stale copy with it. Prove
-    # that: an --exclude here would silently leave the old cache in place.
+    # Dropped by hiding, not excluding, so --update's --delete takes the stale
+    # copy too. An --exclude would silently leave it in place; prove it did not.
     local cache_path
     for cache_path in ${CACHE_DROPS[@]+"${CACHE_DROPS[@]}"}; do
         vcheck "dropped cache $cache_path is absent from the target" \
@@ -1832,17 +2403,16 @@ INODES_ROOT="${INODES_ROOT:-}"
 # Empty = the default 256 MiB ESP; --target-efi-size overrides it (fresh --target only).
 TGT_EFI_SIZE="${TGT_EFI_SIZE:-}"
 ESP_MIB=256
-# Empty = the target's root filesystem is labelled "root"; --target-root-label
-# overrides it. ROOT_LABEL is the resolved label and is never empty: it is what
-# reaches mkfs.ext4 -L / e2label, either of which would clear the label instead.
+# Empty = the root filesystem is labelled "root"; --target-root-label overrides
+# it. ROOT_LABEL is the resolved label and is never empty -- it reaches
+# mkfs.ext4 -L / e2label, which would otherwise clear the label.
 TGT_ROOT_LABEL="${TGT_ROOT_LABEL:-}"
 ROOT_LABEL=root
 DRY_RUN=0
 UPDATE=0
 NO_TRIM=0
-# Keep the ESP's filesystem: no mkfs, no new UUID. What a shared ESP needs, and
-# nothing else -- its contents are written by grub-install and write_esp_menu on
-# every run either way, since the ESP is generated here, never copied.
+# Keep the ESP's filesystem: no mkfs, no new UUID. What a shared ESP needs; its
+# contents are written by grub-install and write_esp_menu on every run anyway.
 KEEP_EFI=0
 # Copy the regenerable browser caches like any other data instead of dropping
 # them (--keep-cache). See CACHE_DROP_NAMES.
@@ -1857,11 +2427,9 @@ CLEANED=0
 # "This target keeps /boot inside /", said explicitly (see --no-target-boot).
 NO_TGT_BOOT=0
 
-# The systems already registered in the shared ESP menu (probe_esp_menu), the
-# boot options this system's entry will carry (probe_menu_cmdline / the source
-# swap probe), whether the memory tester is on the disk already or comes with
-# this run (probe_esp_menu / probe_memtest), and the UUIDs verify_install needs
-# before they exist.
+# The systems already in the shared ESP menu, the boot options this entry will
+# carry, whether the memory tester is on the disk already or comes with this
+# run, and the UUIDs verify_install needs before they exist.
 ESP_MENU_ENTRIES=()
 ESP_MENU_PROBED=0
 ESP_MEMTEST=0
@@ -1884,10 +2452,9 @@ declare -A SWAPFILE_REAL=()
 SWAP_PREVIEW=()
 SWAP_PROBED=0
 
-# The source's own mount layout (fstab_mount_table), the regenerable caches this
-# run drops -- what the pre-confirmation probe found, what Phase 3 resolved for
-# real, and the rsync rules that do it -- and the --exclude-from rules that
-# cannot match the transfer.
+# The source's mount layout (fstab_mount_table), the caches this run drops (as
+# probed, as resolved in Phase 3, and the rsync rules that do it), and the
+# --exclude-from rules that cannot match the transfer.
 FSTAB_TABLE=""
 CACHE_PREVIEW=()
 CACHE_PROBED=0
@@ -1896,18 +2463,42 @@ CACHE_FILTERS=()
 EXCLUDE_AUDIT=()
 EXCLUDE_PROBED=0
 
-# Where rewrite_fstab()'s awk records what it disabled, for the report printed
-# right afterwards. Held globally only so cleanup() can remove the directory
-# when the run ends between the mktemp and the rm (an interrupt, or a failing
-# awk under -e).
+# Mounts resolved at install time instead of being disabled: what --remap
+# answered, what the operator chose at the gate, what the discovery pass found.
+# All keyed by MOUNT POINT, the one field a foreign entry and its replacement
+# share. REMAP_PROBED is the "was this checked at all" flag -- an empty
+# REMAP_MPS is also what "nothing to ask about" looks like.
+REMAP_ARGS=()                 # raw --remap arguments, validated after parsing
+declare -A REMAP_ARG=()       #   ...into MOUNTPOINT -> spec, or "none"
+declare -A REMAP_SPEC=()      # the fstab spec this run writes for that mount
+declare -A REMAP_DEV=()       # the device that spec names here, when attached
+declare -A REMAP_STATE=()     # live | disabled, in the SOURCE's own fstab
+declare -A REMAP_UUID=()      # the UUID the source's entry named, if any
+declare -A REMAP_LABEL=()     # the label its candidates have to carry
+declare -A REMAP_SPECWAS=()   # the spec the source's entry carried
+declare -A REMAP_BINDS=()     # "<live|disabled> <mount point> <source>" rows
+declare -A REMAP_SWAPS=()     # "<live|disabled> <fstab path>" rows, one a line
+declare -A REMAP_NOTES=()     # what reading the chosen filesystem found
+REMAP_MPS=()                  # the remappable mount points, in fstab order
+REMAP_ENABLE=()               # mount points whose commented-out lines come back
+# Tab-separated, safe only because all four fields are always set: tab is IFS
+# *whitespace*, so a run of tabs is one delimiter and an empty field in the
+# middle shifts every later field up one. Anything optional added here must go
+# last (cf. remap_block_rows, which uses \037 for exactly this reason).
+REMAP_SWAP_CREATE=()          # "<fstab path>\t<dev>\t<path on it>\t<bytes>"
+REMAP_PROBED=0
+REMAP_OPEN_MNT=""             # a filesystem this run mounted to look inside
+REMAP_OPEN_PATH=""            # ...and where its contents are readable
+
+# Where rewrite_fstab()'s awk records what it changed, for the reports printed
+# right after. Global only so cleanup() can remove the directory if the run ends
+# between the mktemp and the rm.
 FSTAB_REPORT=""
 FSTAB_REPORT_DIR=""
 
-# Run with nothing to do: show the help rather than marching into Phase 1 and
-# failing on the *default* source path, which says nothing about what went
-# wrong. Env-var-only invocations (TARGET=/dev/sdb ./install.sh) still work --
-# they are only "no arguments" as far as $# is concerned, so check for a target
-# in the environment before deciding the user asked for nothing.
+# Nothing to do: show the help rather than marching into Phase 1 and failing on
+# the *default* source path. An env-var-only invocation (TARGET=/dev/sdb
+# ./install.sh) is "no arguments" to $#, so check the environment too.
 if [ $# -eq 0 ] && [ -z "${TARGET}${TGT_ROOT}${TGT_EFI}${TGT_BIOS}${TGT_BOOT}" ]; then
     set -- --help
 fi
@@ -1942,6 +2533,7 @@ while [ $# -gt 0 ]; do
         --no-trim)        NO_TRIM=1; shift ;;
         --sparse)         SPARSE=1; shift ;;
         --keep-cache)     KEEP_CACHE=1; shift ;;
+        --remap)          REMAP_ARGS+=("$2"); shift 2 ;;
         --yes|-y)         ASSUME_YES=1; shift ;;
         -h|--help)
             cat <<USAGE
@@ -2016,26 +2608,34 @@ Other:
   --update                    Sync onto already-formatted target partitions:
                               skip mkfs and rsync with --delete, refreshing an
                               existing clone in place instead of reformatting it
-  --exclude-from FILE         Pass FILE to rsync as --exclude-from, so the listed
-                              paths are omitted from the copy (e.g. to produce an
-                              impersonal clone). Works with or without --update;
-                              under --update the listed paths are also purged from
-                              the target (rsync --delete-excluded). A swap file
-                              listed here is dropped rather than re-created, and
-                              its fstab entry is commented out. Its paths are
-                              paths in the SOURCE'S ROOT FILESYSTEM, which is
-                              what the transfer sees: a rule for a directory the
-                              source bind-mounts in from elsewhere (~/.cache and
-                              friends on a shared-/data disk) matches nothing,
-                              and the summary says which rules those are.
+  --exclude-from FILE         Omit the paths listed in FILE from the copy (e.g.
+                              an impersonal clone); under --update they are also
+                              purged from the target (--delete-excluded). A swap
+                              file listed here is dropped, not re-created, and
+                              its fstab entry commented out. Paths are paths in
+                              the SOURCE'S ROOT FILESYSTEM, so a rule for a
+                              directory the source binds in from elsewhere
+                              matches nothing -- the summary says which do.
   --keep-cache                Copy the regenerable browser caches instead of
                               dropping them. By default ~/.cache/google-chrome
-                              (and -headless) is neither copied nor left behind
-                              on the target: it holds only the HTTP cache, the
-                              compiled-JS cache and a shader cache, all of which
-                              Chrome rebuilds on demand. Passwords, cookies,
-                              bookmarks and extensions live in ~/.config and are
-                              copied either way.
+                              (and -headless) is neither copied nor left on the
+                              target: HTTP, compiled-JS and shader caches only,
+                              all rebuilt on demand. The profile that matters
+                              lives in ~/.config and is copied either way.
+  --remap MOUNT=DEVICE        Point the target's fstab entry for MOUNT (/data,
+                              say) at DEVICE instead of commenting it out because
+                              the filesystem the source named will not be on this
+                              disk. Repeatable. DEVICE is a /dev path (written as
+                              its UUID), UUID=..., LABEL=... or "none" (leave it
+                              alone). Without this an interactive run ASKS, once
+                              per such mount, offering the attached filesystems
+                              that carry the label the entry expects and
+                              defaulting to the one on the target's own disk;
+                              --yes or a non-interactive stdin declines to ask.
+                              The binds and swap files riding on that mount come
+                              back with it, an entry the source has COMMENTED OUT
+                              can be revived the same way, and a swap file the
+                              chosen filesystem lacks is created there.
   --brand NAME                Brand the GRUB menu title with NAME instead of the
                               target disk's reported model (useful when the medium
                               sits in a USB card reader, whose model string —
@@ -2044,100 +2644,82 @@ Other:
                               into the target's /etc/default/grub, so a brand
                               chosen at install time survives every sync.
   --target-efi-size SIZE      Size of the ESP on a freshly partitioned --target
-                              (default 256M). A bare number is MiB; k/M/G are
-                              accepted and must come out whole MiB, since the
-                              root partition starts where the ESP ends. Only
-                              applies when this run partitions the disk -- not
-                              with --update or individual --target-* partitions.
+                              (default 256M). Bare = MiB; k/M/G must come out
+                              whole MiB, since root starts where the ESP ends.
+                              Rejected with --update or individual --target-*.
   --inodes-root N             Pass N to the root mkfs.ext4 as -N instead of
                               deriving it from the partition size (~4 MiB per
-                              inode, floor 1.5M). A k or M suffix is accepted:
-                              1572864, 1536k and 1M all name a count, not a
-                              size. An explicit count is used as given -- the
-                              1.5M floor is not applied. Only relevant when the
-                              root filesystem is actually formatted (not under
-                              --update, which keeps the existing one).
-  --target-root-label LABEL   Label the target's root filesystem LABEL instead of
-                              "root". Stamped by the root mkfs.ext4 -L when this
-                              run formats it, and by e2label under --update, which
-                              keeps the filesystem (its UUID is untouched either
-                              way). Refused when --target-root resolves in place:
-                              that filesystem is the source's own, and relabelling
-                              it would rename the disk being copied FROM. At most
-                              16 bytes (the ext4 label field), and "boot" is
-                              refused, since a boot-labelled partition is skipped
-                              by the disk scan on purpose. Note that "root" is the
-                              only label that scan looks for, so a rootfs carrying
-                              any other one is no longer found by a whole-disk
-                              --source / --target and has to be named with
-                              --source-root / --target-root. That is the point of
-                              it: it is what tells the slots of a disk carrying a
-                              rootfs per machine apart.
-  --sparse                    Add -S to the rsync, re-creating each run of nulls
-                              in the source as a hole rather than writing it out.
-                              Off by default: a hole costs an entry in the file's
-                              ext4 extent tree, and a big VM image perforated by
-                              thousands of small ones ends up with a tree so wide
-                              that fsck.ext4 -f offers to optimize it (and every
-                              read of the file walks the extra level). Measured on
-                              one 51.8 GiB .vdi: 12,309 holes, 82% of them 64 KiB
-                              or smaller, saving 1.01 GiB (2%) between them and
-                              costing ~11,900 extents. Worth enabling only for a
-                              source holding genuinely, largely sparse files.
-  --no-trim                   Skip the closing fstrim of the written filesystems.
-                              By default the ESP is trimmed on every run (mkfs.fat
-                              has no discard of its own) but the ext4 filesystems
-                              only under --update: a fresh mkfs.ext4 has already
-                              discarded the whole partition and the rsync that
-                              follows only allocates, so nothing is left to
-                              reclaim. Trimming keeps flash fast and makes a
-                              loop-attached .img sparse (the loop driver turns
-                              discards into hole punches on the backing file, so
-                              a fallocate'd image only shrinks if this runs).
+                              inode, floor 1.5M, which an explicit N skips). A
+                              k/M suffix multiplies the COUNT, not a size:
+                              1572864, 1536k and 1M are the same. Only when the
+                              root filesystem is actually formatted.
+  --target-root-label LABEL   Label the target's root filesystem LABEL instead
+                              of "root" (mkfs.ext4 -L when formatting, e2label
+                              under --update; the UUID is untouched). At most 16
+                              bytes, "boot" refused (the disk scan skips
+                              boot-labelled partitions), and refused outright for
+                              an in-place root -- that filesystem is the
+                              source's. "root" is the only label the scan looks
+                              for, so a rootfs wearing any other must be named
+                              with --source-root/--target-root: that is the
+                              point, it is what tells a disk's slots apart.
+  --sparse                    Add -S to the rsync, re-creating runs of nulls as
+                              holes. Off by default: every hole costs an ext4
+                              extent, and one 51.8 GiB .vdi measured here gained
+                              12,309 of them to save 1.01 GiB (2%) -- a tree deep
+                              enough that fsck offers to optimize it. Worth it
+                              only for genuinely, largely sparse sources.
+  --no-trim                   Skip the closing fstrim. By default the ESP is
+                              trimmed on every run (mkfs.fat has no discard) but
+                              the ext4 filesystems only under --update -- a fresh
+                              mkfs.ext4 already discarded the partition and the
+                              rsync only allocates. Trimming keeps flash fast and
+                              makes a loop-attached .img sparse (the loop driver
+                              punches holes in the backing file).
   --mnt DIR                   Target root mount point  (default: private temp dir)
   --src DIR                   Source root mount point  (default: private temp dir)
   --yes, -y                   Skip the confirmation prompt (for scripted runs)
-  --dry-run                   Print destructive commands instead of running them.
-                              Two read-only probes still run, so that the summary
-                              above the confirmation prompt is accurate rather
-                              than guessed: the source's fstab (which swap files
-                              would be re-created) and, under --update, the
-                              target's current GRUB brand. Both are transient
-                              read-only mounts; nothing is written.
+  --dry-run                   Print destructive commands instead of running
+                              them. Read-only probes still run so the summary is
+                              accurate rather than guessed (the source's fstab,
+                              the target's current GRUB brand): transient
+                              read-only mounts, writing nothing.
   -h, --help                  Show this help
 
 Notes:
-  * --source-swap (reuse) and --target-swap (reformat) are mutually exclusive.
-    They cover swap PARTITIONS; a swap FILE listed in the source's fstab needs no
-    option -- it is never copied (it is a run of zeros that fallocate re-creates
-    for free, and under --sparse rsync would leave it full of holes, which swapon
-    refuses) and is re-created on the target at the source's size.
+  * --source-swap (reuse) and --target-swap (reformat) are mutually exclusive
+    and cover swap PARTITIONS. A swap FILE needs no option: it is never copied
+    (a run of zeros fallocate re-creates for free, and -S would leave it holed,
+    which swapon refuses) and is re-created on the target at the source's size.
   * EFI booting uses the EFI System Partition; the BIOS Boot partition is only
     for legacy boot and is regenerated by grub-install (when --target-bios-boot
     is given) or left intact otherwise.
-  * GRUB's boot directory lives on the ESP (/boot/efi/boot/grub), for legacy BIOS
-    and UEFI alike, so the menu belongs to the disk rather than to any one rootfs.
-    Each install registers itself in entries/<root-uuid>.cfg there and rebuilds
-    the master grub.cfg over whatever entry files are present, keeping its
-    timeout/default; hand-written extras go in custom.cfg, sourced last. Deleting
-    an entry file retires that system from the menu. So one disk can carry a
-    rootfs per machine behind a single ESP:
+  * GRUB's boot directory lives on the ESP (/boot/efi/boot/grub) for BIOS and
+    UEFI alike, so the menu belongs to the disk, not to any one rootfs. Each
+    install registers itself in entries/<root-uuid>.cfg and rebuilds the master
+    over whatever entry files are present, keeping its timeout/default;
+    hand-written extras go in custom.cfg. Deleting an entry file retires that
+    system. So one disk can carry a rootfs per machine behind a single ESP:
       $0 --source /dev/sde --target-efi /dev/sde2 --keep-efi \\
          --target-bios-boot /dev/sde1 --target-root /dev/sde5 --brand Laptop
   * That menu also offers "Memory test (memtest86+)" when the source has the
-    memtest86+ package installed: /boot/mt86+x64 is copied to memtest/ on the
-    ESP, so the tester belongs to the disk too and survives installs of slots
-    that do not carry it. One entry covers BIOS and UEFI alike -- the same image
-    boots on both. GRUB_DISABLE_MEMTEST=true in a system's /etc/default/grub
-    keeps that install from adding it, but never removes one already there;
-    retiring it disk-wide is "rm -rf /boot/efi/boot/grub/memtest".
+    package installed: /boot/mt86+x64 is copied to memtest/ on the ESP, so the
+    tester belongs to the disk too and survives installs of slots without it.
+    One entry covers both firmware paths. GRUB_DISABLE_MEMTEST=true keeps an
+    install from adding it but never removes one; retiring it disk-wide is
+    "rm -rf /boot/efi/boot/grub/memtest".
   * A separate /boot earns its keep on a machine whose BIOS cannot boot from
     NVMe: BIOS Boot, the ESP and /boot go on a disk that BIOS can read, while /
     -- everything the running system actually reads -- stays on the NVMe.
-  * Multiple instances may run concurrently (e.g. flashing several disks from
-    one source). Disks are guarded by advisory locks under /run/lock: written
-    disks exclusively, source disks shared; a conflicting instance fails fast
-    before its confirmation prompt. Run each instance in its own terminal.
+  * A mount the target cannot resolve -- /data on a partition of the source
+    machine, say -- is commented out in its fstab, and its binds and swap files
+    go with it. Which filesystem the TARGET should use cannot be derived (several
+    disks may share a label), so an interactive run asks before the confirmation
+    gate and writes the answer in Phase 4. --remap answers in advance, --yes
+    declines to ask; nothing is guessed.
+  * Instances may run concurrently (flashing several disks from one source).
+    Advisory locks under /run/lock guard each disk -- written exclusively, read
+    shared -- so a conflicting instance fails fast, before its prompt.
 
 Examples:
   # Full deploy of an image onto a fresh disk (3 partitions: BIOS Boot, ESP, /):
@@ -2185,6 +2767,13 @@ Examples:
      --target-bios-boot /dev/sdb1 --target-efi /dev/sdb2 \\
      --target-root /dev/sdb3 --update
 
+  # Sync onto a portable disk and point /data at that disk's own data partition,
+  # so its binds (and its swap file) come back to life instead of being
+  # commented out. Interactively this is the question the run asks anyway:
+  $0 --source-efi /dev/sda2 --source-root /dev/nvme0n1p1 \\
+     --target-efi /dev/sde2 --target-root /dev/sde5 --update \\
+     --yes --remap /data=/dev/sde4
+
   # Impersonal clone: deploy minus the paths listed in exclude-personal.txt:
   $0 --image Ubuntu26-Portable-16GB.img --target /dev/sda \\
      --exclude-from exclude-personal.txt
@@ -2205,10 +2794,9 @@ if [ -n "$EXCLUDE_FROM" ]; then
     EXCLUDE_FROM=$(readlink -f "$EXCLUDE_FROM")
 fi
 
-# --inodes-root is handed to mkfs.ext4 -N, which wants a plain count; accept a
-# k/M suffix too, since the useful values are things like 1572864. Resolved here
-# so a typo fails before any disk is touched, rather than at mkfs time. 10# keeps
-# a leading zero from being read as octal.
+# --inodes-root reaches mkfs.ext4 -N, which wants a plain count; a k/M suffix is
+# accepted because the useful values look like 1572864. Resolved here so a typo
+# fails before any disk is touched. 10# keeps a leading zero from reading octal.
 if [ -n "$INODES_ROOT" ]; then
     if [[ "$INODES_ROOT" =~ ^([0-9]+)([kKmM]?)$ ]]; then
         n=$((10#${BASH_REMATCH[1]}))
@@ -2223,11 +2811,9 @@ if [ -n "$INODES_ROOT" ]; then
     fi
 fi
 
-# --target-efi-size is a SIZE, not a count: a bare number means MiB (the unit the
-# GPT layout is expressed in), and k/M/G are KiB/MiB/GiB. It must come out to a
-# whole number of MiB, since the root partition starts where the ESP ends and a
-# sub-MiB boundary would misalign it. Validated here for the same reason as
-# --inodes-root: a typo must not survive until parted has already run.
+# --target-efi-size is a SIZE, not a count: bare = MiB (the unit the GPT layout
+# uses), k/M/G otherwise. It must come out whole MiB, since root starts where
+# the ESP ends. Validated here so a typo cannot survive until parted has run.
 if [ -n "$TGT_EFI_SIZE" ]; then
     if [[ "$TGT_EFI_SIZE" =~ ^([0-9]+)([kKmMgG]?)$ ]]; then
         n=$((10#${BASH_REMATCH[1]}))
@@ -2238,9 +2824,9 @@ if [ -n "$TGT_EFI_SIZE" ]; then
             g|G) n=$(( n * 1024 )) ;;
         esac
         [ "$n" -gt 0 ] || die "--target-efi-size must be greater than zero."
-        # No hard floor: mkfs.fat -F32 will format even 1 MiB. But the GRUB EFI
-        # payload plus the fallback loader need a few MiB, and that failure would
-        # not surface until grub-install, long after the disk was partitioned.
+        # No hard floor -- mkfs.fat -F32 formats even 1 MiB -- but the GRUB
+        # payload needs a few, and that fails only at grub-install, long after
+        # the disk is partitioned.
         [ "$n" -ge 16 ] || \
             echo "Warning: a ${n} MiB ESP may be too small for the GRUB EFI payload." >&2
         ESP_MIB=$n
@@ -2249,32 +2835,67 @@ if [ -n "$TGT_EFI_SIZE" ]; then
     fi
 fi
 
-# --target-root-label reaches the root filesystem's superblock -- mkfs.ext4 -L when
-# this run formats it, e2label when --update keeps it. Checked here for the same
-# reason as the two above: mke2fs silently truncates a label that does not fit, and
-# stamping something the caller did not ask for is worse than refusing it. An empty
-# value means "not given" and leaves the label "root", as an empty --brand does.
+# --target-root-label reaches the superblock (mkfs.ext4 -L, or e2label under
+# --update). Checked here because mke2fs silently TRUNCATES a label that does
+# not fit, and stamping something the caller did not ask for is worse than
+# refusing it. Empty means "not given" and leaves the label "root".
 if [ -n "$TGT_ROOT_LABEL" ]; then
     # ext4's s_volume_name is 16 bytes with no room for a terminator, so count
     # bytes: ${#var} counts characters, which differ in a UTF-8 locale.
     label_bytes=$(printf %s "$TGT_ROOT_LABEL" | wc -c)
     [ "$label_bytes" -le 16 ] || \
         die "--target-root-label must fit in 16 bytes (the ext4 label field); \"$TGT_ROOT_LABEL\" needs $label_bytes."
-    # scan_disk_roles() skips a boot-labelled Linux partition on purpose, so a root
-    # filesystem wearing that label would be invisible to every whole-disk scan --
-    # and would read as a separate /boot to the next person to look at the disk.
+    # scan_disk_roles() skips boot-labelled partitions on purpose, so a root
+    # filesystem wearing that label would be invisible to every whole-disk scan.
     [ "$TGT_ROOT_LABEL" != boot ] || \
         die "--target-root-label boot is refused: the disk scan skips boot-labelled partitions, so a root filesystem labelled 'boot' could never be found by one again."
     ROOT_LABEL="$TGT_ROOT_LABEL"
 fi
 
-# Front-load the sudo password prompt before any resources are acquired, so it
-# cannot fire mid-rsync (sudo timestamps are per-tty and can expire mid-run).
-# A dry run needs it too, for the transient ro mounts the summary is built from:
-# the target's existing GRUB brand under --update (without --brand), and the
-# source's fstab whenever the source root is a block device we can actually
-# mount. An image source in a dry run is the one case that still needs no root
-# at all -- no loop device is attached, so there is nothing to read.
+# --remap MOUNTPOINT=DEVICE answers before the run asks. Validated here like the
+# options above, and resolved to the spec that will be written so the summary
+# and the fstab agree. A /dev path becomes its UUID (lsblk, no privilege
+# needed); UUID= and LABEL= are written as given, since they may name a
+# filesystem that exists only on the machine the target will boot on.
+if [ ${#REMAP_ARGS[@]} -gt 0 ]; then
+    for remap_arg in "${REMAP_ARGS[@]}"; do
+        case "$remap_arg" in
+            *=*) ;;
+            *) die "--remap wants MOUNTPOINT=DEVICE (e.g. --remap /data=/dev/sde4), got: $remap_arg" ;;
+        esac
+        remap_mp=${remap_arg%%=*}
+        remap_want=${remap_arg#*=}
+        [ "${remap_mp#/}" != "$remap_mp" ] || \
+            die "--remap mount point must be absolute (e.g. --remap /data=/dev/sde4), got: $remap_mp"
+        remap_mp=${remap_mp%/}   # mount points are compared without one
+        [ -n "$remap_mp" ] || die "--remap / is refused: the root filesystem is this run's own role."
+        case "$remap_mp" in
+            /boot|/boot/efi) die "--remap $remap_mp is refused: this script owns that mount (--target-boot / --target-efi decide it)." ;;
+        esac
+        [ -z "${REMAP_ARG[$remap_mp]+set}" ] || \
+            die "--remap $remap_mp given twice: say once what that mount point should be."
+        case "$remap_want" in
+            none)   # an explicit "leave it": the prompt skips this mount point
+                REMAP_ARG[$remap_mp]=none ;;
+            UUID=*|LABEL=*|PARTUUID=*|PARTLABEL=*)
+                REMAP_ARG[$remap_mp]="$remap_want" ;;
+            /dev/*)
+                [ -b "$remap_want" ] || \
+                    die "--remap $remap_mp=$remap_want: not a block device on this machine. Name it as UUID=... if it only exists on the machine the target will boot on."
+                remap_uuid=$(lsblk -dno UUID "$remap_want" 2>/dev/null | xargs || true)
+                [ -n "$remap_uuid" ] || \
+                    die "--remap $remap_mp=$remap_want: that device carries no filesystem UUID (unformatted?)."
+                REMAP_ARG[$remap_mp]="/dev/disk/by-uuid/$remap_uuid" ;;
+            *)
+                die "--remap $remap_mp=$remap_want: expected a /dev path, UUID=..., LABEL=... or none." ;;
+        esac
+    done
+fi
+
+# Front-load the sudo prompt before anything is acquired, so it cannot fire
+# mid-rsync (timestamps are per-tty and expire). A dry run needs it too, for the
+# transient ro mounts the summary is built from; an image source in a dry run is
+# the one case that needs no root at all, having no loop device to read.
 if [ "$DRY_RUN" -eq 0 ] || { [ $UPDATE -eq 1 ] && [ -z "$BRAND" ]; } || \
    [ -b "$SOURCE" ] || [ -b "$SRC_ROOT" ]; then
     sudo -v
@@ -2301,18 +2922,15 @@ run() {
     fi
 }
 
-# Teardown is trap-driven so failures and Ctrl+C release everything too:
-# unmount this instance's trees, detach its loop device, remove its temp dirs.
-# Flags gate each step to what was actually acquired — in particular the fake
-# dry-run LOOP_DEV (/dev/loop0) never sets LOOP_ATTACHED and is never detached,
-# and a user-supplied --mnt is never unmounted unless we mounted onto it.
+# Teardown is trap-driven, so a failure or Ctrl+C releases everything too.
+# Flags gate each step to what was actually acquired -- the fake dry-run
+# LOOP_DEV never sets LOOP_ATTACHED, and a user-supplied --mnt is unmounted only
+# if we mounted onto it.
 
-# Recursively unmount one tree, waiting out stragglers that keep it busy.
-# A Ctrl+C kills the rsync client at once, but the process writing the data
-# can be blocked in uninterruptible sleep (D state) while the kernel flushes
-# its dirty pages to a slow target; the pending signal is only honoured when
-# that write returns, and until then the tree cannot be unmounted — so retry
-# instead of bailing out and leaving the target mounted.
+# Recursively unmount one tree, waiting out stragglers. Ctrl+C kills the rsync
+# client at once, but the writer can sit in uninterruptible sleep while the
+# kernel flushes dirty pages to a slow target, and the tree stays busy until
+# that returns -- so retry rather than leave the target mounted.
 umount_tree() {
     local dir="$1" err waited=0
     while findmnt -n "$dir" >/dev/null 2>&1; do
@@ -2335,14 +2953,14 @@ umount_tree() {
 cleanup() {
     if [ "$CLEANED" -eq 1 ]; then return 0; fi
     CLEANED=1
-    # Once teardown starts it must run to completion: ignore further Ctrl+C
-    # (etc.) so an impatient interrupt cannot abort it halfway and leave the
-    # target mounted.
+    # Once teardown starts it must finish: an impatient second Ctrl+C must not
+    # abort it halfway and leave the target mounted.
     trap '' HUP INT TERM
     if [ "$MOUNTS_DONE" -eq 1 ]; then
         umount_tree "$SRC" || true
         umount_tree "$MNT" || true
     fi
+    remap_close   # a filesystem opened to look inside, or to write a swap file
     if [ "$LOOP_ATTACHED" -eq 1 ]; then
         echo "Detaching loop device: $LOOP_DEV"
         sudo losetup -d "$LOOP_DEV" 2>/dev/null || true
@@ -2377,10 +2995,9 @@ role_state() {
 summary_row() { printf '  %-10s%s\n' "$1" "$2"; }
 
 # role_row <label> <migrate-flag> <source-dev> <target-dev> — a summary row for
-# one filesystem role. A migrated/synced role names where the data comes FROM as
-# well as where it lands, since which source partition feeds which target is the
-# thing worth checking before committing to a multi-hour transfer; an in-place
-# role has only the one device to name.
+# one role. A migrated/synced one names where the data comes FROM as well as
+# where it lands, the thing worth checking before a multi-hour transfer; an
+# in-place role has only the one device.
 role_row() {
     if [ "$2" -eq 1 ]; then
         summary_row "$1" "$(role_state "$2")  $3 -> $4"
@@ -2408,10 +3025,9 @@ UNIFIED_TARGET=0
 SCATTERED_SOURCE=0
 if [ -n "$SRC_EFI" ] || [ -n "$SRC_BOOT" ] || [ -n "$SRC_ROOT" ]; then
     SCATTERED_SOURCE=1
-    # --source-boot names one partition of a scattered source; it cannot stand
-    # in for the source itself. That is also what keeps it away from an --image:
-    # a partition inside an image file has no name until the loop attach, which
-    # happens long after this point.
+    # --source-boot names one partition of a scattered source, never the source
+    # itself -- which is also what keeps it away from an --image, whose
+    # partitions have no names until the loop attach far below.
     if [ -n "$SRC_BOOT" ] && { [ -z "$SRC_EFI" ] || [ -z "$SRC_ROOT" ]; }; then
         die "--source-boot names one partition of a scattered source, so --source-efi and --source-root are needed with it.
 (An image keeps /boot inside /, and its partitions have no names until it is attached.)"
@@ -2426,9 +3042,8 @@ if [ $NO_TGT_BOOT -eq 1 ] && [ -n "$TGT_BOOT" ]; then
 fi
 
 # A unified --target owns the whole disk; mixing it with per-role --target-*
-# partitions would silently ignore one or the other. A separate /boot on the
-# target is therefore always spelt out partition by partition: this script
-# partitions a fresh disk as BIOS Boot + ESP + root and nothing else.
+# would silently ignore one or the other. A separate /boot is therefore always
+# spelt out partition by partition: a fresh disk gets BIOS Boot + ESP + root.
 if [ -n "$TARGET" ]; then
     for v in "$TGT_BIOS" "$TGT_EFI" "$TGT_BOOT" "$TGT_ROOT"; do
         [ -z "$v" ] || die "Do not combine a unified --target with individual --target-* partitions."
@@ -2451,11 +3066,9 @@ echo " Phase 1: Resolving Source Architecture   "
 echo "=========================================="
 if [ $SCATTERED_SOURCE -eq 1 ]; then
     echo "Source Mode: Scattered Partitions"
-    validate_partition_type "$SRC_EFI"  "$GUID_EFI"   "Source EFI"  || die "Invalid Source EFI"
-    if [ -n "$SRC_BOOT" ]; then
-        validate_partition_type "$SRC_BOOT" "$GUID_LINUX" "Source Boot" || die "Invalid Source Boot"
-    fi
-    validate_partition_type "$SRC_ROOT" "$GUID_LINUX" "Source Root" || die "Invalid Source Root"
+    validate_partition_type "$SRC_EFI" "$GUID_EFI" "Source EFI"
+    [ -z "$SRC_BOOT" ] || validate_partition_type "$SRC_BOOT" "$GUID_LINUX" "Source Boot"
+    validate_partition_type "$SRC_ROOT" "$GUID_LINUX" "Source Root"
 else
     if [ -b "$SOURCE" ]; then
         echo "Source Mode: Unified Block Device ($SOURCE)"
@@ -2463,21 +3076,16 @@ else
     elif [ -f "$SOURCE" ]; then
         echo "Source Mode: Flat File Image ($SOURCE)"
         if [ "$DRY_RUN" -eq 1 ]; then
-            # No loop device is attached in dry-run, so lsblk has nothing to
-            # scan. parted reads the image's partition table out of the file
-            # itself, so the summary still shows its real layout.
-            # Name the device the real run would actually get rather than
-            # assuming loop0: when the TARGET is itself a loop device, a
-            # hardcoded loop0 collides with it and the safety check below
-            # rejects the run with a bogus "it is also a source partition".
+            # No loop is attached in a dry run, so parted reads the image's
+            # table out of the file itself and the summary still shows its real
+            # layout. Name the device the real run would get rather than
+            # assuming loop0, which could BE the target.
             LOOP_DEV=$(losetup -f 2>/dev/null) || LOOP_DEV=""
             [ -n "$LOOP_DEV" ] || LOOP_DEV="/dev/loop0"
-            # A real run attaches the source only once the target is already in
-            # use, so losetup can never hand it the target's own loop device. A
-            # dry run has no such protection: losetup -f names the target itself
-            # whenever that loop is not currently attached, and the "target is
-            # also a source partition" check downstream then rejects a conflict
-            # that cannot happen for real. Step past whatever the user named.
+            # A real run attaches the source after the target is in use, so
+            # losetup can never hand it the target's own loop. A dry run has no
+            # such protection, and the "target is also a source partition" check
+            # would then reject a conflict that cannot happen: step past it.
             loop_tries=0
             while [[ "$LOOP_DEV" =~ ^/dev/loop[0-9]+$ ]] && \
                   dryrun_loop_clashes "$LOOP_DEV" && [ $loop_tries -lt 64 ]; do
@@ -2495,10 +3103,10 @@ else
             SRC_EFI="${LOOP_DEV}p${n_efi}"
             SRC_ROOT="${LOOP_DEV}p${n_root}"
         else
-            # Read-only: even an ro ext4 mount writes to the device (journal
-            # replay, orphan cleanup), so two instances sharing one image via
-            # separate loop devices would corrupt it. With an ro loop the
-            # kernel refuses all writes and a dirty image fails loudly instead.
+            # Read-only: even an ro ext4 MOUNT writes (journal replay, orphan
+            # cleanup), so two instances sharing one image through separate
+            # loops would corrupt it. An ro loop refuses every write, and a
+            # dirty image then fails loudly instead.
             LOOP_DEV=$(sudo losetup -r -P -f --show "$SOURCE")
             LOOP_ATTACHED=1
             echo "Image mapped to loop device: $LOOP_DEV (read-only)"
@@ -2511,9 +3119,9 @@ else
     fi
 fi
 
-# Does the source keep /boot on its own filesystem, or inside /? --source-boot
-# is the only thing that decides: no partition table is consulted, and the
-# source's own fstab is cross-checked once it is mounted (Phase 3).
+# Does the source keep /boot on its own filesystem? --source-boot alone decides;
+# no partition table is consulted, and the source's fstab cross-checks it once
+# mounted (Phase 3).
 if [ -n "$SRC_BOOT" ]; then SRC_SEP_BOOT=1; else SRC_SEP_BOOT=0; fi
 if [ $SRC_SEP_BOOT -eq 1 ]; then
     echo "Source /boot: separate partition ($SRC_BOOT)"
@@ -2521,11 +3129,10 @@ else
     echo "Source /boot: inside the root filesystem"
 fi
 
-# Old UUIDs from the source (translated into the target's fstab/GRUB later).
+# Old UUIDs from the source, translated into the target's fstab/GRUB later.
 # Without a separate /boot, OLD_UUID_BOOT *is* the root UUID: every consumer
-# wants "the UUID of the filesystem holding /boot", and keeping it non-empty
-# also keeps rewrite_fstab's awk substitutions off an empty regex, which would
-# match at every character position.
+# wants "the UUID of the filesystem holding /boot", and an empty one would make
+# the awk substitutions match at every character position.
 if [ "$DRY_RUN" -eq 1 ]; then
     OLD_UUID_EFI="00000000-0000-0000-0000-000000000001"
     OLD_UUID_ROOT="00000000-0000-0000-0000-000000000003"
@@ -2551,12 +3158,10 @@ if [ $SCATTERED_SOURCE -eq 1 ]; then
     # Each target defaults to its source => in-place unless overridden.
     TGT_EFI="${TGT_EFI:-$SRC_EFI}"
     TGT_ROOT="${TGT_ROOT:-$SRC_ROOT}"
-    # /boot is the one role NOT defaulted from the source. A target that
-    # inherited --source-boot in place would leave the clone's fstab mounting
-    # /boot from the SOURCE machine's disk -- bootable only while that disk is
-    # attached -- so when the source has one, this run has to say what becomes
-    # of it. Neither direction is worth guessing: converting the layout by
-    # accident is how a machine whose BIOS cannot read NVMe stops booting.
+    # /boot is the one role NOT defaulted from the source: inheriting it would
+    # leave the clone mounting /boot from the SOURCE machine's disk. Neither
+    # direction is worth guessing -- converting the layout by accident is how a
+    # machine whose BIOS cannot read NVMe stops booting.
     if [ $SRC_SEP_BOOT -eq 1 ] && [ -z "$TGT_BOOT" ] && [ $NO_TGT_BOOT -eq 0 ]; then
         die "The source keeps /boot on its own filesystem ($SRC_BOOT).
 Say what the target should do with it:
@@ -2564,32 +3169,17 @@ Say what the target should do with it:
   --no-target-boot     fold /boot into the target's root filesystem"
     fi
     echo "Target Mode: Scattered Partitions (per-role migrate / in-place)"
-    if [ -n "$TGT_BIOS" ]; then
-        validate_partition_type "$TGT_BIOS" "$GUID_BIOS" "Target BIOS" || die "Invalid Target BIOS"
-    fi
-    validate_partition_type "$TGT_EFI"  "$GUID_EFI"   "Target EFI"  || die "Invalid Target EFI"
-    if [ -n "$TGT_BOOT" ]; then
-        validate_partition_type "$TGT_BOOT" "$GUID_LINUX" "Target Boot" || die "Invalid Target Boot"
-    fi
-    validate_partition_type "$TGT_ROOT" "$GUID_LINUX" "Target Root" || die "Invalid Target Root"
+    validate_target_roles
 else
-    # Unified/image source => full deploy. The target is a unified device, or
-    # individual --target-* partitions: --target-efi and --target-root are
-    # required, --target-bios-boot and --target-boot optional (no --target-boot
-    # means /boot goes inside /, which is where the source keeps it anyway --
-    # a unified or image source cannot carry --source-boot).
+    # Unified/image source => full deploy, onto a unified device or individual
+    # --target-* partitions (--target-efi and --target-root required, the other
+    # two optional). No --target-boot means /boot inside /, which is where such
+    # a source keeps it anyway.
     if [ -n "$TGT_BIOS" ] || [ -n "$TGT_EFI" ] || [ -n "$TGT_BOOT" ] || [ -n "$TGT_ROOT" ]; then
         [ -n "$TGT_EFI" ]  || die "Scattered target needs --target-efi."
         [ -n "$TGT_ROOT" ] || die "Scattered target needs --target-root."
         echo "Target Mode: Scattered Partitions (full deploy)"
-        if [ -n "$TGT_BIOS" ]; then
-            validate_partition_type "$TGT_BIOS" "$GUID_BIOS" "Target BIOS" || die "Invalid Target BIOS"
-        fi
-        validate_partition_type "$TGT_EFI"  "$GUID_EFI"   "Target EFI"  || die "Invalid Target EFI"
-        if [ -n "$TGT_BOOT" ]; then
-            validate_partition_type "$TGT_BOOT" "$GUID_LINUX" "Target Boot" || die "Invalid Target Boot"
-        fi
-        validate_partition_type "$TGT_ROOT" "$GUID_LINUX" "Target Root" || die "Invalid Target Root"
+        validate_target_roles
     else
         [ -n "$TARGET" ] || die "Specify a unified --target DEV, --target-efi/--target-root partitions, or scattered --source-* for partial migration."
         if [ "$DRY_RUN" -eq 0 ] && [ ! -b "$TARGET" ]; then
@@ -2599,13 +3189,11 @@ else
         echo "Target Mode: Unified Block Device ($TARGET)"
         P=$(partition_prefix "$TARGET")
         if [ $UPDATE -eq 1 ] && [ -b "$TARGET" ]; then
-            # --update keeps the existing layout (we neither repartition nor
-            # format), so discover it rather than impose one -- the ESP and root
-            # may sit at any partition number, and anything else on the disk is
-            # left alone. A /boot partition included: it is never adopted by the
-            # scan, and a unified --target cannot be combined with the
-            # --target-boot that would name it, so a disk with a separate /boot
-            # is synced by naming its partitions individually.
+            # --update keeps the existing layout, so discover it rather than
+            # impose one: the ESP and root may sit at any partition number and
+            # everything else is left alone -- a separate /boot included, which
+            # the scan never adopts, so such a disk is synced by naming its
+            # partitions individually.
             info "Reading the existing layout of $TARGET..."
             scan_disk_roles "$TARGET" TGT
         else
@@ -2619,15 +3207,13 @@ else
 fi
 
 # --target-efi-size only reaches parted, which only runs for a fresh unified
-# --target. Anywhere else the ESP already exists and the value would be silently
-# ignored -- say so instead.
+# --target. Anywhere else the ESP exists already: say so rather than ignore it.
 if [ -n "$TGT_EFI_SIZE" ] && { [ $UNIFIED_TARGET -eq 0 ] || [ $UPDATE -eq 1 ]; }; then
     die "--target-efi-size only applies when partitioning a fresh --target disk (not with --update or individual --target-* partitions)."
 fi
 
 # --keep-efi keeps an ESP that already exists. A fresh unified --target has just
-# been repartitioned, so its ESP is an empty partition with no filesystem on it
-# at all -- keeping that means a target nothing can boot.
+# been repartitioned, so its ESP holds no filesystem to keep.
 if [ $KEEP_EFI -eq 1 ] && [ $UNIFIED_TARGET -eq 1 ] && [ $UPDATE -eq 0 ]; then
     die "--keep-efi needs an ESP that already exists; a fresh --target disk is repartitioned here and its ESP must be formatted.
 Name the partitions instead (--target-efi ... --target-root ...), or add --update to keep the disk's existing filesystems."
@@ -2637,18 +3223,17 @@ fi
 if [ -n "$TGT_BOOT" ]; then TGT_SEP_BOOT=1; else TGT_SEP_BOOT=0; fi
 
 # Per-role migrate (target differs from source) vs in-place (same device).
-# Never feed the empty strings of an absent role to same_dev(): uutils' readlink
-# resolves "" to the working directory, which would compare equal -- which is
-# why MIGRATE_BOOT is only ever computed for a target that has a /boot at all.
+# Never feed an absent role's "" to same_dev(): uutils readlink resolves it to
+# the working directory, and two of those compare equal -- which is why
+# MIGRATE_BOOT is computed only for a target that has a /boot.
 if same_dev "$TGT_ROOT" "$SRC_ROOT"; then MIGRATE_ROOT=0; else MIGRATE_ROOT=1; fi
 
-# The ESP is the one role that is never copied: its whole content -- GRUB's boot
-# directory, the modules, the shared menu -- is produced here, by grub-install
-# and write_esp_menu, on every run. So there is nothing to "migrate", only the
-# question of whether its filesystem is created: FORMAT_EFI. A target ESP that
-# is already the source's stays as it is, and --keep-efi says so explicitly for
-# an ESP that several systems boot from -- reformatting that one would wipe the
-# other systems' menu entries and give the ESP a UUID their fstabs do not name.
+# The ESP is never copied: everything on it -- GRUB's boot directory, the
+# modules, the shared menu -- is produced here on every run. So there is nothing
+# to migrate, only FORMAT_EFI: whether its filesystem is created. One that is
+# already the source's stays as it is, and --keep-efi says so for a shared ESP,
+# where a reformat would wipe the other systems' entries and change the UUID
+# their fstabs name.
 # (--update formats nothing at all, so it settles this the same way --keep-efi
 # does -- and then the entries already on that ESP are worth probing, since the
 # run is going to keep them.)
@@ -2665,11 +3250,10 @@ if [ $TGT_SEP_BOOT -eq 1 ]; then
     if [ $SRC_SEP_BOOT -eq 0 ] || ! same_dev "$TGT_BOOT" "$SRC_BOOT"; then MIGRATE_BOOT=1; fi
 fi
 
-# BOOT_PASS: does the /boot content need a transfer of its own? Only when the
-# source's /boot filesystem is not already the target's -- i.e. both sides keep
-# /boot inside / (the root rsync carries it along), or both use the very same
-# /boot partition. Everything else needs a pass: the two separate partitions
-# differ, or the layout is being converted in one direction or the other.
+# BOOT_PASS: does /boot need a transfer of its own? No only when its filesystem
+# is already the target's -- /boot inside / on both sides (the root rsync
+# carries it), or the same /boot partition on both. A layout conversion in
+# either direction, or two different partitions, needs a pass.
 BOOT_PASS=1
 if [ $SRC_SEP_BOOT -eq 0 ] && [ $TGT_SEP_BOOT -eq 0 ]; then
     BOOT_PASS=0
@@ -2677,11 +3261,10 @@ elif [ $SRC_SEP_BOOT -eq 1 ] && [ $TGT_SEP_BOOT -eq 1 ] && same_dev "$TGT_BOOT" 
     BOOT_PASS=0
 fi
 
-# Bootloader install scope: BIOS only when a BIOS target is given. EFI always --
-# the ESP carries GRUB's boot directory now, and this system's menu entry has to
-# be registered there whatever else the run does, so there is no such thing as a
-# migration that leaves the ESP untouched. (run_chroot_block always runs
-# update-grub + update-initramfs as well.)
+# Bootloader scope: BIOS only when a BIOS target is given; EFI always, since the
+# ESP carries GRUB's boot directory and this system's entry has to be registered
+# there whatever else the run does. (run_chroot_block also always runs
+# update-grub + update-initramfs.)
 if [ -n "$TGT_BIOS" ]; then INSTALL_GRUB_BIOS=1; else INSTALL_GRUB_BIOS=0; fi
 INSTALL_GRUB_EFI=1
 
@@ -2689,18 +3272,15 @@ if [ $FORMAT_EFI -eq 0 ] && [ $BOOT_PASS -eq 0 ] && [ $MIGRATE_ROOT -eq 0 ] && [
     die "Nothing to do: every role resolves in-place and no swap was given."
 fi
 
-# --target-root-label reaches the root filesystem's superblock, written either by
-# the mkfs that creates it or by the e2label that renames one --update keeps. An
-# in-place root is neither: that filesystem is the source's own, mounted here and
-# not otherwise touched, so relabelling it would rename the disk we copy FROM.
-# Refuse rather than ignore it (the --target-efi-size precedent above).
+# An in-place root is the source's own filesystem, so relabelling it would
+# rename the disk being copied FROM. Refuse rather than ignore, as above.
 if [ -n "$TGT_ROOT_LABEL" ] && [ $MIGRATE_ROOT -eq 0 ]; then
     die "--target-root-label needs a root filesystem this run writes, but --target-root ($TGT_ROOT) is the source's own and is left in place."
 fi
 
-# An ESP this run does not format is one it trusts: it must already hold a FAT
-# filesystem, or Phase 3 fails on the mount with the target half-written. Not
-# just under --update -- --keep-efi and an in-place ESP are the same bet.
+# An ESP this run does not format must already hold FAT, or Phase 3 fails on
+# the mount with the target half-written. --keep-efi, --update and an in-place
+# ESP are the same bet.
 if [ $FORMAT_EFI -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
     fstype=$(sudo blkid -c /dev/null -o value -s TYPE "$TGT_EFI" 2>/dev/null || true)
     if [ -z "$fstype" ]; then
@@ -2710,26 +3290,20 @@ if [ $FORMAT_EFI -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
     fi
 fi
 
-# Under --update the target filesystems must already exist and be the right
-# type — we won't mkfs, so catch unformatted or wrong-type partitions now
-# rather than failing with a cryptic mount error later.
+# Under --update nothing is mkfs'd, so catch an unformatted or wrong-type
+# target now rather than at a cryptic mount error later.
 if [ $UPDATE -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
-    for entry in "$TGT_BOOT:Boot:ext4:$MIGRATE_BOOT" \
-                 "$TGT_ROOT:Root:ext4:$MIGRATE_ROOT"; do
-        dev="${entry%%:*}"
-        rest="${entry#*:}"
-        label="${rest%%:*}"
-        rest="${rest#*:}"
-        expected="${rest%%:*}"
-        migrate="${rest##*:}"
-        [ "$migrate" -eq 1 ] || continue
-        fstype=$(sudo blkid -c /dev/null -o value -s TYPE "$dev" 2>/dev/null || true)
-        if [ -z "$fstype" ]; then
-            die "--update: $label target $dev has no recognizable filesystem (unformatted?)."
-        elif [ "$fstype" != "$expected" ]; then
-            die "--update: $label target $dev has filesystem '$fstype', expected '$expected'."
-        fi
-    done
+    check_update_fs() {   # <dev> <label> <migrate-flag>
+        local fstype
+        [ "$3" -eq 1 ] || return 0
+        fstype=$(sudo blkid -c /dev/null -o value -s TYPE "$1" 2>/dev/null || true)
+        [ -n "$fstype" ] || \
+            die "--update: $2 target $1 has no recognizable filesystem (unformatted?)."
+        [ "$fstype" = ext4 ] || \
+            die "--update: $2 target $1 has filesystem '$fstype', expected 'ext4'."
+    }
+    check_update_fs "$TGT_BOOT" Boot "$MIGRATE_BOOT"
+    check_update_fs "$TGT_ROOT" Root "$MIGRATE_ROOT"
 fi
 
 # Disk to install the legacy BIOS bootloader onto. Only meaningful when a BIOS
@@ -2764,11 +3338,10 @@ if [ ${#migrated_targets[@]} -gt 0 ]; then
     done
 fi
 
-# Safety: refuse targets that are in use. Mounting an already-mounted
-# filesystem a second time succeeds (it shares the superblock), so the sync
-# would write into a filesystem in active use — e.g. one auto-mounted by a
-# desktop session when the disk was plugged in. Every target role gets mounted
-# RW (even in-place ones), so all of them must be unmounted first.
+# Safety: refuse targets in use. A second mount of a mounted filesystem
+# succeeds (it shares the superblock), so the sync would write into one in
+# active use -- a disk a desktop session auto-mounted, say. Every target role is
+# mounted RW, in-place ones included, so all must be unmounted first.
 if [ $UNIFIED_TARGET -eq 1 ]; then
     busy_devs=("$TARGET")   # whole disk: lsblk reports every partition's use
 else
@@ -2784,9 +3357,9 @@ done
 
 # ---- Cross-instance locks: exclusive on written disks, shared on read ones ----
 # ALL target roles are registered, in-place ones included: update-grub and
-# update-initramfs write into the mounted /boot even when a role is not
-# migrated. A unified fresh target is keyed on the disk itself (its partitions
-# may not exist yet). An image source is keyed on the image file.
+# update-initramfs write into the mounted /boot either way. A fresh unified
+# target is keyed on the disk (its partitions may not exist yet), an image
+# source on the file.
 add_lock "$SRC_EFI"  sh
 add_lock "$SRC_BOOT" sh
 add_lock "$SRC_ROOT" sh
@@ -2807,13 +3380,11 @@ else
 fi
 
 # ---- GRUB menu brand ----
-# Disk whose model brands the GRUB menu = where the rootfs (the OS) lives.
-# --brand always wins. Under --update the brand already stamped into the
-# target's /etc/default/grub is kept (probed now, so the summary can show it),
-# so a brand chosen at install time survives every subsequent sync. Only
-# otherwise is the model probed from the disk — which can be a card reader's
-# name rather than the medium's, hence --brand. Resolved after the locks: the
-# probe mounts the target root, which must not race a concurrent mkfs.
+# The menu is branded after the disk the rootfs lives on. --brand wins; failing
+# that, --update keeps the brand already in the target's /etc/default/grub, so
+# one chosen at install time survives every sync; failing that, the disk's model
+# -- which can be a card reader's name, hence --brand. After the locks: the
+# probe mounts the target root and must not race a concurrent mkfs.
 if [ $UNIFIED_TARGET -eq 1 ]; then
     BRAND_DISK="$TARGET"
 else
@@ -2824,9 +3395,8 @@ if [ -n "$BRAND" ]; then
     TGT_MODEL="$BRAND"
     BRAND_ORIGIN="--brand override"
 elif [ $UPDATE -eq 1 ]; then
-    # Often the run's first real media access (earlier blkid probes are usually
-    # answered from the page cache), so a spun-down or slow target disk makes
-    # this pause noticeably — say what we are waiting for.
+    # Often the first real media access (blkid is answered from cache), so a
+    # spun-down disk pauses here -- say what we are waiting for.
     info "Reading current GRUB brand off $TGT_ROOT (may need to spin the disk up)..."
     probe_target_brand
     BRAND_ORIGIN="kept from target's GRUB_DISTRIBUTOR"
@@ -2838,25 +3408,32 @@ if [ -z "$TGT_MODEL" ]; then
 fi
 
 # ---- Summary + single confirmation gate (before anything destructive) ----
-# Read the source's fstab first: a swap file listed there is re-created on the
-# target, and the summary should say so rather than report "swap: none". Only
-# when the root filesystem is actually transferred, though -- rebuild_swapfiles()
-# runs with the root rsync, so an in-place root touches no swap file at all.
+# The source's fstab first: it names the swap files, the caches and the mounts
+# to resolve, none of which the summary can guess. Only when the root filesystem
+# is really transferred -- an in-place root touches no swap file at all.
 if [ $MIGRATE_ROOT -eq 1 ]; then probe_source_swapfiles; fi
-# ...then the boot options for the menu entry, if that probe did not already
-# have the source mounted, and the systems already registered on the ESP (which
-# a run that formats it cannot keep, so there is nothing to read).
+# ...then the boot options, if that probe did not already have the source
+# mounted, and the systems on the ESP (nothing to read if it is reformatted).
 probe_menu_cmdline
 if [ $FORMAT_EFI -eq 0 ]; then probe_esp_menu; fi
-# The root filesystem the target partition holds *now*: the system this slot
-# used to boot. It is this system when the filesystem is kept (--update or an
-# in-place root) and a stranger when it is about to be reformatted -- in which
-# case write_esp_menu() retires its menu entry along with it, rather than leave
-# the menu advertising a UUID that no longer exists.
+# What the target partition holds NOW: this system when the filesystem is kept,
+# a stranger when it is about to be reformatted -- in which case
+# write_esp_menu() retires its menu entry with it rather than advertise a UUID
+# that no longer exists.
 TGT_ROOT_UUID_NOW=$(sudo blkid -c /dev/null -s UUID -o value "$TGT_ROOT" 2>/dev/null || true)
 # ...and the label it wears now, so the summary can say what --target-root-label
 # changes it FROM, and so an e2label that would change nothing is skipped.
 TGT_ROOT_LABEL_NOW=$(sudo blkid -c /dev/null -s LABEL -o value "$TGT_ROOT" 2>/dev/null || true)
+
+# Everything is known, so put the mounts that would otherwise be commented out
+# to the operator: before the summary, which shows the answers, and before the
+# gate, which approves them with the rest of the run.
+ask_fstab_remap
+for remap_mp in "${!REMAP_ARG[@]}"; do
+    if [ "$REMAP_PROBED" -eq 1 ] && [ -z "${REMAP_STATE[$remap_mp]:-}" ]; then
+        echo "Warning: --remap $remap_mp names a mount point the source's fstab does not carry (or one it already resolves) -- nothing to do for it." >&2
+    fi
+done
 
 echo
 echo "About to install:"
@@ -2898,12 +3475,16 @@ for swap_entry in "${SWAP_PREVIEW[@]}"; do
     if [ "$swap_bytes" = "?" ]; then swap_size="size unknown"; else swap_size=$(human_size "$swap_bytes"); fi
     swap_label
     case $swap_state in
-        # On a filesystem of its own: not in the transfer, so this run neither
-        # copies nor re-creates it. Said out loud because the fstab entry that
-        # names it may still be disabled in Phase 4 along with its carrier, and
-        # a swapless boot is worth knowing about before the gate rather than after.
+        # On a filesystem of its own: neither copied nor re-created. Said out
+        # loud because its fstab entry may still go in Phase 4 with its carrier,
+        # and a swapless boot is worth knowing about before the gate.
         offroot) echo "LEAVE     file $swap_path is on $swap_real, a filesystem of its own -- not in the transfer" ;;
         drop)    echo "DROP      file $swap_path (excluded by $EXCLUDE_FROM; its fstab entry is disabled)" ;;
+        # The carrier was resolved at the gate, so the file is this run's
+        # business after all (see the fstab: block below).
+        remapkeep) echo "present   file $swap_path is already on $swap_real ($swap_size; nothing to do)" ;;
+        remapmake) echo "CREATE    file $swap_path on $swap_real ($swap_size, fallocate + mkswap)" ;;
+        remapnone) echo "MISSING   file $swap_path is not created on $swap_real -- swapon -a will fail on the target (the fstab: block below says why)" ;;
         *)       if [ "$swap_real" != "$swap_path" ]; then
                      echo "re-create file $swap_path, which the transfer carries at $swap_real ($swap_size, never copied)"
                  else
@@ -2920,10 +3501,45 @@ if [ "$swap_shown" -eq 0 ]; then
         summary_row "swap:" "none given (the source's fstab could not be read here to check for a swap file)"
     fi
 fi
-# Cache: the regenerable browser caches dropped from this transfer -- and from
-# the target, since the rule that drops them is sender-side only. Named in full,
-# because what the transfer sees is a path in the source's ROOT filesystem, not
-# the ~/.cache a running system shows when that is a bind mount.
+# fstab: the mounts resolved at install time instead of being left commented out
+# -- the carrier, what comes back with it, and what reading the chosen
+# filesystem found. A mount left alone says why: "nothing was asked" and
+# "nothing to ask about" must not look the same.
+if [ $MIGRATE_ROOT -eq 1 ]; then
+    if [ "$REMAP_PROBED" -eq 0 ]; then
+        summary_row "fstab:" "not checked (the source's fstab could not be read here to look for mounts it cannot resolve)"
+        if [ ${#REMAP_ARG[@]} -gt 0 ]; then
+            summary_row "" "so --remap is not shown above either; a real run reads the fstab and applies it"
+        fi
+    elif [ ${#REMAP_MPS[@]} -gt 0 ]; then
+        remap_shown=0
+        for remap_mp in "${REMAP_MPS[@]}"; do
+            if [ $remap_shown -eq 0 ]; then remap_shown=1; remap_lbl="fstab:"; else remap_lbl=""; fi
+            remap_with=$(remap_dependants_list "$remap_mp")
+            if [ -n "${REMAP_SPEC[$remap_mp]:-}" ]; then
+                if [ "${REMAP_STATE[$remap_mp]}" = live ]; then
+                    remap_verb="RETARGET"; remap_kept="kept with it"
+                else
+                    remap_verb="ENABLE  "; remap_kept="live again with it"
+                fi
+                summary_row "$remap_lbl" "$remap_verb  $remap_mp -> ${REMAP_DEV[$remap_mp]:-${REMAP_SPEC[$remap_mp]}}"
+                summary_row "" "  written as ${REMAP_SPEC[$remap_mp]}"
+                [ -z "$remap_with" ] || summary_row "" "  $remap_kept: $remap_with"
+            elif [ "${REMAP_STATE[$remap_mp]}" = live ]; then
+                summary_row "$remap_lbl" "DISABLE   $remap_mp is commented out on the target${remap_with:+, along with $remap_with}"
+            else
+                summary_row "$remap_lbl" "leave     $remap_mp commented out${remap_with:+, along with $remap_with}"
+            fi
+            while read -r remap_note_line; do
+                [ -n "$remap_note_line" ] || continue
+                summary_row "" "  $remap_note_line"
+            done <<<"${REMAP_NOTES[$remap_mp]:-}"
+        done
+    fi
+fi
+# Cache: the browser caches dropped from the transfer -- and from the target,
+# the rule being sender-side only. Named in full, because the transfer sees a
+# path in the source's ROOT filesystem, not the ~/.cache a running system shows.
 if [ $MIGRATE_ROOT -eq 1 ]; then
     if [ $KEEP_CACHE -eq 1 ]; then
         summary_row "Cache:" "kept (--keep-cache): browser caches are copied like anything else"
@@ -2941,13 +3557,12 @@ if [ $MIGRATE_ROOT -eq 1 ]; then
     fi
 fi
 echo "  Menu:     GRUB title branded \"$TGT_MODEL\" ($BRAND_ORIGIN)"
-# The entry this run registers in the menu on the ESP, the systems already
-# registered there that it will keep, and the command line it will boot with --
-# the three things a shared-ESP disk must not be guessed about.
+# The entry this run registers, the systems already there that it keeps, and the
+# command line it will boot: the three things a shared ESP must not be guessed at.
 summary_row "" "entry \"GUI $TGT_MODEL\" / \"TTY $TGT_MODEL\" in the ESP menu"
 summary_row "" "boots $(esp_cmdline_from "${MENU_CMDLINE_PREVIEW:-<options from /etc/default/grub, read at install time>}")"
-# The memory tester belongs to the disk rather than to this rootfs, so what the
-# run does with it depends on the source AND on what the ESP already carries.
+# The tester belongs to the disk, not this rootfs, so what happens to it depends
+# on the source AND on what the ESP already carries.
 if [ "$MEMTEST_PROBED" -eq 0 ]; then
     summary_row "" "memtest: not checked (no root could be read here to look for /boot/$MEMTEST_IMAGE)"
 elif [ "$MEMTEST_OFF" -eq 1 ] && [ "$ESP_MEMTEST" -eq 1 ]; then
@@ -3005,8 +3620,8 @@ if [ -n "$TGT_ROOT_LABEL" ]; then
     else
         summary_row "Label:" "relabel the root filesystem \"${TGT_ROOT_LABEL_NOW:-<none>}\" -> \"$ROOT_LABEL\" (e2label; --update keeps the filesystem)"
     fi
-    # The one consequence a reader must not have to work out for themselves: this
-    # rootfs has just left the set a whole-disk scan can resolve.
+    # The consequence a reader must not have to work out: this rootfs has left
+    # the set a whole-disk scan can resolve.
     [ "$ROOT_LABEL" = root ] || summary_row "" \
         "not \"root\", so a whole-disk --source/--target will no longer find it: name this partition with --source-root/--target-root"
 fi
@@ -3040,23 +3655,20 @@ if [ $UNIFIED_TARGET -eq 1 ] && [ $UPDATE -eq 0 ]; then
     ESP_END=$(( 2 + ESP_MIB ))   # the ESP starts at 2 MiB, after the BIOS Boot
     run sudo parted -s "$TARGET" mkpart primary fat32 2MiB "${ESP_END}MiB"
     run sudo parted -s "$TARGET" set 2 esp on
-    # No /boot partition: root and a /boot are formatted with the same ext4
-    # feature set and GRUB reads both, so one would buy nothing on a disk that
-    # boots its own root. A target that needs a separate /boot -- because the
-    # BIOS cannot reach the disk holding / at all -- names existing partitions
-    # (--target-boot) instead of having this layout imposed on it.
+    # No /boot partition: root and a /boot get the same ext4 feature set and
+    # GRUB reads both, so one buys nothing on a disk that boots its own root.
+    # A target that needs one names existing partitions (--target-boot).
     run sudo parted -s "$TARGET" mkpart primary ext4 "${ESP_END}MiB" 100%
-    # Wait for OUR partition nodes rather than the global udev queue, which a
-    # concurrent instance can keep busy past the settle timeout.
+    # Wait for OUR nodes, not the global udev queue a concurrent instance can
+    # keep busy past the settle timeout.
     run sudo udevadm wait --timeout=30 "$TGT_BIOS" "$TGT_EFI" "$TGT_ROOT"
 fi
 
 # ---- Format the migrated roles ----
-# Skipped under --update, which keeps each target filesystem intact and only
-# rsyncs --delete onto it -- all but the root filesystem's LABEL, the one piece of
-# metadata --target-root-label still stamps on a filesystem that is kept.
-# (--target-swap reformatting is independent: it is an explicit opt-in and still
-# honoured below.)
+# Skipped under --update, which keeps each filesystem and rsyncs --delete onto
+# it -- all but the root LABEL, the one piece of metadata --target-root-label
+# still stamps on a kept filesystem. (--target-swap is an explicit opt-in and is
+# still honoured below.)
 if [ $UPDATE -eq 0 ]; then
     if [ $FORMAT_EFI -eq 1 ]; then
         run sudo wipefs -q -a "$TGT_EFI"
@@ -3064,24 +3676,23 @@ if [ $UPDATE -eq 0 ]; then
     fi
     if [ $MIGRATE_BOOT -eq 1 ]; then
         run sudo wipefs -q -a "$TGT_BOOT"
-        # A /boot holds a few dozen large files, so its inode table wants to be
-        # dense (-i 32768) where the rootfs wants the opposite. sparse_super2 for
-        # the same reason the rootfs has it: GRUB's own drivers must read this.
+        # A /boot holds a few dozen large files, so its inode table wants to
+        # be dense (-i 32768) where the rootfs wants the opposite;
+        # sparse_super2 because GRUB's own drivers must read it.
         run sudo mkfs.ext4 -vF -L boot -i 32768 -m 0 -E lazy_itable_init=0,lazy_journal_init=0 -O sparse_super2 "$TGT_BOOT"
     fi
     if [ $MIGRATE_ROOT -eq 1 ]; then
         run sudo wipefs -q -a "$TGT_ROOT"
 
         if [ -n "$INODES_ROOT" ]; then
-            # Pinned by the caller: no probing, and no minimum imposed either --
-            # an explicit count is taken at face value.
+            # Pinned by the caller: taken at face value, no floor imposed.
             TARGET_INODES="$INODES_ROOT"
             info "Root inode count pinned by --inodes-root: $TARGET_INODES"
         else
             TGT_BYTES=$(lsblk -dbno SIZE "$TGT_ROOT" 2>/dev/null) || TGT_BYTES=""
             if [ -z "$TGT_BYTES" ]; then
-                # Only dry-run may proceed without a size (the partition node may
-                # not exist yet); a real run must not fabricate the inode count.
+                # Only a dry run may proceed without a size (the node may not
+                # exist yet); a real run must not fabricate an inode count.
                 [ "$DRY_RUN" -eq 1 ] || die "Cannot determine size of $TGT_ROOT"
                 TGT_BYTES=$((16 * 1024**3))
             fi
@@ -3094,10 +3705,9 @@ if [ $UPDATE -eq 0 ]; then
         run sudo mkfs.ext4 -vF -m 0 -L "$ROOT_LABEL" -N "$TARGET_INODES" -E lazy_itable_init=0,lazy_journal_init=0 -O sparse_super2 "$TGT_ROOT"
     fi
 elif [ -n "$TGT_ROOT_LABEL" ] && [ "$TGT_ROOT_LABEL_NOW" != "$ROOT_LABEL" ]; then
-    # No mkfs runs under --update, so this is where a kept root filesystem gets
-    # the label it was asked for. Here rather than in Phase 3 because the
-    # partition is not mounted yet; and e2label leaves the UUID alone, so fstab,
-    # the ESP menu and everything verified afterwards are untouched by it.
+    # No mkfs under --update, so this is where a kept root filesystem gets its
+    # label. Here rather than Phase 3 because the partition is not mounted yet;
+    # e2label leaves the UUID alone, so nothing verified later is affected.
     info "Relabelling $TGT_ROOT: \"${TGT_ROOT_LABEL_NOW:-<none>}\" -> \"$ROOT_LABEL\""
     run sudo e2label "$TGT_ROOT" "$ROOT_LABEL"
 fi
@@ -3107,10 +3717,9 @@ if [ "$DO_MKSWAP" -eq 1 ]; then
 fi
 
 # ---- New UUIDs: fresh for migrated roles, unchanged for in-place ----
-# NEW_UUID_BOOT is "the UUID of the filesystem that holds /boot", so without a
-# separate /boot partition it is the root UUID -- which is exactly what the menu
-# entry on the ESP must search for to find the kernel, and what update-grub puts
-# in the search line of the rootfs menu it regenerates.
+# NEW_UUID_BOOT is "the UUID of the filesystem holding /boot", so without a
+# separate partition it is the root UUID -- exactly what the ESP menu entry must
+# search for to find the kernel.
 if [ "$DRY_RUN" -eq 0 ]; then
     NEW_UUID_EFI=$(blkid_uuid "$TGT_EFI")
     if [ $MIGRATE_ROOT -eq 1 ]; then NEW_UUID_ROOT=$(blkid_uuid "$TGT_ROOT"); else NEW_UUID_ROOT="$OLD_UUID_ROOT"; fi
@@ -3131,15 +3740,15 @@ echo "=========================================="
 echo " Phase 3: Mounting & Data Synchronization "
 echo "=========================================="
 if [ "$DRY_RUN" -eq 0 ]; then
-    # Refuse to stack over an existing mount — a leftover tree from a crashed
-    # run (or a busy --mnt/--src dir) must be cleaned up, not silently shadowed.
+    # Refuse to stack over an existing mount: a leftover tree from a crashed
+    # run must be cleaned up, not silently shadowed.
     if findmnt -n "$MNT" >/dev/null 2>&1; then die "$MNT is already a mountpoint."; fi
     if findmnt -n "$SRC" >/dev/null 2>&1; then die "$SRC is already a mountpoint."; fi
 fi
 
 # Every command below goes through run(), so a dry run prints the exact mount
-# and rsync command lines rather than a summary of them: the rsync option set is
-# the thing worth reviewing before committing to a multi-hour transfer.
+# and rsync command lines: the assembled option set is the thing worth reviewing
+# before a multi-hour transfer.
 
 # Mount the target tree (the partitions the installed system will use).
 run sudo mkdir -p "$MNT"
@@ -3147,9 +3756,9 @@ run sudo mkdir -p "$MNT"
 # must not go unmounting $MNT/$SRC afterwards.
 if [ "$DRY_RUN" -eq 0 ]; then MOUNTS_DONE=1; fi
 run sudo mount "$TGT_ROOT" "$MNT"
-# Without a separate /boot partition, $MNT/boot is simply a directory on the
-# root filesystem -- but $MNT/boot/efi has to be created on whichever of the two
-# filesystems ends up carrying it, so the /boot mount goes between the mkdirs.
+# Without a separate /boot, $MNT/boot is just a directory -- but $MNT/boot/efi
+# must be created on whichever filesystem ends up carrying it, so the /boot
+# mount goes between the two mkdirs.
 run sudo mkdir -p "$MNT/boot"
 if [ $TGT_SEP_BOOT -eq 1 ]; then
     run sudo mount "$TGT_BOOT" "$MNT/boot"
@@ -3164,13 +3773,12 @@ run sudo mount -r -o noatime "$SRC_ROOT" "$SRC" || \
     die "Cannot mount source root $SRC_ROOT read-only. A dirty (uncleanly unmounted) image cannot replay its journal on a read-only loop -- run e2fsck on it once and retry."
 
 # Cross-check the source's real layout against --source-boot before anything is
-# copied. Its own fstab is the authority, whatever the partition tables look
-# like, and getting this wrong in either direction transfers nothing useful: an
-# unnamed separate /boot means the root rsync copies an empty mount point and the
-# target ends up with no kernel, while a --source-boot the source does not
-# actually use would be mounted over the real /boot and ship an empty one. The
-# fstab lives on the root filesystem, so this runs before $SRC_BOOT is mounted --
-# and only a real run has a mounted source to read it from.
+# copied; its own fstab is the authority, whatever the partition table says.
+# Wrong in either direction transfers nothing useful: an unnamed separate /boot
+# leaves the target with no kernel, and a --source-boot the source does not use
+# would be mounted over the real /boot and ship an empty one. The fstab is on
+# the root filesystem, so this runs before $SRC_BOOT is mounted -- and only a
+# real run has a mounted source to read.
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "[dry-run] the source is not mounted, so its fstab cannot be read here: a real run also checks that it does (or does not) mount /boot, matching --source-boot"
 elif fstab_mounts_boot "$SRC/etc/fstab"; then
@@ -3185,46 +3793,29 @@ would hide the real /boot and copy an empty one. Drop --source-boot."
 fi
 
 # The layout is agreed, so complete the source tree: without this, /boot under
-# $SRC is the bare mount point directory of the source root. Only the /boot pass
-# needs it now -- the ESP is generated on the target, never read from the source.
+# $SRC is the bare mount point of the source root. Only the /boot pass needs it
+# -- the ESP is generated on the target, never read from the source -- and an
+# in-place /boot never gets a pass, so this is always a real read-only mount.
 if [ $SRC_SEP_BOOT -eq 1 ] && [ $BOOT_PASS -eq 1 ]; then
-    if [ $BOOT_PASS -eq 0 ]; then
-        # In-place /boot: this very filesystem is already mounted read-write
-        # at $MNT/boot, so a second, read-only mount of it is at best redundant
-        # and at worst refused outright (one superblock cannot be both). Bind
-        # the mount we already have -- the same filesystem by definition, and
-        # all that is wanted from it here is the /boot/efi mount point.
-        run sudo mount --bind "$MNT/boot" "$SRC/boot"
-    else
-        run sudo mount -r -o noatime "$SRC_BOOT" "$SRC/boot" || \
-            die "Cannot mount source /boot $SRC_BOOT read-only (dirty journal? run e2fsck on it once and retry)."
-    fi
+    run sudo mount -r -o noatime "$SRC_BOOT" "$SRC/boot" || \
+        die "Cannot mount source /boot $SRC_BOOT read-only (dirty journal? run e2fsck on it once and retry)."
 fi
 
 # Base rsync options.
-#   --delete (mirror the source, removing stale target files) is added only
-#     under --update, where we refresh an existing clone in place; a plain
-#     migrate writes onto a freshly-formatted target, so nothing to delete.
-#   --exclude-from (e.g. an impersonal clone) applies to every transfer; its
-#     paths are anchored to each transfer root, so the personal "/..." paths
-#     in the file only match during the root rsync.
-#   --delete-excluded is added when both apply, so a re-sync also PURGES any
-#     excluded paths already on the target — rsync otherwise protects
-#     excluded files from --delete, which would leave personal data behind.
-#   --inplace rewrites changed files in place instead of building a hidden
-#     temp copy and renaming: a changed 50 GB VM image would otherwise need
-#     an extra 50 GB free on the target mid-transfer. The trade-off is that
-#     an interrupted transfer leaves such a file half-updated; the next
-#     --update run repairs it.
-#   --verbose (show the files as they are rsync'ed)
-#   -S is deliberately NOT here; see --sparse, which adds it back. Every hole
-#     rsync punches is one more entry in the file's ext4 extent tree, and a
-#     large VM image is perforated by thousands of tiny ones: measured on a
-#     51.8 GiB .vdi, 12,309 holes (82% of them <= 64 KiB) bought back 1.01 GiB
-#     -- 2% of the file -- for ~11,900 extra extents, which pushed the tree from
-#     one level to two and made every fsck.ext4 -f offer to optimize it. Writing
-#     the nulls out costs a couple of percent more I/O and reads back faster.
-#     (Combining -S with --inplace needs rsync >= 3.1.3.)
+#   --inplace rewrites changed files in place instead of building a temp copy
+#     and renaming: a changed 50 GB VM image would otherwise need 50 GB free
+#     mid-transfer. An interrupted transfer leaves such a file half-updated;
+#     the next --update repairs it. (-S with --inplace needs rsync >= 3.1.3.)
+#   --delete only under --update, which refreshes an existing clone; a plain
+#     migrate writes onto a freshly-formatted target.
+#   --exclude-from applies to every transfer, anchored to each transfer root,
+#     so the personal "/..." paths only match during the root rsync;
+#     --delete-excluded joins it under --update so those paths are PURGED from
+#     the target rather than protected from --delete.
+#   -S is deliberately absent -- see --sparse. Every hole costs an ext4 extent:
+#     one 51.8 GiB .vdi measured here bought back 1.01 GiB (2%) for ~11,900
+#     extents, deepening the tree by a level. Writing the nulls out costs a few
+#     percent more I/O and reads back faster.
 RSYNC_OPTS=(-ahHAX --inplace --numeric-ids -x --verbose)
 if [ $SPARSE -eq 1 ]; then RSYNC_OPTS+=(-S); fi
 if [ $UPDATE -eq 1 ]; then
@@ -3234,26 +3825,20 @@ fi
 if [ -n "$EXCLUDE_FROM" ]; then RSYNC_OPTS+=(--exclude-from="$EXCLUDE_FROM"); fi
 
 # Keep the root transfer off /boot whenever /boot is a filesystem of its own on
-# either side -- whether it gets a pass below (BOOT_PASS) or is left alone
-# in place (TGT_SEP_BOOT with the same partition on both sides). Two rules, not
-# one: "- /boot/" hides it from the sender, and the explicit receiver-side
-# "P /boot/" is what stops --delete from emptying the target's /boot. A plain
-# exclude would not do -- --delete-excluded (added when --update and
-# --exclude-from are combined) demotes unqualified rules to sender-side only.
-# With /boot inside / on both sides there is nothing to keep out: it is an
-# ordinary directory that rides along with the root transfer.
+# either side -- one that gets a pass below, or an in-place one. Two rules, not
+# one: "- /boot/" hides it from the sender, and the receiver-side "P /boot/" is
+# what stops --delete emptying the target's /boot (a plain exclude would not:
+# --delete-excluded demotes unqualified rules to sender-side only). With /boot
+# inside / on both sides it simply rides along with the root transfer.
 BOOT_FILTERS=()
 if [ $TGT_SEP_BOOT -eq 1 ] || [ $BOOT_PASS -eq 1 ]; then
     BOOT_FILTERS=(--filter='- /boot/' --filter='P /boot/')
 fi
 
 if [ $MIGRATE_ROOT -eq 1 ]; then
-    # Swap files are never transferred (gigabytes of zeros, and under --sparse
-    # rsync would punch them full of holes); they are re-created afterwards.
-    # A dry run mounts nothing here, but the pre-confirmation probe did, off a
-    # transient read-only mount -- so both the swap paths and the caches are
-    # already known and the printed command can carry their real arguments
-    # rather than a note about what is missing from it.
+    # Swap files are never transferred, only re-created afterwards. A dry run
+    # mounts nothing here, but the pre-gate probe did, so the printed command
+    # still carries the real swap and cache arguments.
     if [ "$DRY_RUN" -eq 0 ]; then
         scan_swapfiles
         scan_cache_drops
@@ -3262,20 +3847,20 @@ if [ $MIGRATE_ROOT -eq 1 ]; then
         cache_filters_from_preview
     fi
     echo "Rsyncing root filesystem..."
-    # $MNT/boot/efi is the target's mounted ESP, which the EFI pass below owns:
-    # -x keeps the sender out of it and, just as importantly, stops --delete
-    # recursing into it on the receiving side. BOOT_FILTERS does the same for
-    # /boot when that is a filesystem of its own rather than a directory here.
-    # CACHE_FILTERS come first: rule order decides, and a cache dropped by
-    # default should stay dropped even if an --exclude-from file happens to
-    # carry a "+" line that would otherwise re-include it. --keep-cache is the
-    # one way to keep them, and it empties this array.
+    # -x keeps the sender out of the target's mounted ESP at $MNT/boot/efi and
+    # stops --delete recursing into it; BOOT_FILTERS does the same for a /boot
+    # that is a filesystem of its own. CACHE_FILTERS come FIRST: rule order
+    # decides, and a "+" line in an --exclude-from file must not re-include a
+    # cache. --keep-cache is the one way to keep them, and it empties the array.
     run sudo rsync "${CACHE_FILTERS[@]}" "${RSYNC_OPTS[@]}" "${BOOT_FILTERS[@]}" \
         --exclude={"/dev/*","/proc/*","/sys/*","/tmp/*","/run/*","/media/*","/mnt/*","/lost+found"} \
         "${SWAP_EXCLUDES[@]}" \
         "$SRC/" "$MNT/"
     # Reads the sizes/labels of files under $SRC, so likewise real runs only.
     if [ "$DRY_RUN" -eq 0 ]; then rebuild_swapfiles; fi
+    # ...and the swap files belonging on a filesystem resolved at the gate,
+    # whose sizes the probe already read -- so this runs in a dry run too.
+    create_remap_swapfiles
 fi
 if [ $BOOT_PASS -eq 1 ]; then
     # The source side is a mount of its own /boot partition (made above), or --
@@ -3287,18 +3872,22 @@ if [ $BOOT_PASS -eq 1 ]; then
     run sudo rsync "${RSYNC_OPTS[@]}" --filter='- /efi/' --filter='P /efi/' \
         "$SRC/boot/" "$MNT/boot/"
 fi
-# No EFI pass: the ESP is not copied. Everything on it -- GRUB's boot directory,
-# the modules, the shared menu -- is written by Phase 5 (grub-install) and
-# write_esp_menu, from this system's own GRUB. Copying the source's ESP instead
-# would drag over its master menu, whose entries name the source disk's root
-# filesystems, and on a shared ESP would bury the entries of the other systems
-# that boot from it.
+# No EFI pass: the ESP is not copied. Everything on it is written by Phase 5 and
+# write_esp_menu, from this system's own GRUB. Copying the source's would drag
+# over its master menu, whose entries name the SOURCE disk's root filesystems,
+# burying the entries of the other systems that boot from a shared ESP.
 
 echo "=========================================="
 echo " Phase 4: Filesystem Translation (UUIDs)  "
 echo "=========================================="
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "[dry-run] would rewrite fstab + GRUB root UUID and (re)brand the GRUB menu as \"$TGT_MODEL\""
+    for remap_mp in "${!REMAP_SPEC[@]}"; do
+        echo "[dry-run] would point $remap_mp at ${REMAP_SPEC[$remap_mp]} in the target's fstab"
+    done
+    if [ ${#REMAP_ENABLE[@]} -gt 0 ]; then
+        echo "[dry-run] would bring ${#REMAP_ENABLE[@]} commented-out fstab line(s) back to life: ${REMAP_ENABLE[*]}"
+    fi
     echo "[dry-run] cannot list the fstab entries it would disable: that needs the target's own fstab, which is only readable once mounted"
 else
     # rewrite_fstab also retargets (or, if absent, appends) the swap entry to
@@ -3319,9 +3908,8 @@ echo "=========================================="
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "[dry-run] would chroot: grub-install --boot-directory=/boot/efi/boot (bios=$INSTALL_GRUB_BIOS efi=$INSTALL_GRUB_EFI), update-grub + update-initramfs"
 else
-    # os-prober is inert on GRUB >= 2.06 unless explicitly enabled. If the
-    # target enables it, concurrent update-grubs probe each other's in-flight
-    # disks and can cross-pollute the generated menus.
+    # os-prober is inert on GRUB >= 2.06 unless enabled. Where the target
+    # enables it, concurrent update-grubs probe each other's in-flight disks.
     if grep -qs '^[[:space:]]*GRUB_DISABLE_OS_PROBER=false' \
             "$MNT/etc/default/grub" "$MNT"/etc/default/grub.d/*.cfg; then
         echo "Warning: os-prober is enabled in the target's GRUB config; avoid concurrent installs (menus may pick up each other's disks)." >&2
@@ -3344,31 +3932,22 @@ fi
 echo "=========================================="
 echo " Phase 7: Teardown & Cleanup              "
 echo "=========================================="
-# Discard unused blocks on the filesystems we wrote: keeps flash media fast and
-# lets a loop-attached .img target shrink, since the loop driver turns discards
-# into FALLOC_FL_PUNCH_HOLE on the backing file (which is why a fallocate'd image
-# only becomes sparse if this runs). Skipped when the medium cannot discard
-# (spinning disks), so a dry run only shows trims that would actually happen; a
-# failure on discard-capable media is reported but never aborts the teardown.
-# --no-trim suppresses it outright, for a medium where the trim is slow, pointless
-# or unwanted (e.g. a target whose free space should stay written).
+# Discard unused blocks: keeps flash fast and lets a loop-attached .img shrink
+# (the loop driver turns discards into hole punches on the backing file, which
+# is why a fallocate'd image only becomes sparse if this runs). Skipped where
+# the medium cannot discard, and --no-trim suppresses it outright.
 #
-# The ext4 roles are trimmed only under --update. Without it they were just
-# mkfs.ext4'd, and mke2fs discards the whole partition at format time (its
-# "discard" extended option is the default); the rsync that follows only ever
-# allocates blocks, so no block transitions back to free and the closing fstrim
-# would merely re-discard ranges the mkfs already discarded. Under --update the
-# existing filesystem is kept and rsync --delete really does free blocks, so the
-# trim is the only thing that reclaims them. The ESP is the exception in the
-# other direction: mkfs.fat has no discard of its own, so a freshly formatted
-# 256 MiB ESP holding a few MiB of bootloader is only ever released here -- which
-# on a loop-backed .img is the difference between a sparse and a solid ESP.
+# The ext4 roles are trimmed only under --update: otherwise they were just
+# mkfs.ext4'd, which discards the whole partition (its "discard" option is the
+# default), and the rsync that follows only allocates -- nothing returns to
+# free. Under --update, rsync --delete really does free blocks and this is the
+# only thing reclaiming them. The ESP is the exception in the other direction:
+# mkfs.fat has no discard, so a fresh ESP is released only here.
 if [ $NO_TRIM -eq 1 ]; then
     echo "Skipping fstrim on the written filesystems (--no-trim)."
 else
-    # The ESP is trimmed on every run, not just a formatting one: mkfs.fat has no
-    # discard of its own, and a kept ESP has just had its menu and modules
-    # rewritten, so blocks come free either way.
+    # Every run, not just a formatting one: a kept ESP has just had its menu
+    # and modules rewritten, so blocks come free either way.
     if supports_discard "$TGT_EFI"; then run sudo fstrim -v "$MNT/boot/efi" || true; fi
     if [ $UPDATE -eq 1 ]; then
         if [ $MIGRATE_ROOT -eq 1 ] && supports_discard "$TGT_ROOT"; then run sudo fstrim -v "$MNT" || true; fi
@@ -3386,13 +3965,10 @@ if [ "$DRY_RUN" -eq 0 ]; then
 fi
 cleanup   # also runs from the EXIT trap on any earlier failure
 
-# GRUB reads two filesystems at boot: the ESP, for the menu and the modules
-# under its boot directory, and then whichever filesystem holds /boot, for the
-# kernel the menu points at -- the root filesystem on a disk that keeps /boot
-# inside / (which is why the rootfs is formatted with nothing GRUB cannot
-# parse), or the /boot partition on one that has its own. Ask GRUB's own drivers,
-# now that both are unmounted and consistent -- advisory, since a failure here
-# means the disk will not boot but nothing on it is wrong to fix.
+# GRUB reads two filesystems at boot: the ESP, for the menu and its modules, and
+# whichever holds /boot, for the kernel. Ask GRUB's own drivers now that both
+# are unmounted and consistent. Advisory: a failure means the disk will not
+# boot, but nothing on it is wrong to fix.
 if [ "$DRY_RUN" -eq 0 ] && command -v grub-fstest >/dev/null 2>&1; then
     if sudo grub-fstest "$TGT_EFI" ls /boot/grub/grub.cfg >/dev/null 2>&1; then
         echo "  [PASS] GRUB can read its menu at /boot/grub/grub.cfg on the ESP $TGT_EFI."
@@ -3404,9 +3980,8 @@ if [ "$DRY_RUN" -eq 0 ] && command -v grub-fstest >/dev/null 2>&1; then
     else
         BOOT_FS="$TGT_ROOT"; BOOT_KERNEL="/boot/vmlinuz"
     fi
-    # The path the menu entry actually loads, symlink and all -- the thing the
-    # ext2 driver has to resolve. Fall back to the directory it lives in, so a
-    # driver that will not follow the symlink is not reported as a broken disk.
+    # The path the entry loads, symlink and all. Fall back to its directory, so
+    # a driver that will not follow the symlink is not read as a broken disk.
     if sudo grub-fstest "$BOOT_FS" ls "$BOOT_KERNEL" >/dev/null 2>&1; then
         echo "  [PASS] GRUB can read the kernel at $BOOT_KERNEL on $BOOT_FS."
     elif sudo grub-fstest "$BOOT_FS" ls "${BOOT_KERNEL%/*}/" >/dev/null 2>&1; then
