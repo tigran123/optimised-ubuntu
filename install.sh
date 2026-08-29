@@ -2018,7 +2018,9 @@ esp_entries() {
 # esp_entry_text <title> <cmdline> <kernel-dir> — this system's entry file: the
 #   GUI/TTY pair, keyed to the filesystem holding /boot (NEW_UUID_BOOT -- the
 #   /boot partition when there is one, else the root filesystem), with the
-#   kernel path to match.
+#   kernel path to match. No gfxpayload: the menu loads no video driver, so
+#   GRUB sets no mode and the firmware hands its own console mode straight
+#   through to the kernel -- which is what keeps the early boot visible.
 esp_entry_text() {
     local title=$1 cmdline=$2 kdir=$3
     cat <<EOF
@@ -2060,18 +2062,6 @@ esp_master_text() {
         "" \
         "insmod part_gpt" \
         "insmod ext2" \
-        "" \
-        "# Graphics, for both firmware paths. Without a video driver GRUB under" \
-        "# UEFI falls back to the firmware text console and can hand no" \
-        "# framebuffer to what it boots (the memory tester then stops with \"No" \
-        "# graphics display found\"); BIOS hides both behind VGA text mode." \
-        "# all_video resolves to efi_gop or vbe/vga, so one block serves both." \
-        "if loadfont \$prefix/fonts/unicode.pf2; then" \
-        "    insmod all_video" \
-        "    insmod gfxterm" \
-        "    set gfxmode=auto" \
-        "    terminal_output gfxterm" \
-        "fi" \
         ""
     while IFS="$(printf '\t')" read -r uuid title; do
         [ -n "$uuid" ] || continue
@@ -2087,6 +2077,16 @@ esp_master_text() {
             "# The memory tester: shared by the disk, like the menu itself." \
             "if [ -f \$prefix/memtest/$MEMTEST_IMAGE ]; then" \
             "    menuentry \"$MEMTEST_TITLE\" --class memtest {" \
+            "        # The only video driver this menu loads, and only when" \
+            "        # the tester is chosen. It needs a framebuffer -- under" \
+            "        # UEFI there is no VGA text mode to fall back on and it" \
+            "        # stops with \"No graphics display found\" without one --" \
+            "        # while the menu itself must not touch video at all: a" \
+            "        # ThinkPad T450s displays nothing GRUB draws into the" \
+            "        # framebuffer efi_gop reports, leaving the menu live," \
+            "        # navigable and invisible. all_video resolves to efi_gop" \
+            "        # on one path and vbe/vga on the other." \
+            "        insmod all_video" \
             "        # memtest86+ draws a fixed 640x400 panel and never scales" \
             "        # it, so ask for the smallest mode that holds it instead of" \
             "        # gfxterm's. \"keep\" is the fallback where 640x480 is not" \
