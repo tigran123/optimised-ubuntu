@@ -1884,16 +1884,18 @@ probe_target_brand() {
 #   about to be formatted, silent when it cannot be mounted. The ESP goes on MNT
 #   (free at this point), so its grub directory is $MNT/boot/grub here, not the
 #   /boot/efi/boot/grub it becomes once the root is mounted. Fills
-#   ESP_MENU_ENTRIES ("<uuid><TAB><title>"), ESP_MENU_PROBED, and ESP_MEMTEST --
-#   which tells "this run adds the tester" from "it is already there".
+#   ESP_MENU_ENTRIES ("<uuid><TAB><title>"), ESP_MENU_PROBED, ESP_MEMTEST --
+#   which tells "this run adds the tester" from "it is already there" -- and
+#   ESP_CUSTOM, which does the same for the custom.cfg template.
 probe_esp_menu() {
-    ESP_MENU_ENTRIES=(); ESP_MENU_PROBED=0; ESP_MEMTEST=0
+    ESP_MENU_ENTRIES=(); ESP_MENU_PROBED=0; ESP_MEMTEST=0; ESP_CUSTOM=0
     local row
     [ -b "$TGT_EFI" ] || return 0
     MOUNTS_DONE=1   # from here on cleanup() must sweep $MNT, interrupts included
     sudo mount -r "$TGT_EFI" "$MNT" 2>/dev/null || return 0
     ESP_MENU_PROBED=1
     [ ! -f "$MNT/boot/grub/memtest/$MEMTEST_IMAGE" ] || ESP_MEMTEST=1
+    [ ! -e "$MNT/boot/grub/custom.cfg" ] || ESP_CUSTOM=1
     while IFS= read -r row; do
         [ -n "$row" ] && ESP_MENU_ENTRIES+=("$row")
     done < <(esp_entries "$MNT/boot/grub")
@@ -1953,7 +1955,8 @@ rewrite_grub_distributor() {
 #   /boot/efi/boot/grub/grub.cfg              master menu, regenerated per run
 #   /boot/efi/boot/grub/entries/<uuid>.cfg    one file per registered rootfs
 #   /boot/efi/boot/grub/memtest/mt86+x64      the memory tester, one per disk
-#   /boot/efi/boot/grub/custom.cfg            optional, hand-written, sourced last
+#   /boot/efi/boot/grub/custom.cfg            hand-written, sourced last; seeded
+#                                             as comments when the ESP has none
 #   /boot/efi/boot/grub/{x86_64-efi,i386-pc}/ modules, written by grub-install
 #
 # An install owns exactly one entry file -- named after the root filesystem it
@@ -2172,6 +2175,50 @@ sync_esp_memtest() {
     sudo cp "$img" "$grubdir/memtest/$MEMTEST_IMAGE"
 }
 
+# esp_custom_text <title> — the seeded custom.cfg: comments only, plus a worked
+#   example keyed on this install. install.sh cannot know which machine a slot is
+#   for -- a run on one machine routinely builds the slot for another, and
+#   --brand is a display string, not a manufacturer -- so the mapping itself
+#   stays hand-written and this documents the hook at the point of use.
+esp_custom_text() {
+    local title=$1
+    cat <<EOF
+# custom.cfg -- hand-written, sourced last by the master (after its own
+# "set default", before the menu is drawn), so whatever it sets here wins.
+#
+# install.sh seeds this file only when the ESP has none, and never reads,
+# rewrites or removes it afterwards. Edit it freely.
+#
+# The master probes the SMBIOS manufacturer into \$esp_vendor on every boot, so a
+# disk carrying a rootfs per machine can select the right one with no keypress.
+# Match on the menu entry title rather than the index, so adding a slot later
+# cannot silently repoint these. The titles are the ones registered in
+# entries/<root-uuid>.cfg -- this install registered "GUI $title" and "TTY $title".
+#
+# Read the manufacturer string of a machine with:
+#   cat /sys/class/dmi/id/sys_vendor
+#
+# if [ -n "\$esp_vendor" ]; then
+#     if regexp '^Apple' "\$esp_vendor"; then
+#         set default="GUI $title"
+#     elif regexp '^LENOVO' "\$esp_vendor"; then
+#         set default="GUI Laptop"
+#     fi
+# fi
+EOF
+}
+
+# seed_esp_custom <grubdir> <title> — put that template on the ESP when it has
+#   none. Seeds only: custom.cfg is the one file on this ESP the script does not
+#   own, so an existing one is never touched. Add-never-remove, the same rule as
+#   the memory tester and for the same reason -- the ESP is shared.
+seed_esp_custom() {
+    local grubdir=$1 title=$2
+    [ ! -e "$grubdir/custom.cfg" ] || return 0
+    info "Seeding custom.cfg on the ESP (commented template; it had none)..."
+    esp_custom_text "$title" | sudo tee "$grubdir/custom.cfg" >/dev/null
+}
+
 # write_esp_menu — register this system in the shared menu, after
 #   run_chroot_block() has put grub-install's modules there. Reads MNT,
 #   TGT_MODEL, TGT_ROOT, TGT_SEP_BOOT, NEW_UUID_ROOT/_BOOT and (under
@@ -2203,6 +2250,10 @@ write_esp_menu() {
         elif [ "$MEMTEST_SRC" -eq 1 ] || [ "$ESP_MEMTEST" -eq 1 ]; then
             echo "    plus \"$MEMTEST_TITLE\" -> \$prefix/memtest/$MEMTEST_IMAGE"
         fi
+        # A formatted ESP certainly has none; otherwise only a probe knows.
+        if [ "$FORMAT_EFI" -eq 1 ] || { [ "$ESP_MENU_PROBED" -eq 1 ] && [ "$ESP_CUSTOM" -eq 0 ]; }; then
+            echo "    plus a commented custom.cfg template (the ESP has none)"
+        fi
         [ "$shown" -eq 1 ] || [ "$ESP_MENU_PROBED" -eq 1 ] || \
             echo "    (the ESP could not be read here, so entries already on it are not listed)"
         return 0
@@ -2221,6 +2272,7 @@ write_esp_menu() {
     # Before the master is built, since the master offers the entry only when the
     # image is really there.
     sync_esp_memtest "$grubdir"
+    seed_esp_custom "$grubdir" "$title"
     # Build the master before truncating it: it carries over its own timeout.
     master=$(esp_master_text "$grubdir")
     printf '%s\n' "$master" | sudo tee "$grubdir/grub.cfg" >/dev/null
@@ -2488,6 +2540,7 @@ NO_TGT_BOOT=0
 ESP_MENU_ENTRIES=()
 ESP_MENU_PROBED=0
 ESP_MEMTEST=0
+ESP_CUSTOM=0
 MEMTEST_SRC=0
 MEMTEST_OFF=0
 MEMTEST_PROBED=0
@@ -2753,8 +2806,9 @@ Notes:
     UEFI alike, so the menu belongs to the disk, not to any one rootfs. Each
     install registers itself in entries/<root-uuid>.cfg and rebuilds the master
     over whatever entry files are present, keeping its timeout/default;
-    hand-written extras go in custom.cfg. Deleting an entry file retires that
-    system. So one disk can carry a rootfs per machine behind a single ESP:
+    hand-written extras go in custom.cfg, seeded as a commented template when
+    the ESP has none. Deleting an entry file retires that system. So one disk
+    can carry a rootfs per machine behind a single ESP:
       $0 --source /dev/sde --target-efi /dev/sde2 --keep-efi \\
          --target-bios-boot /dev/sde1 --target-root /dev/sde5 --brand Laptop
   * That menu also offers "Memory test (memtest86+)" when the source has the
