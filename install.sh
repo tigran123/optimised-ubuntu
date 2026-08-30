@@ -2079,11 +2079,13 @@ esp_master_text() {
         "# those machines being UEFI. regexp, not \"=\": the earliest Intel Macs" \
         "# say \"Apple Computer, Inc.\" and nothing promises the SMBIOS string is" \
         "# unpadded. \$esp_vendor is left set whatever the vendor is, so custom.cfg" \
-        "# can key a per-machine default off it." \
+        "# can key a per-machine default off it, and \$esp_apple is what the memory" \
+        "# tester reads to pick a mode this firmware actually has." \
         "if insmod smbios; then" \
         "    insmod regexp" \
         "    if smbios --type 1 --get-string 4 --set esp_vendor; then" \
         "        if regexp '^Apple' \"\$esp_vendor\"; then" \
+        "            set esp_apple=1" \
         "            if loadfont \$prefix/fonts/unicode.pf2; then" \
         "                insmod all_video" \
         "                insmod gfxterm" \
@@ -2126,10 +2128,20 @@ esp_master_text() {
             "        # efi_gop on one firmware path and vbe/vga on the other." \
             "        insmod all_video" \
             "        # memtest86+ draws a fixed 640x400 panel and never scales" \
-            "        # it, so ask for the smallest mode that holds it instead of" \
-            "        # gfxterm's. \"keep\" is the fallback where 640x480 is not" \
-            "        # offered: under UEFI there must be SOME framebuffer." \
-            "        set gfxpayload=640x480,keep" \
+            "        # it, so ask for the smallest mode that holds it -- except" \
+            "        # on Apple, whose GOP offers exactly ONE mode (an iMac14,2" \
+            "        # lists 2560x1440 and nothing else, per GRUB videoinfo)." \
+            "        # Asking that firmware for a mode it does not have leaves" \
+            "        # the panel dark with the tester running behind it, live" \
+            "        # enough to reboot on ESC, so there the native mode is the" \
+            "        # only choice and the 640x400 panel sits in the middle of" \
+            "        # it. \"keep\" is the fallback elsewhere for the same reason:" \
+            "        # under UEFI there must be SOME framebuffer." \
+            "        if [ \"\$esp_apple\" = 1 ]; then" \
+            "            set gfxpayload=keep" \
+            "        else" \
+            "            set gfxpayload=640x480,keep" \
+            "        fi" \
             "        linux \$prefix/memtest/$MEMTEST_IMAGE" \
             "    }" \
             "fi"
