@@ -174,7 +174,7 @@ vi /boot/efi/boot/grub/grub.cfg
 
 ```
 
-The master holds nothing machine-specific: it sources one file per registered root filesystem, so a disk can carry a rootfs per machine behind this single ESP and each install only ever touches its own entry file.
+The master holds nothing machine-specific: it sources one file per registered root filesystem, so a disk can carry a rootfs per machine behind this single ESP and each install only ever touches its own entry file. The one thing it does decide at boot time is who draws the menu — Apple firmware never renders what GRUB writes to the EFI text console, so a Mac gets `gfxterm` and everything else is left alone.
 
 ```text
 set timeout=5
@@ -182,6 +182,21 @@ set default=0
 
 insmod part_gpt
 insmod ext2
+
+if insmod smbios; then
+    insmod regexp
+    if smbios --type 1 --get-string 4 --set esp_vendor; then
+        if regexp '^Apple' "$esp_vendor"; then
+            if loadfont $prefix/fonts/unicode.pf2; then
+                insmod all_video
+                insmod gfxterm
+                set gfxmode=auto
+                terminal_output gfxterm
+                set gfxpayload=keep
+            fi
+        fi
+    fi
+fi
 
 if [ -f $prefix/entries/YOUR-ROOT-UUID.cfg ]; then source $prefix/entries/YOUR-ROOT-UUID.cfg; fi
 

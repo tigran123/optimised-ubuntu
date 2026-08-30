@@ -2020,7 +2020,10 @@ esp_entries() {
 #   /boot partition when there is one, else the root filesystem), with the
 #   kernel path to match. No gfxpayload: the menu loads no video driver, so
 #   GRUB sets no mode and the firmware hands its own console mode straight
-#   through to the kernel -- which is what keeps the early boot visible.
+#   through to the kernel -- which is what keeps the early boot visible. Apple
+#   firmware is the one exception, and the master sets gfxpayload globally
+#   there rather than here: on that path GRUB did set a mode, and asking for
+#   text mode under UEFI would hand the kernel no framebuffer at all.
 esp_entry_text() {
     local title=$1 cmdline=$2 kdir=$3
     cat <<EOF
@@ -2062,6 +2065,41 @@ esp_master_text() {
         "" \
         "insmod part_gpt" \
         "insmod ext2" \
+        "" \
+        "# Some firmware renders only what it drew itself. Apple leaves the panel" \
+        "# in graphics mode and never draws what GRUB writes to the EFI text" \
+        "# console, so on a Mac this menu is live, navigable and invisible: an" \
+        "# iMac14,2 counts the timeout down and boots the default entry blind." \
+        "# Drawing it into the framebuffer ourselves is the fix, and it is gated" \
+        "# on the manufacturer because the opposite machine exists -- a ThinkPad" \
+        "# T450s renders the firmware console and renders nothing GRUB draws into" \
+        "# the framebuffer efi_gop reports. GRUB cannot see which buffer the" \
+        "# screen is scanning out, so there is no probe to run and the vendor is" \
+        "# the only discriminator there is; \$grub_platform is not one, both of" \
+        "# those machines being UEFI. regexp, not \"=\": the earliest Intel Macs" \
+        "# say \"Apple Computer, Inc.\" and nothing promises the SMBIOS string is" \
+        "# unpadded. \$esp_vendor is left set whatever the vendor is, so custom.cfg" \
+        "# can key a per-machine default off it." \
+        "if insmod smbios; then" \
+        "    insmod regexp" \
+        "    if smbios --type 1 --get-string 4 --set esp_vendor; then" \
+        "        if regexp '^Apple' \"\$esp_vendor\"; then" \
+        "            if loadfont \$prefix/fonts/unicode.pf2; then" \
+        "                insmod all_video" \
+        "                insmod gfxterm" \
+        "                set gfxmode=auto" \
+        "                terminal_output gfxterm" \
+        "                # GRUB set a mode here, so hand THAT to the kernel: with" \
+        "                # gfxpayload unset the linux loader asks for text mode," \
+        "                # which under UEFI is no framebuffer at all and a blank" \
+        "                # early boot until KMS takes over. Only this branch sets" \
+        "                # it, so every other machine still inherits the firmware" \
+        "                # console mode straight through." \
+        "                set gfxpayload=keep" \
+        "            fi" \
+        "        fi" \
+        "    fi" \
+        "fi" \
         ""
     while IFS="$(printf '\t')" read -r uuid title; do
         [ -n "$uuid" ] || continue
@@ -2077,15 +2115,15 @@ esp_master_text() {
             "# The memory tester: shared by the disk, like the menu itself." \
             "if [ -f \$prefix/memtest/$MEMTEST_IMAGE ]; then" \
             "    menuentry \"$MEMTEST_TITLE\" --class memtest {" \
-            "        # The only video driver this menu loads, and only when" \
-            "        # the tester is chosen. It needs a framebuffer -- under" \
+            "        # The video driver this entry loads for itself, and only" \
+            "        # when the tester is chosen. It needs a framebuffer -- under" \
             "        # UEFI there is no VGA text mode to fall back on and it" \
             "        # stops with \"No graphics display found\" without one --" \
-            "        # while the menu itself must not touch video at all: a" \
-            "        # ThinkPad T450s displays nothing GRUB draws into the" \
-            "        # framebuffer efi_gop reports, leaving the menu live," \
-            "        # navigable and invisible. all_video resolves to efi_gop" \
-            "        # on one path and vbe/vga on the other." \
+            "        # while the menu itself loads none unless the firmware" \
+            "        # is Apple: a ThinkPad T450s displays nothing GRUB draws" \
+            "        # into the framebuffer efi_gop reports, leaving the menu" \
+            "        # live, navigable and invisible. all_video resolves to" \
+            "        # efi_gop on one firmware path and vbe/vga on the other." \
             "        insmod all_video" \
             "        # memtest86+ draws a fixed 640x400 panel and never scales" \
             "        # it, so ask for the smallest mode that holds it instead of" \
@@ -2295,6 +2333,11 @@ verify_install() {
         vcheck "BIOS GRUB modules on the ESP (boot/grub/i386-pc)" \
             sudo test -d "$espgrub/i386-pc"
     fi
+    # The master gates its Apple branch on this font, and nothing here puts it
+    # on the ESP -- it arrives only as a side effect of grub-install. Without it
+    # a Mac silently falls back to the invisible firmware console.
+    vcheck "GRUB font on the ESP (boot/grub/fonts/unicode.pf2, what Apple firmware needs)" \
+        sudo test -f "$espgrub/fonts/unicode.pf2"
     vcheck "this system is registered in the ESP menu (entries/$NEW_UUID_ROOT.cfg)" \
         sudo test -f "$espentry"
     vcheck "its entry boots the new root UUID" \

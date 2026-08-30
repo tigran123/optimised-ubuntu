@@ -95,11 +95,42 @@ $ ./install.sh --image Ubuntu26-Portable-16GB.img --keep-efi \
 
 `--brand` is worth passing here: without it every slot on the disk is named after the disk's own model, and the menu ends up listing the same title three times. `--target-root-label` is its counterpart on the disk itself: it labels this slot's root filesystem `laptop` rather than the `root` that every slot otherwise carries, so `lsblk` tells them apart at a glance. It does not make the disk scannable — a rootfs labelled anything but `root` is not what a whole-disk scan looks for, and such a disk is addressed partition by partition either way. The summary printed before the confirmation gate names the entry being registered, the command line it will boot with, and every system already registered on that ESP that the run will keep.
 
+### Who draws the menu
+
+The master **loads no video driver and switches no terminal**, with one exception. The menu is drawn by whatever console the firmware already provides, and that is a decision rather than an omission: for a while the master set up a graphical terminal (`gfxterm`) for the whole menu, which looked better under UEFI — until a ThinkPad T450s turned up on which it made the menu *invisible*. Not blank and broken: live, navigable, booting the right entry blind, and simply never drawn on the panel, at every video mode tried, while the same file was fine when that machine was booted BIOS-first. It displays nothing GRUB writes into the framebuffer `efi_gop` reports.
+
+The exception is **Apple firmware**, which fails the opposite way. A Mac leaves the panel in graphics mode and never renders what GRUB writes to the EFI *text* console, so on an iMac14,2 the menu is invisible for the mirror-image reason: live, counting its timeout down, booting the default entry blind. One disk boots both machines, so neither answer is right for both — and GRUB cannot tell a framebuffer it wrote from one the screen is actually scanning out, so there is no probe to run. The master therefore asks SMBIOS who made the machine, and sets up `gfxterm` only for Apple:
+
+```text
+if insmod smbios; then
+    insmod regexp
+    if smbios --type 1 --get-string 4 --set esp_vendor; then
+        if regexp '^Apple' "$esp_vendor"; then
+            if loadfont $prefix/fonts/unicode.pf2; then
+                insmod all_video
+                insmod gfxterm
+                set gfxmode=auto
+                terminal_output gfxterm
+                set gfxpayload=keep
+            fi
+        fi
+    fi
+fi
+```
+
+`$grub_platform` is not the discriminator — both of those machines are UEFI, and gating on it was tried and discarded. `regexp` rather than `=`, because the earliest Intel Macs report `Apple Computer, Inc.` and nothing promises the SMBIOS string is unpadded. `set gfxpayload=keep` is inside the branch because GRUB has set a mode there and must hand *that* to the kernel: with `gfxpayload` unset the `linux` loader asks for text mode, which under UEFI is no framebuffer at all and a blank early boot until KMS takes over. Every other machine still gets the firmware's own console mode passed straight through, which is what keeps its early boot visible.
+
+`$esp_vendor` is left set whatever the manufacturer turns out to be, so a disk can key other per-machine choices off it from `custom.cfg`, which is sourced last but still before the menu is drawn:
+
+```text
+if regexp '^Apple' "$esp_vendor"; then set default="GUI iMac"; fi
+```
+
 ### The memory tester
 
 The menu also offers **Memory test (memtest86+)** when the source has Ubuntu's `memtest86+` package installed — a portable disk that boots on arbitrary machines is exactly where a RAM tester earns its keep, since you can plug it into a machine that will not boot at all and still test it. The image (`/boot/mt86+x64`, about 157 KB) is copied onto the ESP at `boot/grub/memtest/`, beside the menu that offers it, and the entry loads it with GRUB's own `linux` command. The same file works under UEFI and legacy BIOS alike, so there is one entry rather than the four Ubuntu's `20_memtest86+` generates — those exist only to choose between the 64- and 32-bit images, and anything that can boot one of these disks is 64-bit.
 
-The entry asks GRUB for a 640x480 framebuffer (`set gfxpayload=640x480,keep`). It needs one at all because under UEFI there is no VGA text mode to fall back on — without a framebuffer memtest86+ prints `No graphics display found` and stops — and it needs a small one because the tester draws a fixed 640x400 panel and never scales it, so on a 2560x1440 screen it would occupy a rectangle in the middle. `keep` is the fallback for firmware with no 640x480 mode. The entry loads GRUB's video driver itself (`insmod all_video`), because the menu around it deliberately loads none. For a while the master set up a graphical terminal for the whole menu, which looked better under UEFI — until a ThinkPad T450s turned up on which it made the menu *invisible*: live and navigable and never drawn on the panel, at every video mode tried, while the same file was fine when the machine was booted BIOS-first. GRUB has no way to tell a framebuffer it wrote from one the screen is actually scanning out, so a disk meant to boot arbitrary machines leaves the display alone and lets the firmware draw the menu. A disk whose firmware is known good can opt back in from `custom.cfg` on its ESP, which is sourced last but still before the menu is drawn.
+The entry asks GRUB for a 640x480 framebuffer (`set gfxpayload=640x480,keep`). It needs one at all because under UEFI there is no VGA text mode to fall back on — without a framebuffer memtest86+ prints `No graphics display found` and stops — and it needs a small one because the tester draws a fixed 640x400 panel and never scales it, so on a 2560x1440 screen it would occupy a rectangle in the middle. `keep` is the fallback for firmware with no 640x480 mode. The entry loads GRUB's video driver itself (`insmod all_video`) rather than relying on the menu around it, which loads none unless the firmware is Apple — see *Who draws the menu* above. That is also why the tester being visible on a machine whose menu is not proves nothing about the menu: it is booted by its own entry after its own mode set, and none of the drawing that precedes it is ever shown.
 
 Like the menu itself, the tester belongs to the **disk**, not to a rootfs: install a second slot from a system that has no `memtest86+` and the entry stays, because the master is rebuilt from what is on the ESP rather than from what the newest source happened to carry.
 
