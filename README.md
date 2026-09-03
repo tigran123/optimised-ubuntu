@@ -95,6 +95,25 @@ $ ./install.sh --image Ubuntu26-Portable-16GB.img --keep-efi \
 
 `--brand` is worth passing here: without it every slot on the disk is named after the disk's own model, and the menu ends up listing the same title three times. `--target-root-label` is its counterpart on the disk itself: it labels this slot's root filesystem `laptop` rather than the `root` that every slot otherwise carries, so `lsblk` tells them apart at a glance. It does not make the disk scannable — a rootfs labelled anything but `root` is not what a whole-disk scan looks for, and such a disk is addressed partition by partition either way. The summary printed before the confirmation gate names the entry being registered, the command line it will boot with, and every system already registered on that ESP that the run will keep.
 
+### Being found by the firmware
+
+`grub-install` is told `--removable`, so the UEFI payload lands on the **fallback path** `EFI/BOOT/BOOTX64.EFI`. That is the path firmware tries by itself, with nothing stored on the machine, and it is what lets one disk boot arbitrary machines — a UEFI boot entry is the opposite of that: a variable in *one* machine's firmware naming *one* disk.
+
+Firmware is not obliged to try the fallback path for a **fixed** disk, though, and some does not. A ThinkPad P70 with a clone on its internal NVMe — ESP, root, swap, data, and no BIOS Boot partition, so no legacy path either — does nothing at all with it: the disk is simply not a boot device, no error, no menu. The same disk in the same machine boots the moment an entry exists. A T450s tries the path and boots without one. So `install.sh` writes the entry itself when the target ESP is on a fixed disk that this machine has none for:
+
+```
+$ sudo efibootmgr -c -d /dev/nvme0n1 -p 1 -L "Ubuntu 26 (NVMe)" -l '\EFI\BOOT\BOOTX64.EFI'
+```
+
+A hotplug disk gets nothing, deliberately: the removable path *is* the portable design, and an entry naming a disk that gets unplugged is clutter that also repoints this machine's `BootOrder`. `--efi-entry` writes one anyway, `--no-efi-entry` writes none, and `--efi-entry-label` names it — the default label is the distro (from the target's own `/etc/os-release`) plus the `--brand`, so `--brand NVMe` gives `Ubuntu 26 (NVMe)` in the firmware menu and in GRUB's.
+
+The entry names the **ESP**, not a rootfs, so it is one per disk however many slots that disk carries: a match is recognised by the ESP's PARTUUID and the loader path, and installing a second slot behind a shared ESP finds the entry already there and leaves it alone. Two things the run deliberately does not do. It never **removes, activates or reorders** anything — these variables belong to the machine, not to the disk being written — so a repartitioned disk leaves a dead entry behind for `efibootmgr -b XXXX -B` to retire by hand, which the summary points out when it sees one. And the write is the **last** step of the run, after verification and after the filesystems are unmounted, so nothing points a machine at a disk that failed its checks. What it will do is reported before the confirmation gate, with everything else:
+
+```
+  NVRAM:    CREATE    "Ubuntu 26 (NVMe)" -> /dev/nvme0n1 p1 \EFI\BOOT\BOOTX64.EFI
+            this machine has no entry for that ESP; efibootmgr puts the new one first in BootOrder
+```
+
 ### Who draws the menu
 
 The master **loads no video driver and switches no terminal**, with one exception. The menu is drawn by whatever console the firmware already provides, and that is a decision rather than an omission: for a while the master set up a graphical terminal (`gfxterm`) for the whole menu, which looked better under UEFI — until a ThinkPad T450s turned up on which it made the menu *invisible*. Not blank and broken: live, navigable, booting the right entry blind, and simply never drawn on the panel, at every video mode tried, while the same file was fine when that machine was booted BIOS-first. It displays nothing GRUB writes into the framebuffer `efi_gop` reports.

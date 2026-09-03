@@ -357,6 +357,7 @@ probe_source_swapfiles() {
     # mounts anything if this did not).
     MENU_CMDLINE_PREVIEW=$(grub_cmdline_options "$SRC")
     probe_memtest "$SRC"
+    probe_os_release "$SRC"
     sudo umount "$SRC" || true
 }
 
@@ -1916,6 +1917,7 @@ probe_menu_cmdline() {
     sudo mount -r -o noatime "$dev" "$MNT" 2>/dev/null || return 0
     MENU_CMDLINE_PREVIEW=$(grub_cmdline_options "$MNT")
     probe_memtest "$MNT"
+    probe_os_release "$MNT"
     sudo umount "$MNT" || true
 }
 
@@ -1928,6 +1930,22 @@ probe_memtest() {
     MEMTEST_OFF=0
     [ "$(grub_default_value "$1/etc/default/grub" GRUB_DISABLE_MEMTEST)" != true ] || MEMTEST_OFF=1
     MEMTEST_PROBED=1
+}
+
+# probe_os_release <mounted-root> — the distro this run names the firmware boot
+#   entry after ("Ubuntu 26"): NAME plus the major of VERSION_ID, read off the
+#   same mount as probe_memtest so it costs nothing, from the same authority the
+#   menu command line uses. Derived rather than hardcoded, so the label follows
+#   the release. Fills EFI_ENTRY_DISTRO; left empty when the file says nothing,
+#   and probe_efi_entry then falls back to "Ubuntu" alone.
+probe_os_release() {
+    local name ver
+    # os-release is the same KEY="value" shape as /etc/default/grub, and is
+    # likewise read rather than sourced: it is the target's file, not ours.
+    name=$(grub_default_value "$1/etc/os-release" NAME)
+    ver=$(grub_default_value "$1/etc/os-release" VERSION_ID)
+    [ -n "$name" ] || return 0
+    EFI_ENTRY_DISTRO="$name${ver:+ ${ver%%.*}}"
 }
 
 rewrite_grub_distributor() {
@@ -2278,6 +2296,195 @@ write_esp_menu() {
     printf '%s\n' "$master" | sudo tee "$grubdir/grub.cfg" >/dev/null
 }
 
+# -----------------------------------------------------------------------------
+# The UEFI boot entry: this machine's NVRAM, not the disk
+# -----------------------------------------------------------------------------
+# grub-install --removable writes \EFI\BOOT\BOOTX64.EFI and deliberately touches
+# no NVRAM: that fallback path is what lets one disk boot arbitrary machines,
+# and a Boot#### variable belongs to the machine it is written on, not to the
+# disk it names. But firmware is not obliged to TRY the fallback path on a FIXED
+# disk -- a ThinkPad P70 does not -- so an internal clone with no BIOS Boot
+# partition has nothing at all to boot from until this machine is told about it.
+# Hence: a fixed target disk gets an entry here, a hotplug one does not (it is
+# the removable path the portable design is built on), and --efi-entry /
+# --no-efi-entry override both ways.
+#
+# Add-never-remove, the rule the memory tester and custom.cfg already follow on
+# the shared ESP, and for a stronger reason here -- NVRAM is the machine's: no
+# -B, no -o, no -b ... -a. Where the state is wrong rather than absent, the run
+# says so and names the command for the operator to run.
+EFI_LOADER='\EFI\BOOT\BOOTX64.EFI'
+
+# disk_is_fixed <disk> — true when the disk is one this machine keeps: not
+#   removable, not hotplug, no removable transport, not a loop device. A
+#   portable disk boots everywhere off the fallback path by design, so an entry
+#   naming it is clutter that also repoints this machine's BootOrder at
+#   something that gets unplugged.
+disk_is_fixed() {
+    local rm hp tran
+    case "$1" in /dev/loop*) return 1 ;; esac
+    read -r rm hp tran < <(lsblk -dno RM,HOTPLUG,TRAN "$1" 2>/dev/null) || return 1
+    [ "${rm:-1}" = 0 ] && [ "${hp:-1}" = 0 ] || return 1
+    case "$tran" in usb|mmc|ieee1394) return 1 ;; esac
+    return 0
+}
+
+# efi_entry_lookup <esp-partuuid> — the firmware entry that boots the removable
+#   loader off that partition: "<num><TAB><active|inactive><TAB><ordered|
+#   unordered><TAB><label>", or nothing when this machine has none. efivarfs is
+#   world-readable, so this needs no privilege -- which is what lets the
+#   pre-gate probe report it in a dry run.
+efi_entry_lookup() {
+    efibootmgr -v 2>/dev/null | awk -v pu="$1" '
+        BEGIN { pu = tolower(pu); ldr = "bootx64.efi" }
+        # BootOrder may be printed after the entries, so membership waits for END.
+        /^BootOrder:/ { order = "," $2 ","; next }
+        # Exactly four hex digits then the active column: that is what keeps
+        # BootCurrent/BootNext and the indented "dp:" lines of -v out. Label
+        # and device path follow at column 11, separated by a tab. Matching is
+        # case-insensitive and by substring, so both output shapes hit
+        # (/\EFI\BOOT\BOOTX64.EFI and /File(\EFI\BOOT\BOOTX64.EFI)).
+        /^Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][ *]/ {
+            if (num != "") next
+            rest = substr($0, 11)
+            t = index(rest, "\t")
+            # Identity is the DEVICE PATH -- the partition the entry names and
+            # the loader on it -- never the label, which is free text someone
+            # can have called anything. The label is carried out for reporting
+            # only. Fall back to the whole line if a version prints no tab.
+            dp = tolower((t > 0) ? substr(rest, t + 1) : rest)
+            if (index(dp, pu) == 0 || index(dp, ldr) == 0) next
+            num = substr($0, 5, 4)
+            act = (substr($0, 9, 1) == "*") ? "active" : "inactive"
+            lbl = (t > 0) ? substr(rest, 1, t - 1) : rest
+        }
+        END {
+            if (num == "") exit 0
+            printf "%s\t%s\t%s\t%s\n", num, act,
+                   index(order, "," num ",") ? "ordered" : "unordered", lbl
+        }'
+}
+
+# probe_efi_entry — decide, before the confirmation gate, whether this run
+#   registers the target ESP in this machine's NVRAM and under what label, so
+#   the summary shows it and a dry run reports what a real one would do.
+#   Reads EFI_ENTRY, EFI_ENTRY_LABEL, EFI_ENTRY_DISTRO, TGT_EFI, TGT_MODEL,
+#   UNIFIED_TARGET/UPDATE; fills the EFI_ENTRY_* block. An explicit --efi-entry
+#   that cannot be honoured DIES rather than degrading to a warning, the way
+#   --target-efi-size does under --update -- except on a hotplug disk, which is
+#   precisely what the flag is for.
+probe_efi_entry() {
+    local forced=0 partuuid row
+    [ "$EFI_ENTRY" != 1 ] || forced=1
+    # Resolved even when no entry is written: the skip messages name it, and so
+    # does the by-hand command line a failure prints.
+    EFI_ENTRY_TITLE=${EFI_ENTRY_LABEL:-"${EFI_ENTRY_DISTRO:-Ubuntu} ($TGT_MODEL)"}
+    # Likewise resolved before any decision: what efibootmgr -d/-p need, and
+    # what the summary names when this run writes nothing.
+    EFI_ENTRY_DISK=$(get_parent_disk "$TGT_EFI")
+    EFI_ENTRY_PART=$(lsblk -dno PARTN "$TGT_EFI" 2>/dev/null | xargs || true)
+    # A fresh unified --target is not partitioned yet, so its ESP has no node to
+    # read either fact off: the disk is the one named on the command line, and
+    # the number is the one this script is about to give it.
+    [ -n "$EFI_ENTRY_DISK" ] || [ $UNIFIED_TARGET -eq 0 ] || EFI_ENTRY_DISK="$TARGET"
+    if [ -z "$EFI_ENTRY_PART" ]; then
+        case "$TGT_EFI" in *[0-9]) EFI_ENTRY_PART=${TGT_EFI##*[!0-9]} ;; esac
+    fi
+
+    if [ "$EFI_ENTRY" = 0 ]; then
+        EFI_ENTRY_WHY="--no-efi-entry"
+        return 0
+    fi
+    if [ ! -d /sys/firmware/efi ]; then
+        [ $forced -eq 0 ] || die "--efi-entry: this host is not booted under UEFI (no /sys/firmware/efi), so it has no boot variables to write. Boot it under UEFI, or add the entry from the machine that will boot the disk."
+        EFI_ENTRY_WHY="this host is not booted under UEFI (no /sys/firmware/efi), so it has no boot variables to write"
+        return 0
+    fi
+    if ! command -v efibootmgr >/dev/null 2>&1; then
+        [ $forced -eq 0 ] || die "--efi-entry needs efibootmgr, which is not installed here (apt install efibootmgr)."
+        EFI_ENTRY_WHY="efibootmgr is not installed (apt install efibootmgr)"
+        return 0
+    fi
+    if [ -z "$EFI_ENTRY_DISK" ] || [ -z "$EFI_ENTRY_PART" ]; then
+        [ $forced -eq 0 ] || die "--efi-entry: cannot resolve the disk and partition number of the target ESP $TGT_EFI, which is what efibootmgr -d/-p need."
+        EFI_ENTRY_WHY="cannot resolve the disk and partition number of $TGT_EFI"
+        return 0
+    fi
+    # A loop device is not a disk any firmware can find at boot, so --efi-entry
+    # cannot be honoured for one either.
+    case "$EFI_ENTRY_DISK" in
+        /dev/loop*)
+            [ $forced -eq 0 ] || die "--efi-entry: the target ESP is on $EFI_ENTRY_DISK, a loop device -- an NVRAM entry names a disk the firmware finds at boot, which that is not. Write the image to a disk and register it there."
+            EFI_ENTRY_WHY="$EFI_ENTRY_DISK is a loop device, which no firmware can boot"
+            return 0 ;;
+    esac
+    if [ $forced -eq 0 ] && ! disk_is_fixed "$EFI_ENTRY_DISK"; then
+        EFI_ENTRY_WHY="$EFI_ENTRY_DISK is a hotplug disk -- it boots off $EFI_LOADER, the removable fallback path (--efi-entry overrides)"
+        return 0
+    fi
+
+    EFI_ENTRY_DO=1
+    # The ESP of a fresh unified --target is created by parted AFTER the gate,
+    # with a PARTUUID that does not exist yet: nothing here can look it up, so
+    # any entry for the ESP it REPLACES is recorded as doomed instead and the
+    # decision is taken again in Phase 7, off the partition that exists by then.
+    partuuid=$(lsblk -dno PARTUUID "$TGT_EFI" 2>/dev/null | xargs || true)
+    [ -n "$partuuid" ] || return 0
+    row=$(efi_entry_lookup "$partuuid") || row=""
+    [ -n "$row" ] || return 0
+    if [ $UNIFIED_TARGET -eq 1 ] && [ $UPDATE -eq 0 ]; then
+        IFS=$'\t' read -r EFI_ENTRY_DOOMED _ _ EFI_ENTRY_NAME <<<"$row"
+        return 0
+    fi
+    IFS=$'\t' read -r EFI_ENTRY_NUM EFI_ENTRY_ACTIVE EFI_ENTRY_ORDER EFI_ENTRY_NAME <<<"$row"
+    EFI_ENTRY_DO=0
+}
+
+# create_efi_entry — the NVRAM write, last of all: after verify_install and
+#   after the tree is unmounted, so nothing points this machine at a disk that
+#   failed verification. Idempotent -- it re-reads the ESP PARTUUID (parted has
+#   run by now) and looks again, so an entry already booting that ESP is
+#   reported and left alone rather than duplicated. Advisory throughout: the
+#   disk is written and correct, and what is missing is a pointer in THIS
+#   machine's firmware, so a failure warns and prints the command by hand
+#   instead of failing the run (the same reasoning as the grub-fstest probes).
+#   Reads EFI_ENTRY_DO/_DISK/_PART/_TITLE and TGT_EFI.
+create_efi_entry() {
+    local partuuid row num
+    [ "$EFI_ENTRY_DO" -eq 1 ] || return 0
+    partuuid=$(lsblk -dno PARTUUID "$TGT_EFI" 2>/dev/null | xargs || true)
+    if [ -n "$partuuid" ]; then
+        row=$(efi_entry_lookup "$partuuid") || row=""
+        if [ -n "$row" ]; then
+            IFS=$'\t' read -r num _ _ _ <<<"$row"
+            info "This machine already boots the target ESP (Boot$num); leaving its NVRAM alone."
+            return 0
+        fi
+    elif [ "$DRY_RUN" -eq 0 ]; then
+        echo "Warning: cannot read the PARTUUID of the target ESP $TGT_EFI, so this machine was not registered to boot it. By hand:" >&2
+        echo "  sudo efibootmgr -c -d $EFI_ENTRY_DISK -p $EFI_ENTRY_PART -L \"$EFI_ENTRY_TITLE\" -l '$EFI_LOADER'" >&2
+        return 0
+    fi
+    info "Registering the target ESP in this machine's NVRAM as \"$EFI_ENTRY_TITLE\"..."
+    # -q keeps efibootmgr from dumping the whole boot list; -c puts the new
+    # entry first in BootOrder, which is the point of writing it.
+    if ! run sudo efibootmgr -q -c -d "$EFI_ENTRY_DISK" -p "$EFI_ENTRY_PART" \
+             -L "$EFI_ENTRY_TITLE" -l "$EFI_LOADER"; then
+        echo "Warning: efibootmgr could not create the boot entry (NVRAM full, or efivarfs mounted read-only?). The disk itself is complete -- register it by hand with:" >&2
+        echo "  sudo efibootmgr -c -d $EFI_ENTRY_DISK -p $EFI_ENTRY_PART -L \"$EFI_ENTRY_TITLE\" -l '$EFI_LOADER'" >&2
+        return 0
+    fi
+    [ "$DRY_RUN" -eq 0 ] || return 0
+    # Read it back: an exit status is not proof the variable landed.
+    row=$(efi_entry_lookup "$partuuid") || row=""
+    if [ -n "$row" ]; then
+        IFS=$'\t' read -r num _ _ _ <<<"$row"
+        echo "  [PASS] this machine boots the target ESP as Boot$num \"$EFI_ENTRY_TITLE\" (first in BootOrder)."
+    else
+        echo "Warning: efibootmgr reported success, but no entry for the target ESP reads back -- check \"efibootmgr -v\"." >&2
+    fi
+}
+
 run_chroot_block() {
     for i in /dev /dev/pts /proc /sys /run; do
         sudo mount --bind "$i" "$MNT$i"
@@ -2521,6 +2728,12 @@ NO_TRIM=0
 # Keep the ESP's filesystem: no mkfs, no new UUID. What a shared ESP needs; its
 # contents are written by grub-install and write_esp_menu on every run anyway.
 KEEP_EFI=0
+# Register the target ESP in THIS machine's NVRAM (a Boot#### variable naming
+# the removable loader on it). Tri-state: "" decides by the disk -- a fixed one
+# gets an entry, a hotplug one does not, see probe_efi_entry -- 1 = --efi-entry,
+# 0 = --no-efi-entry. EFI_ENTRY_LABEL overrides the label it is given.
+EFI_ENTRY="${EFI_ENTRY:-}"
+EFI_ENTRY_LABEL="${EFI_ENTRY_LABEL:-}"
 # Copy the regenerable browser caches like any other data instead of dropping
 # them (--keep-cache). See CACHE_DROP_NAMES.
 KEEP_CACHE=0
@@ -2546,6 +2759,22 @@ MEMTEST_OFF=0
 MEMTEST_PROBED=0
 MENU_CMDLINE_PREVIEW=""
 NEW_UUID_ROOT=""
+
+# What probe_efi_entry decided about this machine's NVRAM, and what
+# create_efi_entry writes with it. DO/WHY are the decision; NUM/NAME/ACTIVE/
+# ORDER describe an entry that already boots that ESP; DOOMED names one that is
+# about to point at a partition this run replaces.
+EFI_ENTRY_DO=0
+EFI_ENTRY_WHY=""
+EFI_ENTRY_DISK=""
+EFI_ENTRY_PART=""
+EFI_ENTRY_TITLE=""
+EFI_ENTRY_NUM=""
+EFI_ENTRY_NAME=""
+EFI_ENTRY_ACTIVE=""
+EFI_ENTRY_ORDER=""
+EFI_ENTRY_DOOMED=""
+EFI_ENTRY_DISTRO=""
 
 # Swap files listed in the source's fstab: to rebuild, dropped by --exclude-from,
 # actually rebuilt (verified later), and the rsync exclusions for all of them.
@@ -2628,6 +2857,9 @@ while [ $# -gt 0 ]; do
         --target-root)      TGT_ROOT="$2"; shift 2 ;;
         --target-swap)      TGT_SWAP="$2"; shift 2 ;;
         --keep-efi)         KEEP_EFI=1;    shift ;;
+        --efi-entry)        EFI_ENTRY=1;   shift ;;
+        --no-efi-entry)     EFI_ENTRY=0;   shift ;;
+        --efi-entry-label)  EFI_ENTRY_LABEL="$2"; shift 2 ;;
 
         --mnt)            MNT="$2"; shift 2 ;;
         --src)            SRC="$2"; shift 2 ;;
@@ -2751,6 +2983,23 @@ Other:
                               Without it, --update keeps the brand already stamped
                               into the target's /etc/default/grub, so a brand
                               chosen at install time survives every sync.
+  --efi-entry                 Register the target ESP in THIS machine's UEFI
+                              boot variables (efibootmgr -c), so its firmware
+                              boot menu lists the disk. Done anyway when the
+                              target is a FIXED disk this host has no entry for;
+                              the flag forces it for a hotplug/USB target too.
+                              Nothing is ever deleted or re-ordered: an entry
+                              that already boots that ESP is left alone.
+  --no-efi-entry              Leave this machine's boot variables alone. The
+                              disk still boots wherever the firmware tries the
+                              removable path \EFI\BOOT\BOOTX64.EFI by itself,
+                              which is every portable case -- but a fixed disk
+                              may then not boot at all (a ThinkPad P70 does not
+                              try it, a T450s does).
+  --efi-entry-label NAME      Label that entry NAME instead of "<distro>
+                              (<brand>)" -- "Ubuntu 26 (NVMe)" with --brand
+                              NVMe. Cosmetic: it is the string the firmware boot
+                              menu shows.
   --target-efi-size SIZE      Size of the ESP on a freshly partitioned --target
                               (default 256M). Bare = MiB; k/M/G must come out
                               whole MiB, since root starts where the ESP ends.
@@ -2817,6 +3066,16 @@ Notes:
     One entry covers both firmware paths. GRUB_DISABLE_MEMTEST=true keeps an
     install from adding it but never removes one; retiring it disk-wide is
     "rm -rf /boot/efi/boot/grub/memtest".
+  * grub-install is told --removable, so the ESP holds EFI/BOOT/BOOTX64.EFI --
+    the path firmware tries on its own for removable media, and what lets one
+    disk boot arbitrary machines. Firmware is NOT obliged to try it for a fixed
+    disk (a ThinkPad P70 does not; a T450s does), so a fixed target is also
+    registered in the boot variables of the machine running this script:
+      sudo efibootmgr -c -d /dev/nvme0n1 -p 1 -L "Ubuntu 26 (NVMe)" \\
+           -l '\EFI\BOOT\BOOTX64.EFI'
+    Those variables belong to the machine, not the disk, so this only ever ADDS
+    one. Retiring a dead entry -- a disk repartitioned since, say -- is
+    "efibootmgr -b XXXX -B" by hand. See --efi-entry / --no-efi-entry.
   * A separate /boot earns its keep on a machine whose BIOS cannot boot from
     NVMe: BIOS Boot, the ESP and /boot go on a disk that BIOS can read, while /
     -- everything the running system actually reads -- stays on the NVMe.
@@ -2959,6 +3218,17 @@ if [ -n "$TGT_ROOT_LABEL" ]; then
     [ "$TGT_ROOT_LABEL" != boot ] || \
         die "--target-root-label boot is refused: the disk scan skips boot-labelled partitions, so a root filesystem labelled 'boot' could never be found by one again."
     ROOT_LABEL="$TGT_ROOT_LABEL"
+fi
+
+# --efi-entry-label is the label of an entry --no-efi-entry says not to write:
+# a contradiction, and refused rather than ignored, like the flags above. An
+# empty label means "not given", as everywhere else here; the value reaches
+# efibootmgr -L, so what it must not be is more than one line.
+if [ -n "$EFI_ENTRY_LABEL" ]; then
+    [ "$EFI_ENTRY" != 0 ] || \
+        die "Specify only one of --efi-entry-label (name the NVRAM entry) or --no-efi-entry (write none)."
+    [ "$EFI_ENTRY_LABEL" = "${EFI_ENTRY_LABEL%%[$'\n\t']*}" ] || \
+        die "--efi-entry-label must be a single line (it becomes the label the firmware menu shows)."
 fi
 
 # --remap MOUNTPOINT=DEVICE answers before the run asks. Validated here like the
@@ -3525,6 +3795,10 @@ if [ $MIGRATE_ROOT -eq 1 ]; then probe_source_swapfiles; fi
 # mounted, and the systems on the ESP (nothing to read if it is reformatted).
 probe_menu_cmdline
 if [ $FORMAT_EFI -eq 0 ]; then probe_esp_menu; fi
+# ...and whether this machine has to be told about the disk it is writing. Last
+# of the probes: the entry is labelled after the brand resolved above and the
+# distro the probes before it read.
+probe_efi_entry
 # What the target partition holds NOW: this system when the filesystem is kept,
 # a stranger when it is about to be reformatted -- in which case
 # write_esp_menu() retires its menu entry with it rather than advertise a UUID
@@ -3714,6 +3988,39 @@ else
     echo "  Bootldr:  reinstall UEFI (removable) (no --target-bios-boot, so legacy BIOS is left intact)"
 fi
 echo "            GRUB boot directory + menu on the ESP (--boot-directory=/boot/efi/boot)"
+# NVRAM: the Boot#### variable in the firmware of THIS machine, naming the
+# target ESP.
+# Not a property of the disk, hence its own block -- and "nothing to do",
+# "declined" and "cannot" must not look alike.
+if [ "$EFI_ENTRY_DO" -eq 1 ]; then
+    summary_row "NVRAM:" "CREATE    \"$EFI_ENTRY_TITLE\" -> $EFI_ENTRY_DISK p$EFI_ENTRY_PART $EFI_LOADER"
+    if [ $UNIFIED_TARGET -eq 1 ] && [ $UPDATE -eq 0 ]; then
+        summary_row "" "checked again after the gate: parted re-creates this ESP, so the PARTUUID to look for does not exist yet"
+        [ -z "$EFI_ENTRY_DOOMED" ] || summary_row "" \
+            "Boot$EFI_ENTRY_DOOMED \"$EFI_ENTRY_NAME\" names the ESP this run replaces, so it will be dead afterwards (efibootmgr -b $EFI_ENTRY_DOOMED -B)"
+    else
+        summary_row "" "this machine has no entry for that ESP; efibootmgr puts the new one first in BootOrder"
+    fi
+    # The label is half a guess when no root could be read here (a dry run
+    # against an image): say so rather than advertise one a real run would spell
+    # differently.
+    [ -n "$EFI_ENTRY_LABEL" ] || [ -n "$EFI_ENTRY_DISTRO" ] || summary_row "" \
+        "the distro half of that label comes from the target's own /etc/os-release, which could not be read here"
+elif [ -n "$EFI_ENTRY_NUM" ]; then
+    summary_row "NVRAM:" "keep      Boot$EFI_ENTRY_NUM \"$EFI_ENTRY_NAME\" already boots that ESP on this machine"
+    [ "$EFI_ENTRY_ORDER" = ordered ] || summary_row "" \
+        "...but it is not in BootOrder, so the firmware never tries it (efibootmgr -o puts it back); left alone"
+    [ "$EFI_ENTRY_ACTIVE" = active ] || summary_row "" \
+        "...but it is inactive (efibootmgr -b $EFI_ENTRY_NUM -a activates it); left alone"
+else
+    summary_row "NVRAM:" "skipped   ${EFI_ENTRY_WHY:-no entry written}"
+    # The trap this step exists for: with no firmware entry AND no legacy path,
+    # a fixed disk depends on the firmware trying the removable loader by
+    # itself -- which a ThinkPad P70 does not do.
+    if [ $INSTALL_GRUB_BIOS -eq 0 ] && [ -n "$EFI_ENTRY_DISK" ] && disk_is_fixed "$EFI_ENTRY_DISK"; then
+        echo "Warning: this run writes neither an NVRAM entry nor a legacy bootloader (no --target-bios-boot), so booting $EFI_ENTRY_DISK depends on the firmware trying $EFI_LOADER on its own -- which some firmware only does for removable media." >&2
+    fi
+fi
 echo "  Mounts:   target=$MNT  source=$SRC"
 if [ $UNIFIED_TARGET -eq 1 ] && [ $UPDATE -eq 0 ]; then
     echo "  Layout:   ${ESP_MIB} MiB ESP, root to 100%${TGT_EFI_SIZE:+  (--target-efi-size)}"
@@ -4099,6 +4406,11 @@ if [ "$DRY_RUN" -eq 0 ] && command -v grub-fstest >/dev/null 2>&1; then
         echo "Warning: GRUB's own ext2 driver cannot read $BOOT_KERNEL on $BOOT_FS -- this disk is unlikely to boot." >&2
     fi
 fi
+
+# Last of all, and only now: the disk is verified, unmounted and readable by
+# GRUB, so this machine can be pointed at it. Writes nothing to the disk -- a
+# Boot#### variable in the firmware of the machine this script is running on.
+create_efi_entry
 
 if [ $UNIFIED_TARGET -eq 1 ]; then
     if [ $UPDATE -eq 1 ]; then

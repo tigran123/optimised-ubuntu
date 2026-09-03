@@ -280,10 +280,24 @@ sudo efibootmgr -b 0000 -B
 
 **3. Create the new EFI entry in NVRAM**
 
+`install.sh` does this step for you whenever the target ESP is on a **fixed**
+disk and the machine has no entry for it already (`--efi-entry` forces it for a
+portable disk too, `--no-efi-entry` suppresses it, `--efi-entry-label` names it).
+It is spelled out here because it is the same command, and because the manual
+build above has no script to do it:
 
 ```bash
 sudo efibootmgr -c -d /dev/sdb -p 2 -L "HGST 1TB Backup" -l '\EFI\BOOT\BOOTX64.EFI'
 ```
+
+Whether you need it at all depends on the machine. Firmware is not obliged to
+try `\EFI\BOOT\BOOTX64.EFI` on its own for a disk it considers fixed — a
+ThinkPad P70 does not, and an internal clone with no BIOS Boot partition is then
+not a boot device at all — while every machine tried here does try it for
+removable media, which is what makes these disks portable in the first place.
+Step 2 above stays manual for the same reason step 3 only ever adds: NVRAM
+belongs to the machine, not to the disk, so nothing here deletes or reorders
+another entry behind your back.
 
 Breakdown of the Parameters:
 
