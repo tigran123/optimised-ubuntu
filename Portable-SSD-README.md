@@ -282,7 +282,8 @@ sudo efibootmgr -b 0000 -B
 
 `install.sh` does this step for you whenever the target ESP is on a **fixed**
 disk and the machine has no entry for it already (`--efi-entry` forces it for a
-portable disk too, `--no-efi-entry` suppresses it, `--efi-entry-label` names it).
+portable disk too, `--no-efi-entry` suppresses it, `--efi-entry-label` names it
+and implies `--efi-entry`).
 It is spelled out here because it is the same command, and because the manual
 build above has no script to do it:
 
@@ -295,9 +296,13 @@ try `\EFI\BOOT\BOOTX64.EFI` on its own for a disk it considers fixed — a
 ThinkPad P70 does not, and an internal clone with no BIOS Boot partition is then
 not a boot device at all — while every machine tried here does try it for
 removable media, which is what makes these disks portable in the first place.
-Step 2 above stays manual for the same reason step 3 only ever adds: NVRAM
-belongs to the machine, not to the disk, so nothing here deletes or reorders
-another entry behind your back.
+Step 2 above stays manual for the same reason step 3 only ever adds when it was
+not asked: NVRAM belongs to the machine, not to the disk, so nothing is deleted
+or reordered behind your back. Ask outright — `--efi-entry` or
+`--efi-entry-label` — and the run replaces instead: the new entry is written
+first, then every entry naming that ESP is deleted, dead ones from a
+repartition included. That is the only case in which it removes anything, and
+it still touches no entry that names another disk.
 
 Breakdown of the Parameters:
 

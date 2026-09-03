@@ -105,13 +105,21 @@ Firmware is not obliged to try the fallback path for a **fixed** disk, though, a
 $ sudo efibootmgr -c -d /dev/nvme0n1 -p 1 -L "Ubuntu 26 (NVMe)" -l '\EFI\BOOT\BOOTX64.EFI'
 ```
 
-A hotplug disk gets nothing, deliberately: the removable path *is* the portable design, and an entry naming a disk that gets unplugged is clutter that also repoints this machine's `BootOrder`. `--efi-entry` writes one anyway, `--no-efi-entry` writes none, and `--efi-entry-label` names it — the default label is the distro (from the target's own `/etc/os-release`) plus the `--brand`, so `--brand NVMe` gives `Ubuntu 26 (NVMe)` in the firmware menu and in GRUB's.
+A hotplug disk gets nothing, deliberately: the removable path *is* the portable design, and an entry naming a disk that gets unplugged is clutter that also repoints this machine's `BootOrder`. `--efi-entry` writes one anyway, `--no-efi-entry` writes none, and `--efi-entry-label` names it — the default label is the distro (from the target's own `/etc/os-release`) plus the `--brand`, so `--brand NVMe` gives `Ubuntu 26 (NVMe)` in the firmware menu and in GRUB's. Naming an entry is asking for one, so `--efi-entry-label` implies `--efi-entry`.
 
-The entry names the **ESP**, not a rootfs, so it is one per disk however many slots that disk carries: a match is recognised by the ESP's PARTUUID and the loader path, and installing a second slot behind a shared ESP finds the entry already there and leaves it alone. Two things the run deliberately does not do. It never **removes, activates or reorders** anything — these variables belong to the machine, not to the disk being written — so a repartitioned disk leaves a dead entry behind for `efibootmgr -b XXXX -B` to retire by hand, which the summary points out when it sees one. And the write is the **last** step of the run, after verification and after the filesystems are unmounted, so nothing points a machine at a disk that failed its checks. What it will do is reported before the confirmation gate, with everything else:
+The entry names the **ESP**, not a rootfs, so it is one per disk however many slots that disk carries: a match is recognised by the ESP's PARTUUID and the loader path, and installing a second slot behind a shared ESP finds the entry already there and leaves it alone. A run told nothing therefore never **removes, activates or reorders** anything — these variables belong to the machine, not to the disk being written — so a repartitioned disk leaves a dead entry behind for `efibootmgr -b XXXX -B` to retire by hand, which the summary points out when it sees one. And the write is the **last** step of the run, after verification and after the filesystems are unmounted, so nothing points a machine at a disk that failed its checks. What it will do is reported before the confirmation gate, with everything else:
 
 ```
   NVRAM:    CREATE    "Ubuntu 26 (NVMe)" -> /dev/nvme0n1 p1 \EFI\BOOT\BOOTX64.EFI
             this machine has no entry for that ESP; efibootmgr puts the new one first in BootOrder
+```
+
+**Asking is the exception**, and the only one. `--efi-entry` and `--efi-entry-label` name the entry this run is to write, so a match must not turn them into no-ops — a label could then never be changed, and an entry that had gone inactive or dropped out of `BootOrder` could never be rewritten, which is what a second run is for. Such a run **replaces**: every entry naming that ESP goes, and so do the ones a repartitioned ESP has orphaned. The new entry is written **first** and the old ones deleted after, so a create that fails leaves the machine the entry it had rather than none at all:
+
+```
+  NVRAM:    REPLACE   "Ubuntu 26 (NVMe)" -> /dev/nvme0n1 p1 \EFI\BOOT\BOOTX64.EFI
+            Boot0003 "UEFI OS" already boots that ESP; deleted once the new entry is written
+            efibootmgr puts the new one first in BootOrder
 ```
 
 ### Who draws the menu

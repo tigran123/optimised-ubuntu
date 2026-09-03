@@ -2313,6 +2313,13 @@ write_esp_menu() {
 # the shared ESP, and for a stronger reason here -- NVRAM is the machine's: no
 # -B, no -o, no -b ... -a. Where the state is wrong rather than absent, the run
 # says so and names the command for the operator to run.
+#
+# The carve-out is the operator ASKING. --efi-entry/--efi-entry-label name the
+# entry this run is to write, and a match must not make them no-ops: a label
+# could then never be changed and an inactive or unordered entry never rewritten
+# -- the two things a second run is for. So a forced run replaces every entry
+# naming that ESP (and the ones a repartition has orphaned), writing the new one
+# first and deleting after. EFI_ENTRY_FORCED is that one notion.
 EFI_LOADER='\EFI\BOOT\BOOTX64.EFI'
 
 # disk_is_fixed <disk> — true when the disk is one this machine keeps: not
@@ -2329,11 +2336,14 @@ disk_is_fixed() {
     return 0
 }
 
-# efi_entry_lookup <esp-partuuid> — the firmware entry that boots the removable
-#   loader off that partition: "<num><TAB><active|inactive><TAB><ordered|
-#   unordered><TAB><label>", or nothing when this machine has none. efivarfs is
-#   world-readable, so this needs no privilege -- which is what lets the
-#   pre-gate probe report it in a dry run.
+# efi_entry_lookup <esp-partuuid> — the firmware entries that boot the removable
+#   loader off that partition, one per line: "<num><TAB><active|inactive><TAB>
+#   <ordered|unordered><TAB><label>", nothing when this machine has none. EVERY
+#   match, not just the first: a forced run deletes them all, while a caller
+#   that wants a single entry reads the first line (read consumes one line, so
+#   the single-row call sites are unaffected). efivarfs is world-readable, so
+#   this needs no privilege -- which is what lets the pre-gate probe report it
+#   in a dry run.
 efi_entry_lookup() {
     efibootmgr -v 2>/dev/null | awk -v pu="$1" '
         BEGIN { pu = tolower(pu); ldr = "bootx64.efi" }
@@ -2345,7 +2355,6 @@ efi_entry_lookup() {
         # case-insensitive and by substring, so both output shapes hit
         # (/\EFI\BOOT\BOOTX64.EFI and /File(\EFI\BOOT\BOOTX64.EFI)).
         /^Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][ *]/ {
-            if (num != "") next
             rest = substr($0, 11)
             t = index(rest, "\t")
             # Identity is the DEVICE PATH -- the partition the entry names and
@@ -2354,15 +2363,30 @@ efi_entry_lookup() {
             # only. Fall back to the whole line if a version prints no tab.
             dp = tolower((t > 0) ? substr(rest, t + 1) : rest)
             if (index(dp, pu) == 0 || index(dp, ldr) == 0) next
-            num = substr($0, 5, 4)
-            act = (substr($0, 9, 1) == "*") ? "active" : "inactive"
-            lbl = (t > 0) ? substr(rest, 1, t - 1) : rest
+            n++
+            nums[n] = substr($0, 5, 4)
+            acts[n] = (substr($0, 9, 1) == "*") ? "active" : "inactive"
+            lbls[n] = (t > 0) ? substr(rest, 1, t - 1) : rest
         }
         END {
-            if (num == "") exit 0
-            printf "%s\t%s\t%s\t%s\n", num, act,
-                   index(order, "," num ",") ? "ordered" : "unordered", lbl
+            for (i = 1; i <= n; i++)
+                printf "%s\t%s\t%s\t%s\n", nums[i], acts[i],
+                       index(order, "," nums[i] ",") ? "ordered" : "unordered",
+                       lbls[i]
         }'
+}
+
+# efi_entry_nums <rows> — the Boot numbers of efi_entry_lookup rows, space
+#   separated. Takes its input as an argument rather than reading a global,
+#   like cache_filters_for(): the probe and the create both need it and must
+#   agree on what "every matching entry" means.
+efi_entry_nums() {
+    local num rest out=""
+    while IFS=$'\t' read -r num rest; do
+        [ -n "$num" ] || continue
+        out+="${out:+ }$num"
+    done <<<"$1"
+    printf '%s\n' "$out"
 }
 
 # probe_efi_entry — decide, before the confirmation gate, whether this run
@@ -2374,8 +2398,17 @@ efi_entry_lookup() {
 #   --target-efi-size does under --update -- except on a hotplug disk, which is
 #   precisely what the flag is for.
 probe_efi_entry() {
-    local forced=0 partuuid row
-    [ "$EFI_ENTRY" != 1 ] || forced=1
+    local flag partuuid row
+    # Both flags are affirmative, and EFI_ENTRY_FORCED is the single notion of
+    # it: naming an entry is asking for one, so --efi-entry-label forces it
+    # exactly as --efi-entry does (the two cannot disagree -- --efi-entry-label
+    # with --no-efi-entry is refused at validation). Forcing is also what turns
+    # a match from "leave it alone" into "replace it": see EFI_ENTRY_DELETE.
+    EFI_ENTRY_FORCED=0
+    if [ "$EFI_ENTRY" = 1 ] || [ -n "$EFI_ENTRY_LABEL" ]; then EFI_ENTRY_FORCED=1; fi
+    # Resolved here so a die message quotes the flag the operator actually typed.
+    flag=--efi-entry
+    [ "$EFI_ENTRY" = 1 ] || [ -z "$EFI_ENTRY_LABEL" ] || flag=--efi-entry-label
     # Resolved even when no entry is written: the skip messages name it, and so
     # does the by-hand command line a failure prints.
     EFI_ENTRY_TITLE=${EFI_ENTRY_LABEL:-"${EFI_ENTRY_DISTRO:-Ubuntu} ($TGT_MODEL)"}
@@ -2396,29 +2429,29 @@ probe_efi_entry() {
         return 0
     fi
     if [ ! -d /sys/firmware/efi ]; then
-        [ $forced -eq 0 ] || die "--efi-entry: this host is not booted under UEFI (no /sys/firmware/efi), so it has no boot variables to write. Boot it under UEFI, or add the entry from the machine that will boot the disk."
+        [ "$EFI_ENTRY_FORCED" -eq 0 ] || die "$flag: this host is not booted under UEFI (no /sys/firmware/efi), so it has no boot variables to write. Boot it under UEFI, or add the entry from the machine that will boot the disk."
         EFI_ENTRY_WHY="this host is not booted under UEFI (no /sys/firmware/efi), so it has no boot variables to write"
         return 0
     fi
     if ! command -v efibootmgr >/dev/null 2>&1; then
-        [ $forced -eq 0 ] || die "--efi-entry needs efibootmgr, which is not installed here (apt install efibootmgr)."
+        [ "$EFI_ENTRY_FORCED" -eq 0 ] || die "$flag needs efibootmgr, which is not installed here (apt install efibootmgr)."
         EFI_ENTRY_WHY="efibootmgr is not installed (apt install efibootmgr)"
         return 0
     fi
     if [ -z "$EFI_ENTRY_DISK" ] || [ -z "$EFI_ENTRY_PART" ]; then
-        [ $forced -eq 0 ] || die "--efi-entry: cannot resolve the disk and partition number of the target ESP $TGT_EFI, which is what efibootmgr -d/-p need."
+        [ "$EFI_ENTRY_FORCED" -eq 0 ] || die "$flag: cannot resolve the disk and partition number of the target ESP $TGT_EFI, which is what efibootmgr -d/-p need."
         EFI_ENTRY_WHY="cannot resolve the disk and partition number of $TGT_EFI"
         return 0
     fi
-    # A loop device is not a disk any firmware can find at boot, so --efi-entry
-    # cannot be honoured for one either.
+    # A loop device is not a disk any firmware can find at boot, so a forced
+    # entry cannot be honoured for one either.
     case "$EFI_ENTRY_DISK" in
         /dev/loop*)
-            [ $forced -eq 0 ] || die "--efi-entry: the target ESP is on $EFI_ENTRY_DISK, a loop device -- an NVRAM entry names a disk the firmware finds at boot, which that is not. Write the image to a disk and register it there."
+            [ "$EFI_ENTRY_FORCED" -eq 0 ] || die "$flag: the target ESP is on $EFI_ENTRY_DISK, a loop device -- an NVRAM entry names a disk the firmware finds at boot, which that is not. Write the image to a disk and register it there."
             EFI_ENTRY_WHY="$EFI_ENTRY_DISK is a loop device, which no firmware can boot"
             return 0 ;;
     esac
-    if [ $forced -eq 0 ] && ! disk_is_fixed "$EFI_ENTRY_DISK"; then
+    if [ "$EFI_ENTRY_FORCED" -eq 0 ] && ! disk_is_fixed "$EFI_ENTRY_DISK"; then
         EFI_ENTRY_WHY="$EFI_ENTRY_DISK is a hotplug disk -- it boots off $EFI_LOADER, the removable fallback path (--efi-entry overrides)"
         return 0
     fi
@@ -2432,33 +2465,79 @@ probe_efi_entry() {
     [ -n "$partuuid" ] || return 0
     row=$(efi_entry_lookup "$partuuid") || row=""
     [ -n "$row" ] || return 0
+    # _NUM/_ACTIVE/_ORDER/_NAME describe the first match (what the summary
+    # names); _NUMS/_DOOMED carry every one, because a forced run deletes them
+    # all rather than converging one run at a time. EFI_ENTRY_DELETE is a
+    # FORECAST for the summary only -- create_efi_entry looks again for real.
     if [ $UNIFIED_TARGET -eq 1 ] && [ $UPDATE -eq 0 ]; then
-        IFS=$'\t' read -r EFI_ENTRY_DOOMED _ _ EFI_ENTRY_NAME <<<"$row"
+        IFS=$'\t' read -r _ _ _ EFI_ENTRY_NAME <<<"$row"
+        EFI_ENTRY_DOOMED=$(efi_entry_nums "$row")
+        [ "$EFI_ENTRY_FORCED" -eq 0 ] || EFI_ENTRY_DELETE="$EFI_ENTRY_DOOMED"
         return 0
     fi
     IFS=$'\t' read -r EFI_ENTRY_NUM EFI_ENTRY_ACTIVE EFI_ENTRY_ORDER EFI_ENTRY_NAME <<<"$row"
-    EFI_ENTRY_DO=0
+    EFI_ENTRY_NUMS=$(efi_entry_nums "$row")
+    # Add-never-remove holds for the entry written as a side effect of
+    # installing to a fixed disk -- NVRAM is the machine's. It does not hold
+    # when the operator asks for the entry by name: --efi-entry-label cannot
+    # rename anything, and --efi-entry cannot repair an inactive or unordered
+    # entry, if a match makes them no-ops.
+    if [ "$EFI_ENTRY_FORCED" -eq 1 ]; then
+        EFI_ENTRY_DELETE="$EFI_ENTRY_NUMS"
+    else
+        EFI_ENTRY_DO=0
+    fi
+}
+
+# efi_entry_delete <num>... — remove the Boot#### variables a forced run
+#   supersedes: the one break in the add-never-remove rule, and only because
+#   --efi-entry/--efi-entry-label asked for it by name. Advisory like the
+#   create, and for the same reason -- the disk is complete either way -- so a
+#   failure warns, names the by-hand command and returns 0 rather than letting
+#   set -e end the run over this machine's NVRAM housekeeping.
+efi_entry_delete() {
+    local num
+    for num in "$@"; do
+        info "Deleting the superseded firmware entry Boot$num..."
+        run sudo efibootmgr -q -b "$num" -B || \
+            echo "Warning: could not delete Boot$num -- remove it by hand with: sudo efibootmgr -b $num -B" >&2
+    done
+    return 0
 }
 
 # create_efi_entry — the NVRAM write, last of all: after verify_install and
 #   after the tree is unmounted, so nothing points this machine at a disk that
 #   failed verification. Idempotent -- it re-reads the ESP PARTUUID (parted has
 #   run by now) and looks again, so an entry already booting that ESP is
-#   reported and left alone rather than duplicated. Advisory throughout: the
-#   disk is written and correct, and what is missing is a pointer in THIS
-#   machine's firmware, so a failure warns and prints the command by hand
-#   instead of failing the run (the same reasoning as the grub-fstest probes).
-#   Reads EFI_ENTRY_DO/_DISK/_PART/_TITLE and TGT_EFI.
+#   reported and left alone rather than duplicated... unless EFI_ENTRY_FORCED,
+#   in which case every such entry is REPLACED: written first, deleted after.
+#   That order is the safety property. A create that fails then leaves the
+#   machine its working entry (and prints the by-hand line), where deleting
+#   first could leave a machine with nothing pointing at the disk it boots --
+#   and it also stops efibootmgr -c handing the new entry a number this run is
+#   about to remove, the old ones still being occupied when it picks one.
+#   Advisory throughout: the disk is written and correct, and what is missing
+#   is a pointer in THIS machine's firmware, so a failure warns and prints the
+#   command by hand instead of failing the run (the same reasoning as the
+#   grub-fstest probes).
+#   Reads EFI_ENTRY_DO/_FORCED/_DISK/_PART/_TITLE/_DOOMED and TGT_EFI.
 create_efi_entry() {
-    local partuuid row num
+    local partuuid row num stale="" doomed="" victims
     [ "$EFI_ENTRY_DO" -eq 1 ] || return 0
+    # The entries a fresh unified --target orphans: their partition is gone, so
+    # the lookup below cannot find them and the probe numbers are the record.
+    [ "$EFI_ENTRY_FORCED" -eq 0 ] || doomed="$EFI_ENTRY_DOOMED"
     partuuid=$(lsblk -dno PARTUUID "$TGT_EFI" 2>/dev/null | xargs || true)
     if [ -n "$partuuid" ]; then
         row=$(efi_entry_lookup "$partuuid") || row=""
         if [ -n "$row" ]; then
             IFS=$'\t' read -r num _ _ _ <<<"$row"
-            info "This machine already boots the target ESP (Boot$num); leaving its NVRAM alone."
-            return 0
+            if [ "$EFI_ENTRY_FORCED" -eq 0 ]; then
+                info "This machine already boots the target ESP (Boot$num); leaving its NVRAM alone."
+                return 0
+            fi
+            stale=$(efi_entry_nums "$row")
+            info "This machine already boots the target ESP; replacing that entry as asked."
         fi
     elif [ "$DRY_RUN" -eq 0 ]; then
         echo "Warning: cannot read the PARTUUID of the target ESP $TGT_EFI, so this machine was not registered to boot it. By hand:" >&2
@@ -2474,12 +2553,34 @@ create_efi_entry() {
         echo "  sudo efibootmgr -c -d $EFI_ENTRY_DISK -p $EFI_ENTRY_PART -L \"$EFI_ENTRY_TITLE\" -l '$EFI_LOADER'" >&2
         return 0
     fi
+    # Only now, the new entry being written: the superseded ones, and the ones
+    # this run orphaned by repartitioning the ESP they name.
+    victims="$stale $doomed"
+    # Strike the entry just written off that list -- whatever number it was
+    # given, it is the one number that must survive. efibootmgr -c cannot hand
+    # it a number that is still live, so this can only bite if something freed
+    # a doomed number between the gate and now; the cost would be deleting the
+    # entry this run exists to write, so it is checked rather than reasoned out.
+    if [ "$DRY_RUN" -eq 0 ]; then
+        for num in $(efi_entry_nums "$(efi_entry_lookup "$partuuid")"); do
+            case " $stale " in
+                *" $num "*) ;;
+                *) victims=" $victims "; victims="${victims// $num / }" ;;
+            esac
+        done
+    fi
+    # shellcheck disable=SC2086 -- a space-separated list of Boot numbers
+    [ -z "${victims// /}" ] || efi_entry_delete $victims
     [ "$DRY_RUN" -eq 0 ] || return 0
-    # Read it back: an exit status is not proof the variable landed.
+    # Read it back: an exit status is not proof the variable landed. After the
+    # deletes, so a leftover cannot be mistaken for the entry just written.
     row=$(efi_entry_lookup "$partuuid") || row=""
     if [ -n "$row" ]; then
         IFS=$'\t' read -r num _ _ _ <<<"$row"
         echo "  [PASS] this machine boots the target ESP as Boot$num \"$EFI_ENTRY_TITLE\" (first in BootOrder)."
+        # Anything beyond the entry just written means a delete did not take.
+        victims=$(efi_entry_nums "$row")
+        [ "$victims" = "$num" ] || echo "Warning: more than one entry still names that ESP (Boot numbers: $victims) -- a delete above did not take." >&2
     else
         echo "Warning: efibootmgr reported success, but no entry for the target ESP reads back -- check \"efibootmgr -v\"." >&2
     fi
@@ -2761,19 +2862,24 @@ MENU_CMDLINE_PREVIEW=""
 NEW_UUID_ROOT=""
 
 # What probe_efi_entry decided about this machine's NVRAM, and what
-# create_efi_entry writes with it. DO/WHY are the decision; NUM/NAME/ACTIVE/
-# ORDER describe an entry that already boots that ESP; DOOMED names one that is
-# about to point at a partition this run replaces.
+# create_efi_entry writes with it. DO/WHY are the decision and FORCED whether
+# a flag asked for it (which is what turns a match into a replacement);
+# NUM/NAME/ACTIVE/ORDER describe the first entry that already boots that ESP
+# and NUMS every one of them; DOOMED names the ones about to point at a
+# partition this run replaces; DELETE is what the summary forecasts will go.
 EFI_ENTRY_DO=0
+EFI_ENTRY_FORCED=0
 EFI_ENTRY_WHY=""
 EFI_ENTRY_DISK=""
 EFI_ENTRY_PART=""
 EFI_ENTRY_TITLE=""
 EFI_ENTRY_NUM=""
+EFI_ENTRY_NUMS=""
 EFI_ENTRY_NAME=""
 EFI_ENTRY_ACTIVE=""
 EFI_ENTRY_ORDER=""
 EFI_ENTRY_DOOMED=""
+EFI_ENTRY_DELETE=""
 EFI_ENTRY_DISTRO=""
 
 # Swap files listed in the source's fstab: to rebuild, dropped by --exclude-from,
@@ -2988,8 +3094,12 @@ Other:
                               boot menu lists the disk. Done anyway when the
                               target is a FIXED disk this host has no entry for;
                               the flag forces it for a hotplug/USB target too.
-                              Nothing is ever deleted or re-ordered: an entry
-                              that already boots that ESP is left alone.
+                              Asking for it explicitly also REPLACES: every
+                              entry already booting that ESP is deleted once the
+                              new one is written, so the label, the active flag
+                              and the place in BootOrder are this run's. Without
+                              the flag nothing is ever deleted or re-ordered --
+                              an entry that already boots that ESP is left be.
   --no-efi-entry              Leave this machine's boot variables alone. The
                               disk still boots wherever the firmware tries the
                               removable path \EFI\BOOT\BOOTX64.EFI by itself,
@@ -2998,8 +3108,11 @@ Other:
                               try it, a T450s does).
   --efi-entry-label NAME      Label that entry NAME instead of "<distro>
                               (<brand>)" -- "Ubuntu 26 (NVMe)" with --brand
-                              NVMe. Cosmetic: it is the string the firmware boot
-                              menu shows.
+                              NVMe. It is the string the firmware boot menu
+                              shows, and naming an entry is asking for one:
+                              this implies --efi-entry, replacement included,
+                              which is what lets it rename an entry that is
+                              already there.
   --target-efi-size SIZE      Size of the ESP on a freshly partitioned --target
                               (default 256M). Bare = MiB; k/M/G must come out
                               whole MiB, since root starts where the ESP ends.
@@ -3073,9 +3186,12 @@ Notes:
     registered in the boot variables of the machine running this script:
       sudo efibootmgr -c -d /dev/nvme0n1 -p 1 -L "Ubuntu 26 (NVMe)" \\
            -l '\EFI\BOOT\BOOTX64.EFI'
-    Those variables belong to the machine, not the disk, so this only ever ADDS
-    one. Retiring a dead entry -- a disk repartitioned since, say -- is
-    "efibootmgr -b XXXX -B" by hand. See --efi-entry / --no-efi-entry.
+    Those variables belong to the machine, not the disk, so a run told nothing
+    only ever ADDS one, and retiring a dead entry -- a disk repartitioned since,
+    say -- is "efibootmgr -b XXXX -B" by hand. Ask for the entry outright, with
+    --efi-entry or --efi-entry-label, and the run instead REPLACES: the new
+    entry is written first, then every one that named that ESP is deleted,
+    dead ones from a repartition included. See --efi-entry / --no-efi-entry.
   * A separate /boot earns its keep on a machine whose BIOS cannot boot from
     NVMe: BIOS Boot, the ESP and /boot go on a disk that BIOS can read, while /
     -- everything the running system actually reads -- stays on the NVMe.
@@ -3221,8 +3337,9 @@ if [ -n "$TGT_ROOT_LABEL" ]; then
 fi
 
 # --efi-entry-label is the label of an entry --no-efi-entry says not to write:
-# a contradiction, and refused rather than ignored, like the flags above. An
-# empty label means "not given", as everywhere else here; the value reaches
+# a contradiction, and refused rather than ignored, like the flags above -- the
+# more so now that naming an entry implies asking for one (EFI_ENTRY_FORCED).
+# An empty label means "not given", as everywhere else here; the value reaches
 # efibootmgr -L, so what it must not be is more than one line.
 if [ -n "$EFI_ENTRY_LABEL" ]; then
     [ "$EFI_ENTRY" != 0 ] || \
@@ -3993,11 +4110,32 @@ echo "            GRUB boot directory + menu on the ESP (--boot-directory=/boot/
 # Not a property of the disk, hence its own block -- and "nothing to do",
 # "declined" and "cannot" must not look alike.
 if [ "$EFI_ENTRY_DO" -eq 1 ]; then
-    summary_row "NVRAM:" "CREATE    \"$EFI_ENTRY_TITLE\" -> $EFI_ENTRY_DISK p$EFI_ENTRY_PART $EFI_LOADER"
+    # REPLACE only when this run will actually delete something: a forced run
+    # that finds no entry is an ordinary CREATE.
+    nvram_verb="CREATE   "; [ -z "$EFI_ENTRY_DELETE" ] || nvram_verb="REPLACE  "
+    summary_row "NVRAM:" "$nvram_verb \"$EFI_ENTRY_TITLE\" -> $EFI_ENTRY_DISK p$EFI_ENTRY_PART $EFI_LOADER"
     if [ $UNIFIED_TARGET -eq 1 ] && [ $UPDATE -eq 0 ]; then
         summary_row "" "checked again after the gate: parted re-creates this ESP, so the PARTUUID to look for does not exist yet"
-        [ -z "$EFI_ENTRY_DOOMED" ] || summary_row "" \
-            "Boot$EFI_ENTRY_DOOMED \"$EFI_ENTRY_NAME\" names the ESP this run replaces, so it will be dead afterwards (efibootmgr -b $EFI_ENTRY_DOOMED -B)"
+        for nvram_num in $EFI_ENTRY_DOOMED; do
+            if [ "$EFI_ENTRY_FORCED" -eq 1 ]; then
+                summary_row "" "Boot$nvram_num names the ESP this run replaces, so it will be dead afterwards; deleted once the new entry is written"
+            elif [ "$nvram_num" = "${EFI_ENTRY_DOOMED%% *}" ]; then
+                summary_row "" "Boot$nvram_num \"$EFI_ENTRY_NAME\" names the ESP this run replaces, so it will be dead afterwards (efibootmgr -b $nvram_num -B)"
+            else
+                summary_row "" "Boot$nvram_num names it too, and will be just as dead (efibootmgr -b $nvram_num -B)"
+            fi
+        done
+    elif [ -n "$EFI_ENTRY_NUMS" ]; then
+        # Forced, and this machine already boots that ESP: add-never-remove is
+        # set aside because the operator named the entry.
+        for nvram_num in $EFI_ENTRY_NUMS; do
+            if [ "$nvram_num" = "$EFI_ENTRY_NUM" ]; then
+                summary_row "" "Boot$nvram_num \"$EFI_ENTRY_NAME\" already boots that ESP; deleted once the new entry is written"
+            else
+                summary_row "" "Boot$nvram_num names it too; deleted as well"
+            fi
+        done
+        summary_row "" "efibootmgr puts the new one first in BootOrder"
     else
         summary_row "" "this machine has no entry for that ESP; efibootmgr puts the new one first in BootOrder"
     fi
@@ -4008,10 +4146,15 @@ if [ "$EFI_ENTRY_DO" -eq 1 ]; then
         "the distro half of that label comes from the target's own /etc/os-release, which could not be read here"
 elif [ -n "$EFI_ENTRY_NUM" ]; then
     summary_row "NVRAM:" "keep      Boot$EFI_ENTRY_NUM \"$EFI_ENTRY_NAME\" already boots that ESP on this machine"
+    if [ "$EFI_ENTRY_NUMS" != "${EFI_ENTRY_NUMS%% *}" ]; then
+        nvram_list=""
+        for nvram_num in ${EFI_ENTRY_NUMS#* }; do nvram_list="${nvram_list:+$nvram_list, }Boot$nvram_num"; done
+        summary_row "" "...and that ESP is also named by $nvram_list; --efi-entry collapses them all into one entry"
+    fi
     [ "$EFI_ENTRY_ORDER" = ordered ] || summary_row "" \
-        "...but it is not in BootOrder, so the firmware never tries it (efibootmgr -o puts it back); left alone"
+        "...but it is not in BootOrder, so the firmware never tries it (efibootmgr -o puts it back, --efi-entry rewrites it); left alone"
     [ "$EFI_ENTRY_ACTIVE" = active ] || summary_row "" \
-        "...but it is inactive (efibootmgr -b $EFI_ENTRY_NUM -a activates it); left alone"
+        "...but it is inactive (efibootmgr -b $EFI_ENTRY_NUM -a activates it, --efi-entry rewrites it); left alone"
 else
     summary_row "NVRAM:" "skipped   ${EFI_ENTRY_WHY:-no entry written}"
     # The trap this step exists for: with no firmware entry AND no legacy path,
