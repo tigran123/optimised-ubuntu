@@ -104,6 +104,7 @@
 /home/tigran/Personal/
 /home/tigran/Misc/
 /var/cache/apt/*
+/var/cache/wigner/
 /var/log/journal/*
 /var/log/AmneziaVPN/
 /etc/systemd/system/AmneziaVPN.service
