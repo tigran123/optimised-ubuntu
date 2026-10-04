@@ -23,7 +23,7 @@ The tree below mirrors `/`: each file goes to the same path without the leading
 | `etc/skel/.inputrc` | vi editing mode in bash and every other readline program |
 | `etc/skel/.config/terminator/config` | Terminator in Terminus Bold 14, full screen, with no title bar or scroll bar, 5000 lines of scrollback, and Alt+1…9 to switch tabs |
 | `etc/dconf/profile/user` | puts the system database `local` underneath each user's own settings |
-| `etc/dconf/db/local.d/00-optimised` | the desktop defaults: wallpaper, blue accent, no animations, dock, night light, Ctrl+F9 for Terminator, and the rest (see the file) |
+| `etc/dconf/db/local.d/00-optimised` | the desktop defaults: wallpaper, every monitor at 100% (Terminus is a bitmap font), blue accent, no animations, dock, night light, Ctrl+F9 for Terminator, and the rest (see the file) |
 | `usr/share/backgrounds/Ravnina.jpg` | the wallpaper (3840×2160) |
 | `usr/share/gnome-background-properties/optimised-ubuntu-wallpapers.xml` | lists the wallpaper in Settings → Appearance, so it can be chosen again after a change |
 

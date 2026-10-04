@@ -14,6 +14,10 @@ accent-color='blue'
 gtk-theme='Yaru-blue'
 icon-theme='Yaru-blue'
 enable-animations=false
+# Every monitor at 100% instead of a scale guessed from its DPI, since
+# Terminus is a bitmap font and smears at any other. A scale picked in
+# Settings > Display is stored in ~/.config/monitors.xml and still wins.
+scaling-factor=uint32 1
 
 [org/gnome/desktop/privacy]
 remember-recent-files=false
