@@ -1,0 +1,54 @@
+# Settings from the source account that 00-optimised leaves out, because they
+# suit one person, one screen or one keyboard rather than everybody.
+# Not installed by the README. To adopt some, move those blocks into
+# 00-optimised (or install this whole file next to it), then: dconf update
+
+# Larger text and pointer, for a high-resolution screen.
+[org/gnome/desktop/interface]
+text-scaling-factor=1.25
+cursor-size=32
+
+# Never blank the screen, and never suspend on mains power.
+[org/gnome/desktop/session]
+idle-delay=uint32 0
+
+[org/gnome/settings-daemon/plugins/power]
+sleep-inactive-ac-type='nothing'
+
+# UK and Russian phonetic layouts: Alt+Shift switches, right Alt is Compose.
+[org/gnome/desktop/input-sources]
+sources=[('xkb', 'gb'), ('xkb', 'ru+phonetic')]
+xkb-options=['grp:alt_shift_toggle', 'compose:ralt']
+per-window=true
+
+# Window keys. Ctrl+Left/Right switch workspaces, which takes word-jump away
+# from every application. Super+Space no longer switches layouts.
+[org/gnome/desktop/wm/keybindings]
+maximize=['<Super>Up']
+maximize-vertically=['<Super>Down']
+switch-to-workspace-left=['<Control>Left']
+switch-to-workspace-right=['<Control>Right']
+switch-input-source=@as []
+switch-input-source-backward=@as []
+
+[org/gnome/mutter]
+edge-tiling=false
+
+[org/gnome/shell]
+disabled-extensions=['tiling-assistant@ubuntu.com']
+
+# Ctrl+Alt launchers, and Ctrl+F10 for the web browser.
+[org/gnome/settings-daemon/plugins/media-keys]
+control-center=['<Control><Alt>s']
+home=['<Control><Alt>f']
+logout=['<Control><Alt>o']
+reboot=['<Control><Alt>Delete']
+screensaver=['<Control><Alt>l']
+shutdown=['<Control><Alt>h']
+www=['<Control>F10']
+
+# Evince: two-page view, fitted to the width, no sidebar.
+[org/gnome/evince/default]
+dual-page=true
+sizing-mode='fit-width'
+show-sidebar=false
