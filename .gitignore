@@ -1,4 +1,7 @@
 *.img
 *.img.xz
+*.img.xz.sha256
 *.vdi
+*.vdi.xz
+*.vdi.xz.sha256
 md5sums.txt
