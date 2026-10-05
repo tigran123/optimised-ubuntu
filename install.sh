@@ -309,11 +309,16 @@ swapfile_entries() {
 #   deliberately NON-existent: against the real target rsync's quick check would
 #   skip an unchanged file and the empty output would read as "excluded".
 #   Limit: a rule excluding a whole parent directory is not detected, --relative
-#   always sending implied dirs. That needs an exclude file that guts /var.
+#   always sending implied dirs. That needs an exclude file that guts /var --
+#   or --public, whose one such rule (all of /home) is answered by name instead.
+#   The --public rules count as well as the file's.
 swapfile_excluded() {
     local sf=$1 listed rc=0
-    [ -n "$EXCLUDE_FROM" ] || return 1
-    listed=$(sudo rsync -n --relative --exclude-from="$EXCLUDE_FROM" \
+    local -a rules=(${PUBLIC_FILTERS[@]+"${PUBLIC_FILTERS[@]}"})
+    if [ "$PUBLIC" -eq 1 ] && public_home_of "$sf" >/dev/null; then return 0; fi
+    if [ -n "$EXCLUDE_FROM" ]; then rules+=(--exclude-from="$EXCLUDE_FROM"); fi
+    [ ${#rules[@]} -gt 0 ] || return 1
+    listed=$(sudo rsync -n --relative "${rules[@]}" \
                  --out-format='%n' "$SRC/./${sf#/}" "$MNT/.swapfile-probe" 2>/dev/null) || rc=$?
     # A failed probe (e.g. the source file is gone) must not read as "excluded".
     [ "$rc" -eq 0 ] || return 1
@@ -340,6 +345,9 @@ probe_source_swapfiles() {
     # FSTAB_TABLE, which the swap loop below needs to tell /var/swap (in the
     # transfer) from /data/swap (on a partition of its own, and not).
     probe_source_layout
+    # --public's accounts and rules before the swap loop, whose "is this file
+    # excluded?" must count them too.
+    if [ "$PUBLIC" -eq 1 ]; then probe_public; fi
     if [ -f "$SRC/etc/fstab" ]; then
         while read -r sf; do
             [ -n "$sf" ] || continue
@@ -358,6 +366,17 @@ probe_source_swapfiles() {
     MENU_CMDLINE_PREVIEW=$(grub_cmdline_options "$SRC")
     probe_memtest "$SRC"
     probe_os_release "$SRC"
+    HOSTNAME_SRC=$(hostname_from "$SRC")
+    # Last, because it walks the whole transfer, swap files excluded as they
+    # will be: what the copy would carry that belongs to nobody afterwards.
+    # Only after probe_public really read the accounts (it leaves the rules
+    # empty when it could not), or a scan would vouch for an image that still
+    # carries them.
+    if [ "$PUBLIC" -eq 1 ] && [ ${#PUBLIC_FILTERS[@]} -gt 0 ]; then
+        swap_excludes_from_preview
+        info "Listing what the copy would carry, owners and all (--public)..."
+        public_scan_owners
+    fi
     sudo umount "$SRC" || true
 }
 
@@ -669,7 +688,8 @@ probe_source_layout() {
         mapfile -t EXCLUDE_AUDIT < <(exclude_rules_unmatchable)
         EXCLUDE_PROBED=1
     fi
-    probe_fstab_remap
+    # --public disables every mount but the target's own: nothing to offer.
+    if [ "$PUBLIC" -eq 0 ]; then probe_fstab_remap; fi
 }
 
 # scan_cache_drops — the authoritative pass, Phase 3, source really mounted (the
@@ -747,6 +767,29 @@ swap_excludes_from_preview() {
         case "$state" in keep|drop) ;; *) continue ;; esac
         SWAP_EXCLUDES+=("--exclude=${real:-$sf}")
     done
+}
+
+# root_filters — every filter rule of the root transfer, in the order rsync must
+#   see them, into ROOT_FILTERS. The caches and the --public rules come FIRST:
+#   the first matching rule wins, and a "+" line in an --exclude-from file must
+#   re-include neither. Then that file, /boot whenever it is a filesystem of its
+#   own on either side, the live system's virtual and scratch directories, and
+#   the swap files. Built in one place for the Phase 3 rsync and the --public
+#   ownership scan, so that what is checked is exactly what is copied.
+#   /boot takes TWO rules: "- /boot/" hides it from the sender, and only the
+#   receiver-side "P /boot/" stops --delete emptying the target's /boot, since
+#   --delete-excluded demotes unqualified rules to sender-side only. With /boot
+#   inside / on both sides it simply rides along. Reads CACHE_FILTERS,
+#   PUBLIC_FILTERS, EXCLUDE_FROM, TGT_SEP_BOOT, BOOT_PASS, SWAP_EXCLUDES.
+root_filters() {
+    ROOT_FILTERS=(${CACHE_FILTERS[@]+"${CACHE_FILTERS[@]}"}
+                  ${PUBLIC_FILTERS[@]+"${PUBLIC_FILTERS[@]}"})
+    if [ -n "$EXCLUDE_FROM" ]; then ROOT_FILTERS+=(--exclude-from="$EXCLUDE_FROM"); fi
+    if [ "$TGT_SEP_BOOT" -eq 1 ] || [ "$BOOT_PASS" -eq 1 ]; then
+        ROOT_FILTERS+=(--filter='- /boot/' --filter='P /boot/')
+    fi
+    ROOT_FILTERS+=(--exclude={"/dev/*","/proc/*","/sys/*","/tmp/*","/run/*","/media/*","/mnt/*","/lost+found"}
+                   ${SWAP_EXCLUDES[@]+"${SWAP_EXCLUDES[@]}"})
 }
 
 # exclude_rules_unmatchable — audit an --exclude-from file against the source's
@@ -849,6 +892,467 @@ report_exclude_audit() {
         summary_row "" "  but a mount the target keeps still carries that data on the clone (Phase 4 says which survived)"
     fi
 }
+
+# -----------------------------------------------------------------------------
+# Public images (--public)
+# -----------------------------------------------------------------------------
+# An image to give away carries no human account and no machine identity. The
+# new owner creates their account at first boot -- GDM runs gnome-initial-setup
+# when there is none -- and a machine-id reading "uninitialized" makes that boot
+# a first boot, which is what has sshd-keygen.service mint new host keys. What
+# would still tie the copy to this machine or this person is kept OUT of the
+# transfer by rsync rules rather than deleted afterwards, so it is never written
+# to the target at all: the homes, the sources of the binds into them, the units
+# that run as their owners, and the state below. What no rule can know about --
+# a file elsewhere owned by an account that is going -- the ownership scan
+# finds, and the run refuses until --exclude-from covers it.
+
+# PUBLIC_STATE_RULES — the per-machine and per-person state no image should
+#   carry, whoever built it. The first matching rule wins, which is what lets the
+#   /var/log trio keep every log directory (daemons expect theirs, and journald
+#   its own) while dropping every file in them, and /root keep its two dotfiles.
+PUBLIC_STATE_RULES=(
+    # Accounts. /home in full: no account ships, so no home does -- an orphaned
+    # one included, such as a deluser --remove-home that tripped over a socket.
+    '- /home/*'
+    '- /var/mail/*'
+    '- /var/spool/cron/crontabs/*'
+    '- /var/lib/AccountsService/users/*'
+    '- /var/lib/AccountsService/icons/*'
+    '- /var/lib/systemd/linger/*'
+    '- /var/lib/sudo/*'
+    '+ /root/.bashrc'
+    '+ /root/.profile'
+    '- /root/*'
+    # Identity, regenerated at first boot or by the first connection. The
+    # machine-info carries the pretty hostname GNOME shows as the device name.
+    '- /etc/machine-id'
+    '- /etc/machine-info'
+    '- /etc/ssh/ssh_host_*'
+    '- /var/lib/systemd/random-seed'
+    '- /var/lib/systemd/credential.secret'
+    '- /var/lib/NetworkManager/*'
+    # Saved networks with their Wi-Fi passwords (NetworkManager keeps them as
+    # netplan files on Ubuntu), Bluetooth pairing keys, enrolled fingerprints.
+    '- /etc/NetworkManager/system-connections/*'
+    '- /etc/netplan/90-NM-*'
+    '- /var/lib/bluetooth/*'
+    '- /var/lib/fprint/*'
+    # The greeter's own state: a fresh install has none, and GDM makes it.
+    '- /var/lib/gdm3/seat0/'
+    # The installer's record of the first account, password hash included: its
+    # cloud-config, and cloud-init's copy of it from the one boot it ran before
+    # the installer disabled it. (The installer's logs go with /var/log.)
+    '- /etc/cloud/cloud.cfg.d/99-installer.cfg'
+    '- /var/lib/cloud/*'
+    # History. /var/backups holds passwd.bak and shadow.bak: the password hashes.
+    '- /var/log/journal/*'
+    '+ /var/log/**/'
+    '- /var/log/**'
+    '- /var/crash/*'
+    '- /var/tmp/*'
+    '- /var/backups/*'
+    '- /var/lib/systemd/coredump/*'
+    '- /var/spool/cups/[cd]*'
+)
+
+# public_field <row> <n> — the nth field of a tab-separated PUBLIC_USERS row
+#   ("name uid gid home"). Tabs, because a home directory may contain spaces.
+public_field() { printf '%s\n' "$1" | cut -f "$2"; }
+
+# public_home_of <path> — the removed home <path> is, or sits in, printed; false
+#   when it is in none. /home counts whole: --public ships no home at all.
+public_home_of() {
+    local row home
+    case "$1" in /home/?*) printf '%s\n' "/home/$(printf '%s' "${1#/home/}" | cut -d/ -f1)"; return 0 ;; esac
+    for row in ${PUBLIC_USERS[@]+"${PUBLIC_USERS[@]}"}; do
+        home=$(public_field "$row" 4)
+        case "$home" in /|'') continue ;; esac
+        if [ "$1" = "$home" ] || [ "${1#"$home"/}" != "$1" ]; then
+            printf '%s\n' "$home"; return 0
+        fi
+    done
+    return 1
+}
+
+# public_filters_static — PUBLIC_FILTERS with only the rules that need no source
+#   to read: what a dry run against an image (no loop device) can still print.
+public_filters_static() {
+    local rule
+    PUBLIC_FILTERS=()
+    for rule in "${PUBLIC_STATE_RULES[@]}"; do PUBLIC_FILTERS+=(--filter="$rule"); done
+}
+
+# probe_public — what --public needs to know about the SOURCE, read through the
+#   mount probe_source_swapfiles() holds, before the gate: the human range its
+#   login.defs declares, the accounts in it, the private groups userdel will
+#   delete with them (same name, their primary gid, nobody else in it), the
+#   groups in range that stay, the units that run as any of them, the binds into
+#   their homes and the netplan files naming this machine's interfaces. Then
+#   PUBLIC_FILTERS, the per-source rules in front of PUBLIC_STATE_RULES. Reads
+#   SRC and FSTAB_TABLE; fills the PUBLIC_* tables bar the scan's own.
+probe_public() {
+    local v n name uid gid home row gname ggid gmem real mp kind src f rel unit link rule nss who=""
+    local -a rules=()
+    PUBLIC_USERS=(); PUBLIC_GIDS_GONE=" "; PUBLIC_GIDS_KEPT=" "
+    PUBLIC_UNITS=(); PUBLIC_BINDS=(); PUBLIC_NETPLAN=()
+    # No account databases, no answers: PUBLIC_PROBED stays 0 and the gate says so.
+    [ -r "$SRC/etc/passwd" ] && [ -r "$SRC/etc/group" ] || return 0
+    for v in UID_MIN UID_MAX GID_MIN GID_MAX; do
+        n=$(awk -v k="$v" '$1 == k && $2 ~ /^[0-9]+$/ { n = $2 } END { print n }' \
+                "$SRC/etc/login.defs" 2>/dev/null) || n=""
+        [ -z "$n" ] || printf -v "PUBLIC_$v" '%s' "$n"
+    done
+
+    while IFS=: read -r name _ uid gid _ home _; do
+        [[ "$uid" =~ ^[0-9]+$ ]] || continue
+        [ "$uid" -ge "$PUBLIC_UID_MIN" ] && [ "$uid" -le "$PUBLIC_UID_MAX" ] || continue
+        [ "$home" = / ] || home=${home%/}
+        PUBLIC_USERS+=("$name"$'\t'"$uid"$'\t'"$gid"$'\t'"$home")
+        who+="${who:+|}${name//./\\.}|$uid"     # a regex below: a dot is literal
+    done < "$SRC/etc/passwd"
+
+    while IFS=: read -r gname _ ggid gmem; do
+        [[ "$ggid" =~ ^[0-9]+$ ]] || continue
+        for row in ${PUBLIC_USERS[@]+"${PUBLIC_USERS[@]}"}; do
+            name=$(public_field "$row" 1); gid=$(public_field "$row" 3)
+            if [ "$gname" = "$name" ] && [ "$ggid" = "$gid" ] && \
+               { [ -z "$gmem" ] || [ "$gmem" = "$name" ]; }; then
+                PUBLIC_GIDS_GONE+="$ggid "
+                who+="|${gname//./\\.}"
+                continue 2
+            fi
+        done
+        if [ "$ggid" -ge "$PUBLIC_GID_MIN" ] && [ "$ggid" -le "$PUBLIC_GID_MAX" ]; then
+            PUBLIC_GIDS_KEPT+="$ggid "
+        fi
+    done < "$SRC/etc/group"
+
+    # A home outside /home (which goes whole) goes by name -- but never one at
+    # the top of the tree: an account whose home is / or /srv must not take the
+    # system with it. Whatever it owns there, the ownership scan still finds.
+    for row in ${PUBLIC_USERS[@]+"${PUBLIC_USERS[@]}"}; do
+        home=$(public_field "$row" 4)
+        case "$home" in /home/*|/|'') continue ;; esac
+        real=$(fstab_realpath "$home") || continue
+        case "$real" in /*/*) rules+=("- $(rsync_pattern_escape "$real")") ;; esac
+    done
+
+    # The binds into a removed home: their mount entries go in Phase 4, and a
+    # source on the root filesystem would otherwise be copied all the same.
+    while IFS=$'\t' read -r mp kind src; do
+        [ "$kind" = bind ] && public_home_of "$mp" >/dev/null || continue
+        if real=$(fstab_realpath "$src"); then
+            PUBLIC_BINDS+=("$mp"$'\t'"$real")
+            rules+=("- $(rsync_pattern_escape "$real")")
+        else
+            PUBLIC_BINDS+=("$mp"$'\t'"-offroot-")
+        fi
+    done <<<"$FSTAB_TABLE"
+
+    # The units that run as a removed account or its group. A unit file goes
+    # with every link that enables it and its drop-in directory; a drop-in that
+    # says so about some other unit goes alone, which leaves that unit running
+    # as its package meant it to.
+    if [ -n "$who" ]; then
+        while IFS= read -r f; do
+            rel=${f#"$SRC"}
+            case "$rel" in
+                */*.d/*) PUBLIC_UNITS+=("$rel") ;;
+                *)  unit=${rel##*/}
+                    PUBLIC_UNITS+=("$rel")
+                    if sudo test -d "$f.d"; then PUBLIC_UNITS+=("$rel.d/"); fi
+                    while IFS= read -r link; do
+                        PUBLIC_UNITS+=("${link#"$SRC"}")
+                    done < <(sudo find "$SRC/etc/systemd/system" -type l -name "$unit" 2>/dev/null | sort)
+                    ;;
+            esac
+        done < <(sudo grep -rlE "^[[:space:]]*(User|Group)=($who)[[:space:]]*$" \
+                     "$SRC/etc/systemd/system" 2>/dev/null | sort)
+    fi
+    for rel in ${PUBLIC_UNITS[@]+"${PUBLIC_UNITS[@]}"}; do
+        rules+=("- $(rsync_pattern_escape "${rel%/}")")
+    done
+    PUBLIC_WHO=$who
+
+    # Netplan files that configure particular interfaces describe THIS machine.
+    # They are renamed, not dropped (Phase 4): netplan reads only *.yaml, so the
+    # new owner has them as examples. The ones NetworkManager saves are excluded
+    # outright -- they carry the Wi-Fi passwords.
+    for f in "$SRC"/etc/netplan/*.yaml; do
+        [ -e "$f" ] || continue
+        case "${f##*/}" in 90-NM-*) continue ;; esac
+        if sudo grep -qE '^[[:space:]]*(ethernets|wifis|bonds|bridges|vlans|tunnels|vrfs|modems)[[:space:]]*:' "$f"; then
+            PUBLIC_NETPLAN+=("${f#"$SRC"}")
+        fi
+    done
+
+    # The owner names the machine at first boot, so a 127.0.1.1 line written now
+    # would go stale at once and the image carries none. The name resolves
+    # anyway wherever something answers for the machine's own hostname without
+    # /etc/hosts: systemd-resolved, through nss-resolve or its 127.0.0.53 stub
+    # (the Ubuntu default, so libnss-myhostname is not needed), or nss-myhostname.
+    PUBLIC_RESOLVER=""
+    nss=" $(sed -n 's/#.*//; s/^hosts:[[:space:]]*//p' "$SRC/etc/nsswitch.conf" 2>/dev/null | tr -s '[:space:]' ' ' || true) "
+    if [[ $nss == *" myhostname "* ]]; then
+        PUBLIC_RESOLVER=nss-myhostname
+    elif [[ $nss == *" resolve "* ]]; then
+        PUBLIC_RESOLVER=systemd-resolved
+    elif [[ $nss == *" dns "* ]]; then
+        if [ -L "$SRC/etc/resolv.conf" ]; then
+            # Read the link, not the file: it points into /run, which is empty here.
+            if [[ $(readlink "$SRC/etc/resolv.conf") == */systemd/resolve/stub-resolv.conf ]]; then
+                PUBLIC_RESOLVER=systemd-resolved
+            fi
+        elif grep -qE '^[[:space:]]*nameserver[[:space:]]+127\.0\.0\.53([[:space:]]|$)' "$SRC/etc/resolv.conf" 2>/dev/null; then
+            PUBLIC_RESOLVER=systemd-resolved
+        fi
+    fi
+
+    public_filters_static
+    for rule in ${rules[@]+"${rules[@]}"}; do
+        PUBLIC_FILTERS=(--filter="$rule" "${PUBLIC_FILTERS[@]}")
+    done
+}
+
+# public_owner_test — read "<uid> <gid> <path>" lines and print "L<TAB><path>"
+#   for each one owned by a uid in the human range, or by a gid in it that no
+#   group will own once the accounts are gone. Every account in range is
+#   removed, so what they own afterwards belongs to nobody -- or to whoever is
+#   next given that number, the new owner first of all. Lines that do not start
+#   with a number pass through untouched. Shared by the pre-gate scan and
+#   verify_install(), so the refusal and the check apply one rule.
+public_owner_test() {
+    awk -v umin="$PUBLIC_UID_MIN" -v umax="$PUBLIC_UID_MAX" \
+        -v gmin="$PUBLIC_GID_MIN" -v gmax="$PUBLIC_GID_MAX" -v gkeep="$PUBLIC_GIDS_KEPT" '
+        $1 !~ /^[0-9]+$/ { print; next }
+        {
+            p = $0; sub(/^[^ ]+ [^ ]+ /, "", p);
+            u = $1 + 0; g = $2 + 0;
+            if ((u >= umin && u <= umax) ||
+                (g >= gmin && g <= gmax && index(gkeep, " " $2 " ") == 0))
+                print "L\t" p;
+        }'
+}
+
+# public_scan_owners — ask rsync what the root transfer would carry, owners and
+#   all: a dry run with exactly the rules root_filters() assembles, against a
+#   destination that does not exist (the trick swapfile_excluded() uses), so
+#   every file is listed. Fills PUBLIC_LEFTOVERS (the topmost paths left owned
+#   by nobody: a directory stands for everything in it), PUBLIC_LEFTOVER_N,
+#   PUBLIC_MENTIONS (the files of /etc, /var/lib and /var/spool in the transfer
+#   that still name a removed account or its home) and PUBLIC_PROBED. The caches
+#   are hidden only in Phase 3, which can only make this stricter. Reads SRC,
+#   MNT, PUBLIC_*.
+public_scan_owners() {
+    local tag path rc="" row
+    local -a etc=() pats=()
+    PUBLIC_LEFTOVERS=(); PUBLIC_LEFTOVER_N=0; PUBLIC_MENTIONS=(); PUBLIC_PROBED=0
+    root_filters
+    while IFS=$'\t' read -r tag path; do
+        case "$tag" in
+            L) PUBLIC_LEFTOVERS+=("$path") ;;
+            N) PUBLIC_LEFTOVER_N=$path ;;
+            E) etc+=("$path") ;;
+            R) rc=$path ;;
+        esac
+    done < <({ sudo rsync -n -a -x --numeric-ids --out-format='%U %G %n' \
+                   "${ROOT_FILTERS[@]}" "$SRC/" "$MNT/.public-probe/" 2>/dev/null
+               printf 'R\t%s\n' "$?"; } |
+             awk '/^R\t/ { print; next }
+                  {
+                      p = $0; sub(/^[^ ]+ [^ ]+ /, "", p);
+                      if (p == "./") next;
+                      if (p !~ /\/$/ && (substr(p, 1, 4) == "etc/" || substr(p, 1, 8) == "var/lib/" ||
+                                         substr(p, 1, 10) == "var/spool/")) print "E\t/" p;
+                      print $1 " " $2 " /" p;
+                  }' |
+             public_owner_test | LC_ALL=C sort |
+             awk -F'\t' '$1 == "L" {
+                             n++;
+                             if (top != "" && substr($2, 1, length(top)) == top) next;
+                             print; top = ($2 ~ /\/$/) ? $2 : ""; next;
+                         }
+                         { print }
+                         END { print "N\t" n + 0 }')
+    # 23/24 are "some files could not be read / vanished": a live source does
+    # that, and the files it did list are still the transfer. Anything else, or
+    # no answer at all, means nothing was checked -- which must not read as clean.
+    case "$rc" in 0|23|24) PUBLIC_PROBED=1 ;; *) return 0 ;; esac
+
+    # The files that still name a removed account -- in /etc, /var/lib and
+    # /var/spool, where configuration and state live: a warning, not a refusal
+    # -- a PATH mentioning an old home is untidy, not personal data. The account
+    # databases and fstab are rewritten by this run, hosts and hostname too.
+    for row in ${PUBLIC_USERS[@]+"${PUBLIC_USERS[@]}"}; do
+        pats+=(-e "$(public_field "$row" 1)")
+        case "$(public_field "$row" 4)" in /|'') ;; *) pats+=(-e "$(public_field "$row" 4)") ;; esac
+    done
+    [ ${#pats[@]} -gt 0 ] && [ ${#etc[@]} -gt 0 ] || return 0
+    while IFS= read -r path; do
+        path=${path#"$SRC"}
+        case "$path" in
+            /etc/passwd|/etc/shadow|/etc/group|/etc/gshadow|/etc/subuid|/etc/subgid) continue ;;
+            /etc/passwd-|/etc/shadow-|/etc/group-|/etc/gshadow-|/etc/subuid-|/etc/subgid-) continue ;;
+            /etc/fstab|/etc/hosts|/etc/hostname) continue ;;
+        esac
+        PUBLIC_MENTIONS+=("$path")
+    done < <(printf '%s\0' "${etc[@]/#/$SRC}" | sudo xargs -0 -r grep -lIwF "${pats[@]}" -- 2>/dev/null | sort)
+}
+
+# report_public — the summary's "Public:" block: what goes, what is regenerated
+#   at first boot, and -- the part that stops the run -- what the copy would
+#   still carry that belongs to nobody once the accounts are gone. Reads PUBLIC_*.
+report_public() {
+    local row name uid home mp real n
+    local -a units=()
+    if [ "$PUBLIC_PROBED" -eq 0 ]; then
+        summary_row "Public:" "NOT CHECKED: what the copy would carry could not be read here (an image in a dry run has no"
+        summary_row "" "  loop device); a real run reads it before the gate, and refuses if it cannot"
+        return 0
+    fi
+    if [ ${#PUBLIC_USERS[@]} -eq 0 ]; then
+        summary_row "Public:" "no account in UID $PUBLIC_UID_MIN..$PUBLIC_UID_MAX to remove"
+    else
+        summary_row "Public:" "accounts removed (UID $PUBLIC_UID_MIN..$PUBLIC_UID_MAX); the new owner creates theirs at first boot:"
+        for row in "${PUBLIC_USERS[@]}"; do
+            name=$(public_field "$row" 1); uid=$(public_field "$row" 2); home=$(public_field "$row" 4)
+            summary_row "" "  $name (uid $uid, home $home not copied)"
+        done
+    fi
+    for row in ${PUBLIC_BINDS[@]+"${PUBLIC_BINDS[@]}"}; do
+        IFS=$'\t' read -r mp real <<<"$row"
+        if [ "$real" = -offroot- ]; then
+            summary_row "" "  bind $mp: removed from fstab (its source is off the root filesystem)"
+        else
+            summary_row "" "  bind $mp: removed from fstab, and its source $real not copied"
+        fi
+    done
+    # The unit files and drop-ins by name; the links enabling them go unsaid.
+    for row in ${PUBLIC_UNITS[@]+"${PUBLIC_UNITS[@]}"}; do
+        case "$row" in
+            */) ;;
+            /etc/systemd/system/*.d/*) units+=("${row#/etc/systemd/system/}") ;;
+            /etc/systemd/system/*/*) ;;
+            *) units+=("${row##*/}") ;;
+        esac
+    done
+    if [ ${#units[@]} -gt 0 ]; then
+        summary_row "" "  units running as them, not copied: ${units[*]}"
+    fi
+    summary_row "" "machine-id \"uninitialized\" (first boot), SSH host keys made at first boot, stock /etc/hosts"
+    if [ -n "$PUBLIC_RESOLVER" ]; then
+        summary_row "" "  with no 127.0.1.1 line: $PUBLIC_RESOLVER answers for whatever name the owner gives it"
+    else
+        summary_row "" "WARNING: the name the owner gives it will not resolve: the source answers for its own name only"
+        summary_row "" "  through /etc/hosts (no systemd-resolved stub, no nss-myhostname); apt install libnss-myhostname"
+    fi
+    summary_row "" "GNOME Initial Setup runs once, at the login screen (not again in the new session)"
+    for row in ${PUBLIC_NETPLAN[@]+"${PUBLIC_NETPLAN[@]}"}; do
+        summary_row "" "  $row -> ${row##*/}.backup (names this machine's interfaces)"
+    done
+    summary_row "" "not copied: logs, crash dumps, saved networks, Bluetooth pairings, fingerprints, machine-info,"
+    summary_row "" "  cron tables, mail, /root (bar .bashrc/.profile), /var/backups, /var/tmp, greeter state"
+    if [ ${#PUBLIC_MENTIONS[@]} -gt 0 ]; then
+        summary_row "" "WARNING: ${#PUBLIC_MENTIONS[@]} file(s) in /etc, /var/lib or /var/spool still name a removed account (copied as they are):"
+        for row in "${PUBLIC_MENTIONS[@]}"; do summary_row "" "  $row"; done
+    fi
+    if [ ${#PUBLIC_LEFTOVERS[@]} -eq 0 ]; then
+        summary_row "" "no file in the copy belongs to a removed (or orphaned) uid/gid"
+    else
+        n=${#PUBLIC_LEFTOVERS[@]}
+        summary_row "" "REFUSED: $PUBLIC_LEFTOVER_N file(s) in the copy belong to a uid/gid no account will own;"
+        summary_row "" "  add these to --exclude-from (a trailing / is a whole directory):"
+        for row in "${PUBLIC_LEFTOVERS[@]:0:20}"; do summary_row "" "  $row"; done
+        [ "$n" -le 20 ] || summary_row "" "  ... and $((n - 20)) more"
+    fi
+}
+
+# hosts_stock — Ubuntu's /etc/hosts for a machine called $1; with no name, no
+#   127.0.1.1 line (what --public writes: see PUBLIC_RESOLVER in probe_public).
+hosts_stock() {
+    printf '127.0.0.1\tlocalhost\n'
+    if [ -n "$1" ]; then printf '127.0.1.1\t%s\n' "$1"; fi
+    printf '\n'
+    printf '# The following lines are desirable for IPv6 capable hosts\n'
+    printf '::1     ip6-localhost ip6-loopback\nfe00::0 ip6-localnet\nff00::0 ip6-mcastprefix\n'
+    printf 'ff02::1 ip6-allnodes\nff02::2 ip6-allrouters\n'
+}
+
+# write_identity — Phase 4, on the mounted target root: the hostname this run
+#   resolved (/etc/hostname, and the 127.0.1.1 line that makes it resolve), and
+#   under --public the rest of the machine's identity: Ubuntu's stock /etc/hosts
+#   with no 127.0.1.1 line (the owner has not named the machine yet) instead of
+#   the source's LAN map, a machine-id that makes the next boot a
+#   first boot, the netplan files naming this machine's interfaces set aside as
+#   *.yaml.backup, and GNOME Initial Setup run once rather than twice (see
+#   GIS_FIRST_LOGIN_DROPIN). A name of its own also takes PRETTY_HOSTNAME out of
+#   /etc/machine-info, which GNOME would otherwise go on showing as the device
+#   name. Reads MNT, HOSTNAME_NEW, PUBLIC, PUBLIC_NETPLAN.
+write_identity() {
+    local f
+    if [ -n "$HOSTNAME_NEW" ]; then
+        info "Hostname: $HOSTNAME_NEW"
+        printf '%s\n' "$HOSTNAME_NEW" | sudo tee "$MNT/etc/hostname" >/dev/null
+        if sudo grep -q '^PRETTY_HOSTNAME=' "$MNT/etc/machine-info" 2>/dev/null; then
+            sudo sed -i '/^PRETTY_HOSTNAME=/d' "$MNT/etc/machine-info"
+            sudo test -s "$MNT/etc/machine-info" || sudo rm -f "$MNT/etc/machine-info"
+        fi
+        if [ "$PUBLIC" -eq 1 ]; then
+            hosts_stock "" | sudo tee "$MNT/etc/hosts" >/dev/null
+        elif ! sudo test -s "$MNT/etc/hosts"; then
+            hosts_stock "$HOSTNAME_NEW" | sudo tee "$MNT/etc/hosts" >/dev/null
+        else
+            # The first 127.0.1.1 line names this machine; with none, one goes
+            # straight after 127.0.0.1 (or first, if even that is missing).
+            sudo awk -v h="$HOSTNAME_NEW" '
+                NR == FNR { if ($1 == "127.0.1.1") have = 1; if ($1 == "127.0.0.1") lo = 1; next }
+                !have && !lo && !done { print "127.0.1.1\t" h; done = 1 }
+                $1 == "127.0.1.1" && !done { print "127.0.1.1\t" h; done = 1; next }
+                { print }
+                !have && $1 == "127.0.0.1" && !done { print "127.0.1.1\t" h; done = 1 }
+            ' "$MNT/etc/hosts" "$MNT/etc/hosts" | sudo tee "$MNT/etc/hosts.new" >/dev/null
+            sudo mv "$MNT/etc/hosts.new" "$MNT/etc/hosts"
+        fi
+        sudo chown root:root "$MNT/etc/hostname" "$MNT/etc/hosts"
+        sudo chmod 644 "$MNT/etc/hostname" "$MNT/etc/hosts"
+    fi
+    [ "$PUBLIC" -eq 1 ] || return 0
+    info "First boot: machine-id \"uninitialized\" (sshd-keygen makes the host keys then)."
+    printf 'uninitialized\n' | sudo tee "$MNT/etc/machine-id" >/dev/null
+    sudo chown root:root "$MNT/etc/machine-id"
+    sudo chmod 444 "$MNT/etc/machine-id"
+    for f in ${PUBLIC_NETPLAN[@]+"${PUBLIC_NETPLAN[@]}"}; do
+        if sudo test -e "$MNT$f"; then
+            info "Netplan: $f -> ${f##*/}.backup (it names this machine's interfaces)."
+            sudo mv "$MNT$f" "$MNT$f.backup"
+        fi
+    done
+    info "GNOME Initial Setup: once, at the login screen (${GIS_FIRST_LOGIN_DROPIN#/})."
+    sudo mkdir -p "$MNT${GIS_FIRST_LOGIN_DROPIN%/*}"
+    printf '%s' "$GIS_FIRST_LOGIN_TEXT" | sudo tee "$MNT$GIS_FIRST_LOGIN_DROPIN" >/dev/null
+    sudo chmod 644 "$MNT$GIS_FIRST_LOGIN_DROPIN"
+}
+
+# GIS_FIRST_LOGIN_DROPIN — the account on a --public image is made by GNOME
+#   Initial Setup at the login screen, which asks for everything that matters:
+#   language, keyboard, the account and its hostname, privacy, Ubuntu Pro,
+#   time zone. Ubuntu then runs it AGAIN in the new session, on purpose -- its
+#   copy-worker patch stops the "done" stamp being carried over -- for pages
+#   the first round already showed. This drop-in turns that second run into
+#   what a finished one leaves behind: the stamps. The copy-worker still runs
+#   before it and carries the first round's choices (keyboard included) into
+#   the account, which a "done" file in /etc/skel would have prevented. The
+#   upgrade stamp is written FIRST: gnome-initial-setup-upgrade-login.service
+#   starts alongside and runs the upgrade wizard whenever "done" exists without
+#   it. $$ is a literal $ to systemd; %E is ~/.config.
+GIS_FIRST_LOGIN_DROPIN=/etc/systemd/user/gnome-initial-setup-first-login.service.d/once.conf
+GIS_FIRST_LOGIN_TEXT="# Written by install.sh --public: GNOME Initial Setup ran at the login screen,
+# so mark the first-login run done instead of showing it a second time.
+[Service]
+ExecStart=
+ExecStart=/bin/sh -c '. /etc/os-release && mkdir -p \"\$\$1/gnome-initial-setup\" && touch \"\$\$1/gnome-initial-setup/upgrade-\$\${VERSION_ID}-done\" && printf yes > \"\$\$1/gnome-initial-setup-done\"' sh %E
+"
 
 # -----------------------------------------------------------------------------
 # Mounts resolved at install time
@@ -1482,12 +1986,18 @@ report_fstab_retargets() {
 #   booting fstab in one run (a /data plus every bind on it), and reading the
 #   file afterwards used to be the only way to find out. A UUID row also names
 #   the device that UUID resolves to HERE, which is what makes it actionable.
+#   Under --public the same lines are left out instead, and it says so.
 report_fstab_disables() {
-    local file=$1 kind mp detail dev disks
+    local file=$1 kind mp detail dev disks gone=disabled
     local uuid_rows=0
-    report_scan "$file" "uuid bind swapmount swapdrop boot" || return 0
+    report_scan "$file" "uuid public home tagged comment bind swapmount swapdrop boot" || return 0
     disks=$(target_disks)
-    info "Disabled in the target's /etc/fstab ($REPORT_N $REPORT_WORD):"
+    if [ "$PUBLIC" -eq 1 ]; then
+        gone=removed
+        info "Removed from the target's /etc/fstab (--public; $REPORT_N $REPORT_WORD):"
+    else
+        info "Disabled in the target's /etc/fstab ($REPORT_N $REPORT_WORD):"
+    fi
     while IFS=$'\t' read -r kind mp detail; do
         case "$kind" in
             uuid)
@@ -1497,12 +2007,21 @@ report_fstab_disables() {
                        "$REPORT_W" "$mp" "$detail" "${dev:-not attached}" "${disks:-any target disk}"
                 uuid_rows=$((uuid_rows + 1))
                 ;;
+            public)
+                printf '      %-*s %s -- --public keeps only the target'"'"'s own filesystems\n' \
+                       "$REPORT_W" "$mp" "$detail" ;;
+            home)
+                printf '      %-*s inside %s, which --public does not copy\n' "$REPORT_W" "$mp" "$detail" ;;
+            tagged)
+                printf '      %-*s disabled by an earlier run\n' "$REPORT_W" "$mp" ;;
+            comment)
+                printf '      %-*s commented out in the source\n' "$REPORT_W" "$mp" ;;
             bind)
-                printf '      %-*s bind on %s, disabled above\n' "$REPORT_W" "$mp" "$detail" ;;
+                printf '      %-*s bind on %s, %s above\n' "$REPORT_W" "$mp" "$detail" "$gone" ;;
             swapmount)
-                printf '      %-*s swap file on %s, disabled above\n' "$REPORT_W" "$mp" "$detail" ;;
+                printf '      %-*s swap file on %s, %s above\n' "$REPORT_W" "$mp" "$detail" "$gone" ;;
             swapdrop)
-                printf '      %-*s swap file dropped by --exclude-from\n' "$REPORT_W" "$mp" ;;
+                printf '      %-*s swap file left out of the copy\n' "$REPORT_W" "$mp" ;;
             boot)
                 printf '      %-*s /boot is inside / on this target\n' "$REPORT_W" "$mp" ;;
         esac
@@ -1540,8 +2059,23 @@ rewrite_fstab() {
     # keep_uuids: mounts on the target's own disk(s) survive (see
     # target_disk_uuids); the two-pass awk below then keeps the bind mounts that
     # hang off them, and disables the ones whose backing mount it just disabled.
-    local keep_uuids
-    keep_uuids=$(target_disk_uuids)
+    # --public keeps nothing but the target's own filesystems (uuid_kept()
+    # always keeps the root, /boot and ESP UUIDs), even where the source's /data
+    # sits on the very disk being written: the image is for someone else. homes:
+    # the home directories it removes, one per line -- nothing may still be
+    # mounted inside one, not even a bind rooted on / whose source survives.
+    # /home counts whole, as it does for the copy (PUBLIC_STATE_RULES).
+    local keep_uuids homes="" user_row home
+    if [ "$PUBLIC" -eq 1 ]; then
+        keep_uuids=" ${NEW_UUID_SWAP:-} "
+        homes="/home"$'\n'
+        for user_row in ${PUBLIC_USERS[@]+"${PUBLIC_USERS[@]}"}; do
+            home=$(public_field "$user_row" 4)
+            case "$home" in /|''|/home/*) ;; *) homes+="$home"$'\n' ;; esac
+        done
+    else
+        keep_uuids=$(target_disk_uuids)
+    fi
 
     # remap_rows / enable_set: what ask_fstab_remap() resolved. The awk needs
     # only these two -- the spec to write for a mount point, and the lines to
@@ -1581,6 +2115,7 @@ rewrite_fstab() {
              -v has_boot="$has_boot" -v keep_uuids="$keep_uuids" \
              -v new_swap="${NEW_UUID_SWAP:-}" -v drop_swap="$drop_swap" \
              -v remap="$remap_rows" -v enable="$enable_set" \
+             -v public="$PUBLIC" -v homes="$homes" \
              -v report="$FSTAB_REPORT" '
     # The mounts resolved at the gate, as "<mount point>\t<spec>" rows.
     BEGIN {
@@ -1602,21 +2137,35 @@ rewrite_fstab() {
     # enabled(key) — is this one of the commented-out lines the operator asked
     # for back? Mount point for an ordinary entry, path for a swap file.
     function enabled(k) { return index(enable, " " k " ") > 0 }
+    # mount_payload(line) — the mount entry under a comment marker (or several,
+    # or the tag of this toolkit), or "" when the comment is prose. The test the
+    # discovery pass applied when it offered such a line: prose can carry four
+    # fields too, and must never read as a mount.
+    function mount_payload(s,   p, g) {
+        if (s !~ /^[[:space:]]*#/) return "";
+        p = s;
+        while (sub(/^[[:space:]]*#[[:space:]]*/, "", p) ||
+               sub(/^\[PORTABLE-SYNC-DISABLED\][[:space:]]+/, "", p)) { }
+        if (split(p, g) < 4) return "";
+        if (g[1] !~ /^(\/|UUID=|LABEL=|PARTUUID=|PARTLABEL=)/) return "";
+        if (g[3] !~ /^(ext[234]|xfs|btrfs|f2fs|jfs|reiserfs|vfat|exfat|ntfs3?|udf|iso9660|auto|none|swap)$/ &&
+            g[4] !~ /(^|,)r?bind(,|$)/) return "";
+        return p;
+    }
+    # disable(line) — what becomes of a line this run will not leave live: it is
+    # commented out and tagged, so a later sync or a human can bring it back --
+    # or, under --public, left out altogether. The image is for someone else, and
+    # a comment would still spell out the disks and homes of this machine.
+    function disable(s) { if (!public) print "# [PORTABLE-SYNC-DISABLED] " s }
     # revive(line, pass) — the live mount line hiding under a comment marker,
     # when this run was told to bring it back; "" for anything else, prose above
     # all. Only the FIRST line per key is revived, so a stale duplicate cannot
     # become a second mount of the same thing; the passes count separately.
     function revive(s, pass,   p, g, k, istag) {
-        if (enable == " " || s !~ /^[[:space:]]*#/) return "";
-        p = s;
-        while (sub(/^[[:space:]]*#[[:space:]]*/, "", p) ||
-               sub(/^\[PORTABLE-SYNC-DISABLED\][[:space:]]+/, "", p)) { }
-        if (split(p, g) < 4) return "";
-        # The test the discovery pass applied when it offered this line: prose
-        # can carry four fields too, and must never read as a mount.
-        if (g[1] !~ /^(\/|UUID=|LABEL=|PARTUUID=|PARTLABEL=)/) return "";
-        if (g[3] !~ /^(ext[234]|xfs|btrfs|f2fs|jfs|reiserfs|vfat|exfat|ntfs3?|udf|iso9660|auto|none|swap)$/ &&
-            g[4] !~ /(^|,)r?bind(,|$)/) return "";
+        if (enable == " ") return "";
+        p = mount_payload(s);
+        if (p == "") return "";
+        split(p, g);
         k = (g[3] == "swap") ? g[1] : g[2];
         if (!enabled(k)) return "";
         # With both a line this toolkit disabled and one a human commented out,
@@ -1655,6 +2204,24 @@ rewrite_fstab() {
         if (u == "") return 1;                             # not mounted by UUID
         if (u == new_efi || u == new_boot || u == new_root) return 1;
         return index(keep_uuids, " " u " ") > 0;
+    }
+    # The removed home a path is, or sits in; "" for anything else (always,
+    # without --public). Matched on whole components, as nearest_mount does.
+    function in_home(path,   n, h, i) {
+        n = split(homes, h, "\n");
+        for (i = 1; i <= n; i++) {
+            if (h[i] == "") continue;
+            if (path == h[i] || substr(path, 1, length(h[i]) + 1) == h[i] "/") return h[i];
+        }
+        return "";
+    }
+    # A device named some way other than by UUID, mounted somewhere other than
+    # the three places this run owns. --public keeps none: what the target
+    # mounts by UUID is translated, and anything else is another disk.
+    function other_dev(s,   g) {
+        split(s, g);
+        if (g[2] == "/" || g[2] == "/boot" || g[2] == "/boot/efi") return 0;
+        return line_uuid(s) == "" && g[1] ~ /^(LABEL=|PARTLABEL=|\/dev\/)/;
     }
     # One record per line this run changes, in file order, for the reports the
     # shell prints afterwards. Lines that arrived already tagged are NOT
@@ -1702,9 +2269,11 @@ rewrite_fstab() {
         if (f[2] in remap_spec) { line = retarget(line, remap_spec[f[2]]); split(line, f) }
         if (f[4] ~ /(^|,)bind(,|$)/) { binds[++nbind] = f[1] SUBSEP f[2]; next }
         if (!sep_boot && f[2] == "/boot")   keep = 0;
+        else if (public && in_home(f[2]) != "") keep = 0;
         else if (f[3] == "swap")            keep = (index(drop_swap, " " f[1] " ") == 0);
         # Resolved at the gate: kept by decision, whatever UUID it used to name.
         else if (f[2] in remap_spec)        keep = 1;
+        else if (public && other_dev(line)) keep = 0;
         else                                keep = uuid_kept(line_uuid(line));
         if (substr(f[2], 1, 1) == "/") mp_kept[f[2]] = keep;
         next;
@@ -1717,7 +2286,7 @@ rewrite_fstab() {
         for (mp in was_disabled) if (!(mp in mp_kept)) mp_kept[mp] = 0;
         for (i = 1; i <= nbind; i++) {
             split(binds[i], b, SUBSEP);
-            bind_kept[b[2]] = mp_kept[nearest_mount(b[1])];
+            bind_kept[b[2]] = (public && in_home(b[2]) != "") ? 0 : mp_kept[nearest_mount(b[1])];
             mp_kept[b[2]] = bind_kept[b[2]];
         }
     }
@@ -1738,7 +2307,8 @@ rewrite_fstab() {
     # Lines disabled by a previous run: never re-prefix them (collapse any
     # stacked markers left by older versions), and drop disabled swap entries
     # once a live swap entry is being written below -- otherwise every
-    # re-mkswap sync leaves one more dead line behind.
+    # re-mkswap sync leaves one more dead line behind. Under --public they go
+    # like everything else disabled, and are said to.
     /^# \[PORTABLE-SYNC-DISABLED\] / {
         payload = $0;
         while (sub(/^# \[PORTABLE-SYNC-DISABLED\] /, "", payload)) { }
@@ -1747,14 +2317,24 @@ rewrite_fstab() {
         # file damaged that way heals on the next sync.
         if (payload ~ /^[[:space:]]*#/) { print payload; next; }
         split(payload, f);
+        if (public) { note("tagged", (f[3] == "swap") ? f[1] : f[2], ""); next; }
         if (new_swap != "" && f[3] == "swap") next;
-        print "# [PORTABLE-SYNC-DISABLED] " payload;
+        disable(payload);
         next;
     }
 
     # Comments are prose, not mounts -- and the Ubuntu header mentions "UUID=",
-    # which the disabler below would otherwise tag on every sync.
-    /^[[:space:]]*#/ { print; next }
+    # which the disabler below would otherwise tag on every sync. Under --public
+    # a mount commented out by hand goes too: it names a disk or a home of this
+    # machine as plainly as a live one.
+    /^[[:space:]]*#/ {
+        if (public && (payload = mount_payload($0)) != "") {
+            split(payload, f);
+            note("comment", (f[3] == "swap") ? f[1] : f[2], "");
+            next;
+        }
+        print; next;
+    }
 
     {
         # /boot lives inside / here, so an inherited /boot entry names a
@@ -1762,7 +2342,17 @@ rewrite_fstab() {
         # below, which would rewrite it into "mount / at /boot".
         if (!sep_boot && $2 == "/boot") {
             note("boot", $2, "");
-            print "# [PORTABLE-SYNC-DISABLED] " $0;
+            disable($0);
+            next;
+        }
+
+        # --public: nothing is mounted in a home it removed -- a bind rooted on
+        # / included, whose source would otherwise keep it alive -- and no swap
+        # file lives in one either.
+        hm = public ? in_home(($3 == "swap") ? $1 : $2) : "";
+        if (hm != "") {
+            note("home", ($3 == "swap") ? $1 : $2, hm);
+            disable($0);
             next;
         }
 
@@ -1794,7 +2384,7 @@ rewrite_fstab() {
         # entry rather than leave systemd trying to swapon a missing file.
         if ($3 == "swap" && index(drop_swap, " " $1 " ") > 0) {
             note("swapdrop", $1, "");
-            print "# [PORTABLE-SYNC-DISABLED] " $0;
+            disable($0);
             next;
         }
 
@@ -1806,7 +2396,7 @@ rewrite_fstab() {
             carrier = nearest_mount($1);
             if ((carrier in mp_kept) && !mp_kept[carrier]) {
                 note("swapmount", $1, carrier);
-                print "# [PORTABLE-SYNC-DISABLED] " $0;
+                disable($0);
                 next;
             }
         }
@@ -1828,12 +2418,18 @@ rewrite_fstab() {
             # A filesystem on the disk this install writes to is kept: it is
             # there exactly when this system is. Anything else -- another disk
             # of the source machine, a foreign swap partition -- is disabled,
-            # since a disk that boots elsewhere must not wait for it.
+            # since a disk that boots elsewhere must not wait for it. Under
+            # --public only the target roles count (keep_uuids says so).
             if (!uuid_kept(line_uuid($0))) {
-                note("uuid", $2, line_uuid($0));
-                print "# [PORTABLE-SYNC-DISABLED] " $0;
+                if (public) note("public", $2, "UUID=" line_uuid($0));
+                else        note("uuid", $2, line_uuid($0));
+                disable($0);
                 next;
             }
+        } else if (public && other_dev($0)) {
+            note("public", $2, $1);
+            disable($0);
+            next;
         }
 
         if ($4 ~ /(^|,)bind(,|$)/) {
@@ -1842,7 +2438,7 @@ rewrite_fstab() {
             # /home/tigran survives exactly as long as /data does.
             if (bind_kept[$2]) { print $0; next }
             note("bind", $2, nearest_mount($1));
-            print "# [PORTABLE-SYNC-DISABLED] " $0;
+            disable($0);
             next;
         }
 
@@ -1865,18 +2461,37 @@ rewrite_fstab() {
 }
 
 # probe_target_brand — the brand already stamped into the target root's
-#   GRUB_DISTRIBUTOR, read through a transient read-only mount on MNT before
-#   rsync overwrites the file. Sets TGT_MODEL (empty if the mount fails or the
-#   "Desktop <brand> `( ." pattern is absent). Runs under --dry-run too, so the
-#   summary can show the brand it would keep.
+#   GRUB_DISTRIBUTOR, and the hostname it already wears, read through a
+#   transient read-only mount on MNT before rsync overwrites both files. Sets
+#   TGT_MODEL (empty if the mount fails or the "Desktop <brand> `( ." pattern is
+#   absent) and HOSTNAME_TGT (empty if there is no usable /etc/hostname). Runs
+#   under --dry-run too, so the summary can show what it would keep.
 probe_target_brand() {
-    TGT_MODEL=""
+    TGT_MODEL=""; HOSTNAME_TGT=""
     MOUNTS_DONE=1   # from here on cleanup() must sweep $MNT, interrupts included
     if sudo mount -r -o noatime "$TGT_ROOT" "$MNT" 2>/dev/null; then
         TGT_MODEL=$(sed -nE 's/^GRUB_DISTRIBUTOR="Desktop (.*) `\( \..*$/\1/p' \
                         "$MNT/etc/default/grub" 2>/dev/null | head -n 1) || TGT_MODEL=""
+        HOSTNAME_TGT=$(hostname_from "$MNT")
         sudo umount "$MNT" || true
     fi
+}
+
+# hostname_from <root> — the static hostname a root filesystem carries: the
+#   first word of its /etc/hostname, or nothing when that is missing or would
+#   not pass --hostname's own check (a stray FQDN or a blank file is not worth
+#   keeping across an --update). Readable without privilege.
+hostname_from() {
+    local h
+    h=$(awk 'NF && $1 !~ /^#/ { print $1; exit }' "$1/etc/hostname" 2>/dev/null) || h=""
+    if hostname_valid "$h"; then printf '%s' "$h"; fi
+}
+
+# hostname_valid <name> — an RFC 1123 label: 1-63 letters, digits and hyphens,
+#   neither first nor last a hyphen. One label, not an FQDN: it is what
+#   /etc/hostname and the 127.0.1.1 line carry on an Ubuntu desktop.
+hostname_valid() {
+    [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]
 }
 
 # probe_esp_menu — the systems already registered on the target ESP, read
@@ -2591,6 +3206,16 @@ run_chroot_block() {
         sudo mount --bind "$i" "$MNT$i"
     done
 
+    # --public: the accounts go by the target's own userdel, which also takes
+    # them out of every group and of subuid/subgid, and deletes the private
+    # group. No -r: their homes were never copied. The "-" files are the
+    # databases as they were BEFORE each edit, removed account and its password
+    # hash included, so they go too.
+    local public_names="" row
+    for row in ${PUBLIC_USERS[@]+"${PUBLIC_USERS[@]}"}; do
+        public_names+="$(public_field "$row" 1) "
+    done
+
     # INSTALL_GRUB_BIOS/_EFI default to 1; install.sh gates BIOS on a BIOS
     # target being given, and the caller resolves TGT_GRUB_DISK.
     # --boot-directory=/boot/efi/boot puts GRUB's boot directory on the ESP for
@@ -2601,6 +3226,14 @@ run_chroot_block() {
     sudo chroot "$MNT" /bin/bash <<EOF
 set -e
 echo "=> Inside chroot..."
+
+for u in $public_names; do
+    echo "=> Removing account \$u (--public)..."
+    userdel "\$u"
+done
+if [ -n "$public_names" ]; then
+    rm -f /etc/passwd- /etc/shadow- /etc/group- /etc/gshadow- /etc/subuid- /etc/subgid-
+fi
 
 if [ "${INSTALL_GRUB_BIOS:-1}" = 1 ]; then
     echo "=> Installing legacy BIOS GRUB to $TGT_GRUB_DISK..."
@@ -2632,6 +3265,85 @@ update-initramfs -u -k all
 
 echo "=> Exiting chroot."
 EOF
+}
+
+# verify_public — verify_install()'s checks for --public, run inside it (vcheck
+#   and its failure count are that function's): no account left in the human
+#   range and no trace of the removed ones in the account databases or the "-"
+#   copies shadow keeps of them; nothing owned by a uid or gid nobody will own
+#   -- the backstop for a live source that changed after the gate's scan, by
+#   the same public_owner_test; no home, no /root beyond its two dotfiles, no
+#   machine identity, no unit running as anyone removed, and no live mount but
+#   the target's own. Reads MNT, the PUBLIC_* tables and the NEW_UUID_* set.
+verify_public() {
+    local row name db stray
+    no_human() {
+        sudo awk -F: -v lo="$PUBLIC_UID_MIN" -v hi="$PUBLIC_UID_MAX" \
+            '$3 ~ /^[0-9]+$/ && $3 + 0 >= lo && $3 + 0 <= hi { f = 1 } END { exit f }' "$1"
+    }
+    # No field of <file>, nor any member of a comma-separated list in one, is <name>.
+    not_named() {
+        sudo awk -F: -v n="$1" '{ for (i = 1; i <= NF; i++) { m = split($i, e, ",");
+                                   for (j = 1; j <= m; j++) if (e[j] == n) f = 1 } }
+                                END { exit f }' "$2"
+    }
+    nothing_in() {   # <dir> [names allowed to be there]
+        local dir=$1 allowed
+        local -a keep=()
+        shift
+        for allowed in "$@"; do keep+=(! -name "$allowed"); done
+        [ -z "$(sudo find "$dir" -mindepth 1 -maxdepth 1 ${keep[@]+"${keep[@]}"} -print -quit 2>/dev/null)" ]
+    }
+    no_host_keys() {
+        [ -z "$(sudo find "$MNT/etc/ssh" -maxdepth 1 -name 'ssh_host_*' -print -quit 2>/dev/null)" ]
+    }
+    no_unit_runs_as_them() {
+        [ -n "$PUBLIC_WHO" ] || return 0
+        ! sudo grep -rqE "^[[:space:]]*(User|Group)=($PUBLIC_WHO)[[:space:]]*$" "$MNT/etc/systemd/system"
+    }
+    # Every live entry is the target's own, by UUID or by the place it mounts,
+    # or is no device at all (tmpfs, proc, a bind outside /home) -- and no
+    # disabled one is left behind as a comment.
+    fstab_own_only() {
+        sudo awk -v r="$NEW_UUID_ROOT" -v b="$NEW_UUID_BOOT" -v e="$NEW_UUID_EFI" \
+                 -v s="${NEW_UUID_SWAP:-}" '
+            /PORTABLE-SYNC-DISABLED/ { bad = 1 }
+            $0 ~ /^[[:space:]]*#/ || NF < 3 { next }
+            $2 == "/home" || index($2, "/home/") == 1 { bad = 1 }
+            match($0, /(UUID=|\/dev\/disk\/by-uuid\/)[0-9A-Za-z-]+/) {
+                u = substr($0, RSTART, RLENGTH); sub(/.*[=\/]/, "", u);
+                if (u != r && u != b && u != e && u != s) bad = 1; next;
+            }
+            $1 ~ /^(LABEL=|PARTLABEL=|\/dev\/)/ && $2 != "/" && $2 != "/boot" && $2 != "/boot/efi" { bad = 1 }
+            END { exit bad }' "$MNT/etc/fstab"
+    }
+
+    vcheck "no account in UID $PUBLIC_UID_MIN..$PUBLIC_UID_MAX is left in /etc/passwd" \
+        no_human "$MNT/etc/passwd"
+    for row in ${PUBLIC_USERS[@]+"${PUBLIC_USERS[@]}"}; do
+        name=$(public_field "$row" 1)
+        for db in passwd shadow group gshadow subuid subgid; do
+            sudo test -e "$MNT/etc/$db" || continue
+            vcheck "/etc/$db no longer names $name" not_named "$name" "$MNT/etc/$db"
+        done
+    done
+    for db in passwd shadow group gshadow subuid subgid; do
+        vcheck "no /etc/$db- (the copy shadow keeps of the old one)" sudo test ! -e "$MNT/etc/$db-"
+    done
+    # -xdev also keeps out the host's /dev, /proc, /sys and /run, still bound in
+    # from the chroot. head cutting the pipe short is not a failure.
+    stray=$(sudo find "$MNT" -xdev -printf '%U %G /%P\n' 2>/dev/null | public_owner_test |
+            head -n 3 | cut -f2 | paste -sd' ' -) || true
+    vcheck "no file belongs to a removed or orphaned uid/gid${stray:+ ($stray ...)}" test -z "$stray"
+    vcheck "/home is empty" nothing_in "$MNT/home"
+    vcheck "/root holds nothing but .bashrc and .profile" nothing_in "$MNT/root" .bashrc .profile
+    vcheck "machine-id says \"uninitialized\" (the first boot makes the real one)" \
+        sudo grep -qxF uninitialized "$MNT/etc/machine-id"
+    vcheck "no SSH host key (the first boot makes them)" no_host_keys
+    vcheck "no /etc/machine-info (its pretty hostname would name this machine)" sudo test ! -e "$MNT/etc/machine-info"
+    vcheck "GNOME Initial Setup runs once ($GIS_FIRST_LOGIN_DROPIN)" sudo test -s "$MNT$GIS_FIRST_LOGIN_DROPIN"
+    vcheck "no unit in /etc/systemd/system runs as a removed account" no_unit_runs_as_them
+    vcheck "fstab holds nothing but the target's own filesystems: nothing in /home, no disabled line" fstab_own_only
 }
 
 # verify_install — post-install checks on the still-mounted target tree: fstab
@@ -2783,6 +3495,20 @@ verify_install() {
             sudo test ! -e "$MNT$cache_path"
     done
 
+    # The name the copy answers to, however it was chosen.
+    if [ -n "$HOSTNAME_NEW" ]; then
+        vcheck "/etc/hostname says $HOSTNAME_NEW" sudo grep -qxF "$HOSTNAME_NEW" "$MNT/etc/hostname"
+    fi
+    if [ "$PUBLIC" -eq 1 ]; then
+        vcheck "/etc/hosts has no 127.0.1.1 line (the owner names the machine at first boot)" \
+            sudo awk '$1 == "127.0.1.1" { f = 1 } END { exit f }' "$MNT/etc/hosts"
+    elif [ -n "$HOSTNAME_NEW" ]; then
+        vcheck "/etc/hosts resolves $HOSTNAME_NEW to 127.0.1.1" \
+            sudo awk -v h="$HOSTNAME_NEW" '$1 == "127.0.1.1" { for (i = 2; i <= NF; i++) if ($i == h) f = 1 }
+                                           END { exit !f }' "$MNT/etc/hosts"
+    fi
+    if [ "$PUBLIC" -eq 1 ]; then verify_public; fi
+
     if [ "$fails" -gt 0 ]; then
         echo "  $fails verification check(s) FAILED."
         return 1
@@ -2903,6 +3629,7 @@ CACHE_PREVIEW=()
 CACHE_PROBED=0
 CACHE_DROPS=()
 CACHE_FILTERS=()
+ROOT_FILTERS=()               # every rule of the root transfer (root_filters)
 EXCLUDE_AUDIT=()
 EXCLUDE_PROBED=0
 
@@ -2932,6 +3659,43 @@ REMAP_SWAP_CREATE=()          # "<fstab path>\t<dev>\t<path on it>\t<bytes>"
 REMAP_PROBED=0
 REMAP_OPEN_MNT=""             # a filesystem this run mounted to look inside
 REMAP_OPEN_PATH=""            # ...and where its contents are readable
+
+# --public: an image with no human accounts, whose first boot is a first boot.
+# probe_public() fills the rest from the SOURCE before the gate. The ranges are
+# what its login.defs calls human; the accounts in them go, as "name uid gid
+# home" rows, together with the private groups that go with them (and any gid
+# in range that no group owns at all, an orphan). The units that run as them,
+# the root-fs sources of the binds into their homes and the netplan files that
+# describe this machine's interfaces are what the copy has to leave out or
+# rename; the /etc files that still name them are a WARNING, and the files of
+# the transfer still owned by a uid or gid nobody will own are a REFUSAL.
+# PUBLIC_FILTERS are the rsync rules that keep all of it out of the copy.
+PUBLIC=0
+PUBLIC_PROBED=0               # 0 = the source could not be read (dry-run image)
+PUBLIC_UID_MIN=1000
+PUBLIC_UID_MAX=60000
+PUBLIC_GID_MIN=1000
+PUBLIC_GID_MAX=60000
+PUBLIC_USERS=()               # "<name> <uid> <gid> <home>"
+PUBLIC_GIDS_GONE=" "          # sentinel-spaced, for the awk lookups
+PUBLIC_GIDS_KEPT=" "          # ...and the gids in range whose groups stay
+PUBLIC_UNITS=()               # unit files (and their links) in /etc/systemd/system
+PUBLIC_BINDS=()               # "<mount point> <transfer path|-offroot->"
+PUBLIC_NETPLAN=()             # /etc/netplan/*.yaml renamed to *.yaml.backup
+PUBLIC_MENTIONS=()            # config/state files still naming a removed account
+PUBLIC_LEFTOVERS=()           # topmost transferred paths owned by nobody left
+PUBLIC_LEFTOVER_N=0           # ...and how many files that is in all
+PUBLIC_FILTERS=()
+PUBLIC_WHO=""                 # "name|uid|group..." -- a regex of who is removed
+PUBLIC_RESOLVER=""            # what answers for the hostname without /etc/hosts, if anything
+# The hostname this run stamps on the target: --hostname, else "ubuntu" under
+# --public, else -- under --update -- the one the target already wears
+# (probe_target_brand, before rsync overwrites it). Empty = the source's, left
+# alone. Not HOSTNAME: bash sets that one itself.
+HOSTNAME_ARG=""
+HOSTNAME_NEW=""
+HOSTNAME_SRC=""               # what the source's /etc/hostname says
+HOSTNAME_TGT=""               # ...and the target's, under --update
 
 # Where rewrite_fstab()'s awk records what it changed, for the reports printed
 # right after. Global only so cleanup() can remove the directory if the run ends
@@ -2980,6 +3744,8 @@ while [ $# -gt 0 ]; do
         --sparse)         SPARSE=1; shift ;;
         --keep-cache)     KEEP_CACHE=1; shift ;;
         --remap)          REMAP_ARGS+=("$2"); shift 2 ;;
+        --public)         PUBLIC=1; shift ;;
+        --hostname)       HOSTNAME_ARG="$2"; shift 2 ;;
         --yes|-y)         ASSUME_YES=1; shift ;;
         -h|--help)
             cat <<USAGE
@@ -3082,7 +3848,36 @@ Other:
                               back with it, an entry the source has COMMENTED OUT
                               can be revived the same way, and a swap file the
                               chosen filesystem lacks is created there.
-  --brand NAME                Brand the GRUB menu title with NAME instead of the
+  --public                    Build an image to give away: no human accounts
+                              (every account in the source's UID_MIN..UID_MAX
+                              is removed, homes included, and GNOME asks the
+                              new owner to create theirs at first boot), no
+                              machine identity (machine-id and SSH host keys
+                              are regenerated at first boot, /etc/hosts is
+                              Ubuntu's stock one), and none of the source's
+                              logs, saved networks, pairings or other
+                              per-machine state. Every mount outside the
+                              target's own filesystems is removed from its
+                              fstab, the binds into /home too (not commented
+                              out: a comment would still name your disks and
+                              homes), and netplan files naming
+                              this machine's interfaces become *.yaml.backup.
+                              Files the copy would still carry that belong to
+                              no account left REFUSE the run: the summary lists
+                              them for --exclude-from. Needs a root this run
+                              copies; refused with --update, --remap,
+                              --keep-cache and --hostname. The image is called
+                              "ubuntu" only until its owner names it: the
+                              first-boot setup always sets the hostname.
+  --hostname NAME             Give the target the hostname NAME (/etc/hostname
+                              and the 127.0.1.1 line of /etc/hosts). One label:
+                              letters, digits and hyphens, at most 63. Without
+                              it the source's name is copied -- except under
+                              --update, which keeps the name the target already
+                              has, so a clone named once stays named. Not with
+                              --public, whose owner names the machine at first
+                              boot.
+  --brand NAME               Brand the GRUB menu title with NAME instead of the
                               target disk's reported model (useful when the medium
                               sits in a USB card reader, whose model string —
                               e.g. "SD Transcend" — says nothing about the card).
@@ -3262,6 +4057,11 @@ Examples:
   $0 --image Ubuntu26-Portable-16GB.img --target /dev/sda \\
      --exclude-from exclude-personal.txt
 
+  # Public image to give away, built from this machine's own disk into a
+  # loop-attached file (truncate -s 28G public.img; losetup -fP --show ...):
+  $0 --source /dev/nvme0n1 --target /dev/loop0 --public \\
+     --exclude-from exclude-personal.txt
+
 Most options also read from the matching environment variable (SOURCE, TARGET,
 SRC_ROOT, SRC_BOOT, TGT_ROOT, TGT_BOOT, TGT_ROOT_LABEL, TGT_SWAP, EXCLUDE_FROM,
 ...).
@@ -3388,11 +4188,37 @@ if [ ${#REMAP_ARGS[@]} -gt 0 ]; then
     done
 fi
 
+# --hostname reaches /etc/hostname and /etc/hosts. Checked here, like the label
+# above, so a typo fails before any disk is touched.
+if [ -n "$HOSTNAME_ARG" ] && ! hostname_valid "$HOSTNAME_ARG"; then
+    die "--hostname must be one label of letters, digits and hyphens (at most 63, no hyphen first or last), got: $HOSTNAME_ARG"
+fi
+
+# --public builds a fresh image and nothing else, so its contradictions are
+# refused rather than half-honoured: --update would sync onto a disk whose
+# accounts and identity this run did not create, --remap brings back the very
+# mounts --public disables, --keep-cache asks to keep what lives in the homes
+# it does not copy, and --hostname names a machine whose owner names it again
+# at first boot: the account page of the setup always sets the hostname (the
+# one typed, or the username), and never offers the one already there. (An
+# in-place root is refused once roles are known.)
+if [ $PUBLIC -eq 1 ]; then
+    [ $UPDATE -eq 0 ] || \
+        die "--public builds a fresh image; it cannot be combined with --update."
+    [ ${#REMAP_ARGS[@]} -eq 0 ] || \
+        die "--public disables every mount outside the target's own filesystems, and --remap would bring one back. Drop one of them."
+    [ $KEEP_CACHE -eq 0 ] || \
+        die "--public copies no home directory, so there is no cache for --keep-cache to keep."
+    [ -z "$HOSTNAME_ARG" ] || \
+        die "--hostname has nothing to name under --public: the new owner names the machine during first-boot setup, which replaces any name given here."
+fi
+
 # Front-load the sudo prompt before anything is acquired, so it cannot fire
 # mid-rsync (timestamps are per-tty and expire). A dry run needs it too, for the
 # transient ro mounts the summary is built from; an image source in a dry run is
 # the one case that needs no root at all, having no loop device to read.
-if [ "$DRY_RUN" -eq 0 ] || { [ $UPDATE -eq 1 ] && [ -z "$BRAND" ]; } || \
+if [ "$DRY_RUN" -eq 0 ] || \
+   { [ $UPDATE -eq 1 ] && { [ -z "$BRAND" ] || [ -z "$HOSTNAME_ARG" ]; }; } || \
    [ -b "$SOURCE" ] || [ -b "$SRC_ROOT" ]; then
     sudo -v
 fi
@@ -3773,6 +4599,14 @@ fi
 if [ -n "$TGT_ROOT_LABEL" ] && [ $MIGRATE_ROOT -eq 0 ]; then
     die "--target-root-label needs a root filesystem this run writes, but --target-root ($TGT_ROOT) is the source's own and is left in place."
 fi
+# ...and the same goes for renaming that system, and all the more for stripping
+# its accounts: on an in-place root both would be done to the source itself.
+if [ -n "$HOSTNAME_ARG" ] && [ $MIGRATE_ROOT -eq 0 ]; then
+    die "--hostname needs a root filesystem this run writes, but --target-root ($TGT_ROOT) is the source's own and is left in place."
+fi
+if [ $PUBLIC -eq 1 ] && [ $MIGRATE_ROOT -eq 0 ]; then
+    die "--public needs a root filesystem this run copies, but --target-root ($TGT_ROOT) is the source's own: its accounts would be removed from the source itself."
+fi
 
 # An ESP this run does not format must already hold FAT, or Phase 3 fails on
 # the mount with the target half-written. --keep-efi, --update and an in-place
@@ -3887,20 +4721,38 @@ else
     BRAND_DISK=$(get_parent_disk "$TGT_ROOT")
 fi
 TGT_MODEL=""
+# --update keeps the target's hostname the same way, so one mount answers both.
+if [ $UPDATE -eq 1 ] && { [ -z "$BRAND" ] || [ -z "$HOSTNAME_ARG" ]; }; then
+    # Often the first real media access (blkid is answered from cache), so a
+    # spun-down disk pauses here -- say what we are waiting for.
+    info "Reading the current GRUB brand and hostname off $TGT_ROOT (may need to spin the disk up)..."
+    probe_target_brand
+fi
 if [ -n "$BRAND" ]; then
     TGT_MODEL="$BRAND"
     BRAND_ORIGIN="--brand override"
 elif [ $UPDATE -eq 1 ]; then
-    # Often the first real media access (blkid is answered from cache), so a
-    # spun-down disk pauses here -- say what we are waiting for.
-    info "Reading current GRUB brand off $TGT_ROOT (may need to spin the disk up)..."
-    probe_target_brand
     BRAND_ORIGIN="kept from target's GRUB_DISTRIBUTOR"
 fi
 if [ -z "$TGT_MODEL" ]; then
     TGT_MODEL=$(lsblk -n -d -o MODEL "${BRAND_DISK:-}" 2>/dev/null | xargs || true)
     [ -n "$TGT_MODEL" ] || TGT_MODEL="Portable Image"
     BRAND_ORIGIN="rootfs on ${BRAND_DISK:-?}"
+fi
+
+# ---- Hostname ----
+# --hostname wins; --public writes a placeholder, the name the image carries
+# until its owner names it at first boot (SSH host key comments, a DHCP request
+# made before the account exists); --update keeps what the clone was called (a
+# name given once survives every sync, like the brand). Otherwise the source's
+# /etc/hostname is copied like any other file and nothing is written.
+if [ -n "$HOSTNAME_ARG" ]; then
+    HOSTNAME_NEW="$HOSTNAME_ARG"
+elif [ $PUBLIC -eq 1 ]; then
+    HOSTNAME_NEW=ubuntu     # what Ubuntu calls a machine nobody has named yet
+elif [ $UPDATE -eq 1 ] && [ $MIGRATE_ROOT -eq 1 ]; then
+    # (An in-place root is the source's own: there is nothing to put back.)
+    HOSTNAME_NEW="$HOSTNAME_TGT"
 fi
 
 # ---- Summary + single confirmation gate (before anything destructive) ----
@@ -4006,7 +4858,10 @@ fi
 # filesystem found. A mount left alone says why: "nothing was asked" and
 # "nothing to ask about" must not look the same.
 if [ $MIGRATE_ROOT -eq 1 ]; then
-    if [ "$REMAP_PROBED" -eq 0 ]; then
+    if [ "$PUBLIC" -eq 1 ]; then
+        summary_row "fstab:" "only the target's own filesystems stay (--public): every other mount, the binds and swap"
+        summary_row "" "  files riding on them, and anything mounted inside /home are removed, not commented out"
+    elif [ "$REMAP_PROBED" -eq 0 ]; then
         summary_row "fstab:" "not checked (the source's fstab could not be read here to look for mounts it cannot resolve)"
         if [ ${#REMAP_ARG[@]} -gt 0 ]; then
             summary_row "" "so --remap is not shown above either; a real run reads the fstab and applies it"
@@ -4195,8 +5050,43 @@ if [ -n "$EXCLUDE_FROM" ]; then
     fi
     report_exclude_audit
 fi
+# The name the copy answers to: shown on every copy, since which one it gets
+# depends on --hostname, --public and --update between them.
+if [ $MIGRATE_ROOT -eq 1 ]; then
+    if [ -n "$HOSTNAME_ARG" ]; then hostname_why="--hostname"
+    elif [ $PUBLIC -eq 1 ]; then hostname_why="a placeholder until the owner names the machine during first-boot setup"
+    else hostname_why="kept from the target's own /etc/hostname"; fi
+    if [ -z "$HOSTNAME_NEW" ]; then
+        if [ $UPDATE -eq 1 ]; then
+            summary_row "Hostname:" "\"${HOSTNAME_SRC:-?}\", the source's: the target's own /etc/hostname could not be read here"
+        else
+            summary_row "Hostname:" "\"${HOSTNAME_SRC:-?}\", the source's (--hostname gives the copy a name of its own)"
+        fi
+    elif [ -n "$HOSTNAME_SRC" ] && [ "$HOSTNAME_SRC" != "$HOSTNAME_NEW" ]; then
+        summary_row "Hostname:" "\"$HOSTNAME_SRC\" -> \"$HOSTNAME_NEW\" ($hostname_why)"
+    else
+        summary_row "Hostname:" "\"$HOSTNAME_NEW\" ($hostname_why)"
+    fi
+fi
+if [ $PUBLIC -eq 1 ]; then report_public; fi
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "  (dry-run mode — destructive commands will be printed, not executed)"
+fi
+# --public refuses with the summary on screen, before anything is written: an
+# image that would carry someone's files cannot be given away, and the list
+# above is exactly what --exclude-from has to cover first. Not reading the
+# source at all is the same refusal -- "not checked" must never pass for clean.
+if [ $PUBLIC -eq 1 ]; then
+    if [ "$PUBLIC_PROBED" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+        die "--public could not read the source's accounts and files, so it cannot tell what the image would carry."
+    fi
+    if [ ${#PUBLIC_LEFTOVERS[@]} -gt 0 ]; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            echo "  (a real run REFUSES here: the files under \"Public:\" belong to no account the image keeps)"
+        else
+            die "--public: the copy would carry $PUBLIC_LEFTOVER_N file(s) owned by a removed or orphaned account (listed above). Add those paths to --exclude-from and run again."
+        fi
+    fi
 fi
 echo
 if [ $UPDATE -eq 1 ]; then
@@ -4370,7 +5260,9 @@ fi
 #   --exclude-from applies to every transfer, anchored to each transfer root,
 #     so the personal "/..." paths only match during the root rsync;
 #     --delete-excluded joins it under --update so those paths are PURGED from
-#     the target rather than protected from --delete.
+#     the target rather than protected from --delete. It is not in RSYNC_OPTS:
+#     the root transfer needs it AFTER the cache and --public rules
+#     (root_filters), so each pass names it where it belongs.
 #   -S is deliberately absent -- see --sparse. Every hole costs an ext4 extent:
 #     one 51.8 GiB .vdi measured here bought back 1.01 GiB (2%) for ~11,900
 #     extents, deepening the tree by a level. Writing the nulls out costs a few
@@ -4381,18 +5273,8 @@ if [ $UPDATE -eq 1 ]; then
     RSYNC_OPTS+=(--delete)
     if [ -n "$EXCLUDE_FROM" ]; then RSYNC_OPTS+=(--delete-excluded); fi
 fi
-if [ -n "$EXCLUDE_FROM" ]; then RSYNC_OPTS+=(--exclude-from="$EXCLUDE_FROM"); fi
-
-# Keep the root transfer off /boot whenever /boot is a filesystem of its own on
-# either side -- one that gets a pass below, or an in-place one. Two rules, not
-# one: "- /boot/" hides it from the sender, and the receiver-side "P /boot/" is
-# what stops --delete emptying the target's /boot (a plain exclude would not:
-# --delete-excluded demotes unqualified rules to sender-side only). With /boot
-# inside / on both sides it simply rides along with the root transfer.
-BOOT_FILTERS=()
-if [ $TGT_SEP_BOOT -eq 1 ] || [ $BOOT_PASS -eq 1 ]; then
-    BOOT_FILTERS=(--filter='- /boot/' --filter='P /boot/')
-fi
+EXCLUDE_ARGS=()
+if [ -n "$EXCLUDE_FROM" ]; then EXCLUDE_ARGS=(--exclude-from="$EXCLUDE_FROM"); fi
 
 if [ $MIGRATE_ROOT -eq 1 ]; then
     # Swap files are never transferred, only re-created afterwards. A dry run
@@ -4404,17 +5286,18 @@ if [ $MIGRATE_ROOT -eq 1 ]; then
     else
         swap_excludes_from_preview
         cache_filters_from_preview
+        if [ "$PUBLIC" -eq 1 ] && [ ${#PUBLIC_FILTERS[@]} -eq 0 ]; then
+            public_filters_static
+            echo "[dry-run] ...and --public could not read the source's accounts here, so the command below lacks the rules for their homes' binds and units (a real run reads them before the gate)"
+        fi
     fi
     echo "Rsyncing root filesystem..."
     # -x keeps the sender out of the target's mounted ESP at $MNT/boot/efi and
-    # stops --delete recursing into it; BOOT_FILTERS does the same for a /boot
-    # that is a filesystem of its own. CACHE_FILTERS come FIRST: rule order
-    # decides, and a "+" line in an --exclude-from file must not re-include a
-    # cache. --keep-cache is the one way to keep them, and it empties the array.
-    run sudo rsync "${CACHE_FILTERS[@]}" "${RSYNC_OPTS[@]}" "${BOOT_FILTERS[@]}" \
-        --exclude={"/dev/*","/proc/*","/sys/*","/tmp/*","/run/*","/media/*","/mnt/*","/lost+found"} \
-        "${SWAP_EXCLUDES[@]}" \
-        "$SRC/" "$MNT/"
+    # stops --delete recursing into it; root_filters keeps it off a /boot that
+    # is a filesystem of its own, and puts the caches and the --public rules
+    # first. --keep-cache is the one way to keep the caches: it empties the array.
+    root_filters
+    run sudo rsync "${RSYNC_OPTS[@]}" "${ROOT_FILTERS[@]}" "$SRC/" "$MNT/"
     # Reads the sizes/labels of files under $SRC, so likewise real runs only.
     if [ "$DRY_RUN" -eq 0 ]; then rebuild_swapfiles; fi
     # ...and the swap files belonging on a filesystem resolved at the gate,
@@ -4428,7 +5311,7 @@ if [ $BOOT_PASS -eq 1 ]; then
     # /boot/efi is the target's mounted ESP, which the EFI pass below owns: keep
     # this transfer out of it, and out of --delete's reach, since $MNT/boot may
     # be an ordinary directory rather than a mount point that -x would shield.
-    run sudo rsync "${RSYNC_OPTS[@]}" --filter='- /efi/' --filter='P /efi/' \
+    run sudo rsync "${RSYNC_OPTS[@]}" "${EXCLUDE_ARGS[@]}" --filter='- /efi/' --filter='P /efi/' \
         "$SRC/boot/" "$MNT/boot/"
 fi
 # No EFI pass: the ESP is not copied. Everything on it is written by Phase 5 and
@@ -4448,10 +5331,20 @@ if [ "$DRY_RUN" -eq 1 ]; then
         echo "[dry-run] would bring ${#REMAP_ENABLE[@]} commented-out fstab line(s) back to life: ${REMAP_ENABLE[*]}"
     fi
     echo "[dry-run] cannot list the fstab entries it would disable: that needs the target's own fstab, which is only readable once mounted"
+    if [ "$PUBLIC" -eq 1 ]; then
+        echo "[dry-run] would write hostname \"$HOSTNAME_NEW\", Ubuntu's stock /etc/hosts (no 127.0.1.1 line) and machine-id \"uninitialized\""
+        echo "[dry-run] would write $GIS_FIRST_LOGIN_DROPIN (GNOME Initial Setup once, at the login screen)"
+        for f in ${PUBLIC_NETPLAN[@]+"${PUBLIC_NETPLAN[@]}"}; do
+            echo "[dry-run] would rename $f to ${f##*/}.backup"
+        done
+    elif [ -n "$HOSTNAME_NEW" ]; then
+        echo "[dry-run] would write hostname \"$HOSTNAME_NEW\" to /etc/hostname and the 127.0.1.1 line of /etc/hosts"
+    fi
 else
     # rewrite_fstab also retargets (or, if absent, appends) the swap entry to
     # NEW_UUID_SWAP when a swap device was given.
     rewrite_fstab
+    write_identity
 
     echo "Enforcing Root UUID mapping in GRUB default..."
     if grep -q '^GRUB_CMDLINE_LINUX=' "$MNT/etc/default/grub"; then
@@ -4465,6 +5358,9 @@ echo "=========================================="
 echo " Phase 5: The Headless chroot Environment "
 echo "=========================================="
 if [ "$DRY_RUN" -eq 1 ]; then
+    for row in ${PUBLIC_USERS[@]+"${PUBLIC_USERS[@]}"}; do
+        echo "[dry-run] would chroot: userdel $(public_field "$row" 1), then remove /etc/{passwd,shadow,group,gshadow,subuid,subgid}-"
+    done
     echo "[dry-run] would chroot: grub-install --boot-directory=/boot/efi/boot (bios=$INSTALL_GRUB_BIOS efi=$INSTALL_GRUB_EFI), update-grub + update-initramfs"
 else
     # os-prober is inert on GRUB >= 2.06 unless enabled. Where the target

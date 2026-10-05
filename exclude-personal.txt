@@ -104,10 +104,12 @@
 /home/tigran/Personal/
 /home/tigran/Misc/
 /var/cache/apt/*
-/var/cache/wigner/
+/var/cache/wignerf/
+/var/lib/nordvpn/
 /var/log/journal/*
 /var/log/AmneziaVPN/
 /etc/systemd/system/AmneziaVPN.service
+/etc/systemd/system/ollama.service
 /usr/share/applications/AmneziaVPN.desktop
 /usr/share/pixmaps/AmneziaVPN.png
 /usr/bin/libreoffice
@@ -151,3 +153,11 @@
 /var/local/tigran-state/local/share/com.github.githubapp/
 /var/local/tigran-state/local/share/Trash/*
 /var/local/tigran-state/local/bin/
+
+# --public: all of tigran-state goes. Its six subdirectories are the sources of
+# binds into /home/tigran, which --public leaves out by itself; this takes the
+# directory holding them too, which is owned by tigran and would otherwise stop
+# the run. It also makes every tigran-state line above redundant -- and this
+# file unfit for a clone that keeps the account, whose binds would then have
+# no source to mount.
+/var/local/tigran-state/
