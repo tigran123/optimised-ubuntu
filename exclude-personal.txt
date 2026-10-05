@@ -6,13 +6,7 @@
 /opt/Wolfram/
 /usr/share/Wolfram/
 /usr/share/ollama/
-/usr/share/stellarium/
-/usr/share/virtualbox/
-/usr/share/libreoffice/
-/usr/lib/libreoffice/
-/etc/libreoffice/
 /usr/include/boost/
-/usr/bin/stellarium
 /usr/local/bin/ollama
 /usr/local/lib/ollama/
 /usr/local/texlive/
@@ -105,14 +99,23 @@
 /home/tigran/Misc/
 /var/cache/apt/*
 /var/cache/wignerf/
-/var/lib/nordvpn/
+# NordVPN: the files its package ships, and none of its state -- the login and
+# settings, and insights.dat (where this machine's connection appears to be).
+# The first matching rule wins, so the + lines must come first.
++ /var/lib/nordvpn/data/
++ /var/lib/nordvpn/data/countries.dat
++ /var/lib/nordvpn/data/servers.dat
++ /var/lib/nordvpn/data/cybersec.dat
++ /var/lib/nordvpn/data/ovpn_template.xslt
++ /var/lib/nordvpn/data/ovpn_xor_template.xslt
+- /var/lib/nordvpn/data/*
+- /var/lib/nordvpn/*
 /var/log/journal/*
 /var/log/AmneziaVPN/
 /etc/systemd/system/AmneziaVPN.service
 /etc/systemd/system/ollama.service
 /usr/share/applications/AmneziaVPN.desktop
 /usr/share/pixmaps/AmneziaVPN.png
-/usr/bin/libreoffice
 
 # --- The same paths again, as this machine's ROOT filesystem sees them -------
 # rsync is handed the source's root filesystem RAW: mounted read-only, with none

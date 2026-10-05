@@ -1,4 +1,4 @@
-# Ubuntu 26.04 Public Image — v1.0
+# Ubuntu 26.04 Public Image — v1.1
 
 A ready-to-boot Ubuntu 26.04 LTS desktop, tuned for speed rather than for
 caution. It holds no user accounts and no personal data: you create your own
@@ -18,8 +18,8 @@ Ubuntu release, and is not endorsed by Canonical (Ubuntu is their trademark).
   whether those trade-offs suit your machine and how you use it is your
   responsibility.
 - **Third-party software comes under its own licence.** That includes Google
-  Chrome, the NVIDIA driver, VirtualBox, the NordVPN client and
-  wolframscript, and by using them you accept those licences.
+  Chrome, the NVIDIA driver, VirtualBox and the NordVPN client, and by using
+  them you accept those licences.
 
 ## What you need
 
@@ -34,15 +34,17 @@ Ubuntu release, and is not endorsed by Canonical (Ubuntu is their trademark).
 
 | File | |
 |---|---|
-| `Ubuntu-26-Public-v1.0-*.img.xz` | the image, 7.0 GB compressed (24 GiB written) |
-| `Ubuntu-26-Public-v1.0-*.img.xz.sha256` | its checksum |
+| `Ubuntu-26-Public-v1.1.img.xz` | the image to write to a disk, 7.5 GB compressed (24 GiB written) |
+| `Ubuntu-26-Public-v1.1.vdi.xz` | the same system as a VirtualBox disk, 7.5 GB compressed, to try it in a virtual machine first ([below](#trying-it-in-virtualbox)) |
+| `*.sha256` | a checksum for each |
 
-Check the download before writing it. Compare the hash this prints with the
-one in the `.sha256` file:
-- **Linux:** `sha256sum -c Ubuntu-26-Public-v1.0-*.img.xz.sha256` checks it for
-  you;
-- **macOS:** `shasum -a 256 Ubuntu-26-Public-v1.0-*.img.xz`;
-- **Windows:** `certutil -hashfile Ubuntu-26-Public-v1.0-<date>.img.xz SHA256`.
+You need only one of the two. Check the download before using it, by
+comparing the hash these commands print with the one in its `.sha256` file:
+- **Linux:** `sha256sum -c --ignore-missing Ubuntu-26-Public-v1.1.*.sha256`
+  checks every file you downloaded and does the comparing for you;
+- **macOS:** `shasum -a 256 Ubuntu-26-Public-v1.1.*.xz`;
+- **Windows:** `certutil -hashfile Ubuntu-26-Public-v1.1.img.xz SHA256` (or the
+  `.vdi.xz`).
 
 ## Writing the image
 
@@ -54,7 +56,7 @@ target is the **whole disk**, not a partition on it.
   Image…* → choose the `.img.xz` → *Start Restoring*.
 - **Linux, command line:** find the disk with `lsblk` first.
   ```bash
-  xzcat Ubuntu-26-Public-v1.0-*.img.xz | sudo dd of=/dev/sdX bs=4M conv=fsync status=progress
+  xzcat Ubuntu-26-Public-v1.1.img.xz | sudo dd of=/dev/sdX bs=4M conv=fsync status=progress
   ```
 - **Windows and macOS:** use [balenaEtcher](https://etcher.balena.io/): *Flash from
   file* → choose the `.img.xz` → *Select target* → *Flash!*
@@ -67,13 +69,41 @@ target is the **whole disk**, not a partition on it.
   faster than `/dev/diskN`.
   ```bash
   diskutil unmountDisk /dev/diskN
-  xzcat Ubuntu-26-Public-v1.0-*.img.xz | sudo dd of=/dev/rdiskN bs=4m
+  xzcat Ubuntu-26-Public-v1.1.img.xz | sudo dd of=/dev/rdiskN bs=4m
   ```
+
+## Trying it in VirtualBox
+
+The `.vdi.xz` is the same system, unbooted, as a VirtualBox disk.
+1. **Decompress it first:** VirtualBox cannot read `.xz`.
+   - Linux and macOS: `xz -dk Ubuntu-26-Public-v1.1.vdi.xz`
+   - Windows: 7-Zip → *Extract Here*
+
+   The `.vdi` takes about 22 GB on disk and is a 24 GiB virtual disk.
+2. **Optionally, make the disk bigger before the first boot.** The system
+   grows to fill it on its own, just as on a real disk. To make it 64 GiB
+   (the size is in MB):
+   ```bash
+   VBoxManage modifymedium disk Ubuntu-26-Public-v1.1.vdi --resize 65536
+   ```
+   In the GUI, do the same under *File → Tools → Media*: select the disk,
+   set its size and click *Apply*.
+3. **Create the machine.** Choose *Machine → New* and pick Linux, Ubuntu
+   (64-bit). Under *Hard Disk*, choose *Use an Existing Virtual Hard Disk
+   File* and select the `.vdi`. If that option is missing, switch VirtualBox
+   from *Basic* to *Expert* mode: Basic mode hides it.
+4. **Give it resources.** At least 4 GB of RAM (it has no swap) and 2 or more
+   CPUs. It boots both with and without *Enable EFI* (*Settings → System*);
+   if you turn EFI on, leave Secure Boot off.
+
+A second virtual machine needs its own copy, made with *File → Tools →
+Media → Copy*: VirtualBox refuses to register the same disk twice.
 
 ## First boot
 
 1. Boot from the disk you wrote, usually through the firmware's boot menu key
-   (F12, F11, F8 or Esc, depending on the maker).
+   (F12, F11, F8 or Esc, depending on the maker), or start the virtual
+   machine.
 2. The boot menu offers three entries:
    - **GUI Portable Image** (the default) is the desktop;
    - **TTY Portable Image** starts a text console without a desktop;
@@ -164,6 +194,7 @@ Security updates install themselves (unattended-upgrades), as on stock Ubuntu.
 - **Preinstalled:**
   - Google Chrome is the browser;
   - LibreOffice;
+  - Stellarium, the planetarium;
   - VirtualBox;
   - the NVIDIA driver (580), which only loads on a machine with an NVIDIA card.
 
@@ -173,3 +204,12 @@ Security updates install themselves (unattended-upgrades), as on stock Ubuntu.
   Do not connect two copies to the same machine at once, or it may mount the
   wrong one.
 - **The menu titles say "Portable Image".** That is cosmetic.
+
+## Changes since v1.0
+
+- **LibreOffice and Stellarium are included.** In v1.0 their files were left
+  out, and their icons in the app grid opened nothing.
+- **VirtualBox is complete.** v1.0 lacked the sources it needs to rebuild its
+  kernel modules after a kernel update, and its translations.
+- **The NordVPN client has its data files.** v1.0 left out its server and
+  country lists and its OpenVPN templates.
