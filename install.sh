@@ -367,6 +367,7 @@ probe_source_swapfiles() {
     probe_memtest "$SRC"
     probe_os_release "$SRC"
     HOSTNAME_SRC=$(hostname_from "$SRC")
+    probe_mask_units "$SRC"
     # Last, because it walks the whole transfer, swap files excluded as they
     # will be: what the copy would carry that belongs to nobody afterwards.
     # Only after probe_public really read the accounts (it leaves the rules
@@ -2551,6 +2552,41 @@ hostname_valid() {
     [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]
 }
 
+# probe_mask_units <root> — which --mask units the source at <root> has no
+#   unit file for, into MASK_MISSING, so the summary can flag a likely typo
+#   before the gate. Such a unit is still masked: that is harmless, and it stays
+#   masked if a package later installs it. Sets MASK_PROBED.
+probe_mask_units() {
+    local u d
+    MASK_MISSING=()
+    for u in ${MASK_UNITS[@]+"${MASK_UNITS[@]}"}; do
+        for d in etc/systemd/system usr/lib/systemd/system lib/systemd/system; do
+            [ -e "$1/$d/$u" ] && continue 2
+        done
+        MASK_MISSING+=("$u")
+    done
+    MASK_PROBED=1
+}
+
+# mask_units — --mask, on the mounted target root: each unit is disabled (the
+#   links its [Install] section made are removed) and then masked (linked to
+#   /dev/null), by the host's systemctl --root, which only touches files. It is
+#   the mask that holds: a package whose postinst runs "systemctl enable" and
+#   "start" on every upgrade (nordvpn's does) brings a merely disabled unit
+#   back, and fails on a masked one. A failure is left to verify_install(),
+#   which checks each unit. Reads MNT, MASK_UNITS.
+mask_units() {
+    local u
+    [ ${#MASK_UNITS[@]} -gt 0 ] || return 0
+    info "Masking in the target: ${MASK_UNITS[*]}"
+    for u in "${MASK_UNITS[@]}"; do
+        # Fails for a unit with no file, which has no links to remove anyway;
+        # the links it does remove are worth seeing in the log.
+        sudo systemctl --root="$MNT" disable -- "$u" 2>&1 | grep -v 'does not exist' || true
+    done
+    sudo systemctl --root="$MNT" mask -- "${MASK_UNITS[@]}" || true
+}
+
 # probe_esp_menu — the systems already registered on the target ESP, read
 #   before the gate so the summary can say whose entries this run keeps and
 #   verify_install() can prove afterwards that it did. Skipped when the ESP is
@@ -3439,6 +3475,7 @@ verify_install() {
     }
     no_boot_entry() { ! fstab_mounts_boot "$1"; }
     root_label_is() { [ "$(sudo blkid -c /dev/null -s LABEL -o value "$1")" = "$2" ]; }
+    unit_masked() { [ "$(sudo readlink "$MNT/etc/systemd/system/$1")" = /dev/null ]; }
     # fs_lacks <device> <feature>... -- the ext4 on <device> has none of them.
     # A superblock that cannot be read is a failure, not an absence.
     fs_lacks() {
@@ -3535,16 +3572,6 @@ verify_install() {
         vcheck "the root filesystem is labelled \"$ROOT_LABEL\"" \
             root_label_is "$TGT_ROOT" "$ROOT_LABEL"
     fi
-    # What this run's mkfs turned off; mke2fs.conf turns both on, so leaving
-    # them out of -O once let them back in unnoticed.
-    if [ "$UPDATE" -eq 0 ] && [ "$MIGRATE_ROOT" -eq 1 ]; then
-        vcheck "the root filesystem has no orphan_file or metadata_csum_seed" \
-            fs_lacks "$TGT_ROOT" orphan_file metadata_csum_seed
-    fi
-    if [ "$UPDATE" -eq 0 ] && [ "$MIGRATE_BOOT" -eq 1 ]; then
-        vcheck "the /boot filesystem has no orphan_file or metadata_csum_seed" \
-            fs_lacks "$TGT_BOOT" orphan_file metadata_csum_seed
-    fi
 
     # The mounts resolved at the gate: live in the target's fstab, naming the
     # chosen filesystem, with every revived line live too. The one part of the
@@ -3592,6 +3619,10 @@ verify_install() {
             sudo awk -v h="$HOSTNAME_NEW" '$1 == "127.0.1.1" { for (i = 2; i <= NF; i++) if ($i == h) f = 1 }
                                            END { exit !f }' "$MNT/etc/hosts"
     fi
+    local unit
+    for unit in ${MASK_UNITS[@]+"${MASK_UNITS[@]}"}; do
+        vcheck "$unit is masked (--mask)" unit_masked "$unit"
+    done
     if [ "$PUBLIC" -eq 1 ]; then verify_public; fi
 
     if [ "$fails" -gt 0 ]; then
@@ -3782,6 +3813,10 @@ HOSTNAME_ARG=""
 HOSTNAME_NEW=""
 HOSTNAME_SRC=""               # what the source's /etc/hostname says
 HOSTNAME_TGT=""               # ...and the target's, under --update
+# --mask UNIT: systemd units the target gets masked, after the copy.
+MASK_UNITS=()
+MASK_MISSING=()               # ...of which the source has no unit file
+MASK_PROBED=0                 # 0 = the source's units could not be read here
 
 # Where rewrite_fstab()'s awk records what it changed, for the reports printed
 # right after. Global only so cleanup() can remove the directory if the run ends
@@ -3832,6 +3867,7 @@ while [ $# -gt 0 ]; do
         --remap)          REMAP_ARGS+=("$2"); shift 2 ;;
         --public)         PUBLIC=1; shift ;;
         --hostname)       HOSTNAME_ARG="$2"; shift 2 ;;
+        --mask)           MASK_UNITS+=("$2"); shift 2 ;;
         --yes|-y)         ASSUME_YES=1; shift ;;
         -h|--help)
             cat <<USAGE
@@ -3967,6 +4003,13 @@ Other:
                               has, so a clone named once stays named. Not with
                               --public, whose owner names the machine at first
                               boot.
+  --mask UNIT                 Mask the systemd unit UNIT in the target: it stays
+                              installed but is never started, not even by a
+                              package upgrade whose postinst runs "systemctl
+                              enable" again. Repeatable. Meant for a daemon the
+                              source runs for its owner and an image should not,
+                              e.g. --mask nordvpnd.service --mask nordvpnd.socket;
+                              "systemctl unmask UNIT" on the target undoes it.
   --brand NAME               Brand the GRUB menu title with NAME instead of the
                               target disk's reported model (useful when the medium
                               sits in a USB card reader, whose model string —
@@ -4149,9 +4192,11 @@ Examples:
 
   # Public image to give away, built from this machine's own disk into a
   # loop-attached file (truncate -s 24G public.img; losetup -fP --show ...);
-  # its root grows to fill whatever disk it is later written to:
+  # its root grows to fill whatever disk it is later written to. The VPN
+  # daemon this machine runs stays installed in it, but off:
   $0 --source /dev/nvme0n1 --target /dev/loop0 --public \\
-     --exclude-from exclude-personal.txt
+     --exclude-from exclude-personal.txt --mask nordvpnd.service \\
+     --mask nordvpnd.socket --mask nordvpnd-killswitch.service
 
 Most options also read from the matching environment variable (SOURCE, TARGET,
 SRC_ROOT, SRC_BOOT, TGT_ROOT, TGT_BOOT, TGT_ROOT_LABEL, TGT_SWAP, EXCLUDE_FROM,
@@ -4284,6 +4329,12 @@ fi
 if [ -n "$HOSTNAME_ARG" ] && ! hostname_valid "$HOSTNAME_ARG"; then
     die "--hostname must be one label of letters, digits and hyphens (at most 63, no hyphen first or last), got: $HOSTNAME_ARG"
 fi
+# --mask hands its argument to systemctl, so only a plain unit name gets there.
+# A leading letter or digit also rules out "-.mount", the root filesystem.
+for mask_unit in ${MASK_UNITS[@]+"${MASK_UNITS[@]}"}; do
+    [[ $mask_unit =~ ^[A-Za-z0-9][A-Za-z0-9:_.@\\-]*\.(service|socket|timer|path|mount|automount|swap|target|slice)$ ]] || \
+        die "--mask takes a systemd unit name, such as nordvpnd.service, got: $mask_unit"
+done
 
 # --public builds a fresh image and nothing else, so its contradictions are
 # refused rather than half-honoured: --update would sync onto a disk whose
@@ -4697,6 +4748,9 @@ if [ -n "$HOSTNAME_ARG" ] && [ $MIGRATE_ROOT -eq 0 ]; then
 fi
 if [ $PUBLIC -eq 1 ] && [ $MIGRATE_ROOT -eq 0 ]; then
     die "--public needs a root filesystem this run copies, but --target-root ($TGT_ROOT) is the source's own: its accounts would be removed from the source itself."
+fi
+if [ ${#MASK_UNITS[@]} -gt 0 ] && [ $MIGRATE_ROOT -eq 0 ]; then
+    die "--mask needs a root filesystem this run writes, but --target-root ($TGT_ROOT) is the source's own: the units would be masked on the source itself."
 fi
 
 # An ESP this run does not format must already hold FAT, or Phase 3 fails on
@@ -5159,6 +5213,14 @@ if [ $MIGRATE_ROOT -eq 1 ]; then
         summary_row "Hostname:" "\"$HOSTNAME_NEW\" ($hostname_why)"
     fi
 fi
+if [ ${#MASK_UNITS[@]} -gt 0 ]; then
+    summary_row "Masked:" "${MASK_UNITS[*]} (installed, but never started; systemctl unmask undoes it)"
+    if [ ${#MASK_MISSING[@]} -gt 0 ]; then
+        summary_row "" "WARNING: the source has no unit file for ${MASK_MISSING[*]} (masked anyway -- a typo?)"
+    elif [ "$MASK_PROBED" -eq 0 ]; then
+        summary_row "" "  whether the source has these units could not be read here"
+    fi
+fi
 if [ $PUBLIC -eq 1 ]; then report_public; fi
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "  (dry-run mode — destructive commands will be printed, not executed)"
@@ -5218,9 +5280,8 @@ if [ $UPDATE -eq 0 ]; then
         run sudo wipefs -q -a "$TGT_BOOT"
         # A /boot holds a few dozen large files, so its inode table wants to
         # be dense (-i 32768) where the rootfs wants the opposite;
-        # sparse_super2 because GRUB's own drivers must read it; the other two
-        # as for the root below.
-        run sudo mkfs.ext4 -vF -L boot -i 32768 -m 0 -E lazy_itable_init=0,lazy_journal_init=0 -O sparse_super2,^orphan_file,^metadata_csum_seed "$TGT_BOOT"
+        # sparse_super2 because GRUB's own drivers must read it.
+        run sudo mkfs.ext4 -vF -L boot -i 32768 -m 0 -E lazy_itable_init=0,lazy_journal_init=0 -O sparse_super2 "$TGT_BOOT"
     fi
     if [ $MIGRATE_ROOT -eq 1 ]; then
         run sudo wipefs -q -a "$TGT_ROOT"
@@ -5243,14 +5304,12 @@ if [ $UPDATE -eq 0 ]; then
             TARGET_INODES=$(( CALC_INODES < MIN_INODES ? MIN_INODES : CALC_INODES ))
         fi
 
-        # orphan_file and metadata_csum_seed are switched OFF by name, because
-        # 26.04's /etc/mke2fs.conf switches them on: leaving them out of -O is
-        # not enough. A --public root also goes without sparse_super2, since its
-        # first boot grows it while mounted and the kernel refuses that
-        # (ext4_resize_begin) on a sparse_super2 file system.
-        ROOT_FEATURES=sparse_super2,^orphan_file,^metadata_csum_seed
-        [ "$PUBLIC" -eq 0 ] || ROOT_FEATURES=^orphan_file,^metadata_csum_seed
-        run sudo mkfs.ext4 -vF -m 0 -L "$ROOT_LABEL" -N "$TARGET_INODES" -E lazy_itable_init=0,lazy_journal_init=0 -O "$ROOT_FEATURES" "$TGT_ROOT"
+        # A --public root goes without sparse_super2: its first boot grows it
+        # while mounted, which the kernel refuses (ext4_resize_begin) on a
+        # sparse_super2 file system.
+        ROOT_FEATURES=(-O sparse_super2)
+        [ "$PUBLIC" -eq 0 ] || ROOT_FEATURES=()
+        run sudo mkfs.ext4 -vF -m 0 -L "$ROOT_LABEL" -N "$TARGET_INODES" -E lazy_itable_init=0,lazy_journal_init=0 ${ROOT_FEATURES[@]+"${ROOT_FEATURES[@]}"} "$TGT_ROOT"
     fi
 elif [ -n "$TGT_ROOT_LABEL" ] && [ "$TGT_ROOT_LABEL_NOW" != "$ROOT_LABEL" ]; then
     # No mkfs under --update, so this is where a kept root filesystem gets its
@@ -5444,11 +5503,15 @@ if [ "$DRY_RUN" -eq 1 ]; then
     elif [ -n "$HOSTNAME_NEW" ]; then
         echo "[dry-run] would write hostname \"$HOSTNAME_NEW\" to /etc/hostname and the 127.0.1.1 line of /etc/hosts"
     fi
+    if [ ${#MASK_UNITS[@]} -gt 0 ]; then
+        echo "[dry-run] would disable and mask in the target: ${MASK_UNITS[*]}"
+    fi
 else
     # rewrite_fstab also retargets (or, if absent, appends) the swap entry to
     # NEW_UUID_SWAP when a swap device was given.
     rewrite_fstab
     write_identity
+    mask_units
 
     echo "Enforcing Root UUID mapping in GRUB default..."
     if grep -q '^GRUB_CMDLINE_LINUX=' "$MNT/etc/default/grub"; then

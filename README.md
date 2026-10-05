@@ -1,7 +1,7 @@
 # Optimised version of Ubuntu 26.04 LTS distribution
 I have made the following optimisations:
 
-* Formatted the rootfs with `-O sparse_super2` and a very sparse inode table (~4 MiB per inode), which makes use of the latest versions of Linux kernel, forsaking compatibility with the ancient versions which are, imho, no longer relevant. I did use `orphan_file` for a while and dropped it again: it sets the *dynamic* `INCOMPAT_ORPHAN_PRESENT` superblock flag while orphan entries exist and only clears it on a clean unmount, so an unclean shutdown leaves an incompat flag behind — and recovering from power loss started costing me noticeably more than it used to.
+* Formatted the rootfs with `-O sparse_super2` and a very sparse inode table (~4 MiB per inode), which makes use of the latest versions of Linux kernel, forsaking compatibility with the ancient versions which are, imho, no longer relevant.
 
 * No separate `/boot` partition. It only ever existed because the rootfs carried features GRUB could not read; now that both are plain `-O sparse_super2`, GRUB reads the rootfs directly and `/boot` is just a directory in `/`. A fresh disk gets three partitions — 1 MiB BIOS Boot, 256 MiB ESP, and the root filesystem. You can check this claim yourself without booting anything, using GRUB's own ext2 driver: `grub-fstest Ubuntu26-16GB.img ls '(loop0,gpt3)/boot/grub/'`.
 

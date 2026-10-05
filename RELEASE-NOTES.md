@@ -175,6 +175,14 @@ Security updates install themselves (unattended-upgrades), as on stock Ubuntu.
 
   Turn any of them back on with `sudo systemctl unmask NAME` and then
   `sudo systemctl enable --now NAME`.
+- **The NordVPN client is installed but switched off.** This project has no
+  connection with NordVPN. To use it with an account of your own:
+  ```bash
+  sudo systemctl unmask nordvpnd.service nordvpnd.socket nordvpnd-killswitch.service
+  sudo systemctl enable --now nordvpnd.socket
+  sudo usermod -aG nordvpn $USER    # then log out and back in
+  nordvpn login
+  ```
 - **No Snap and no App Center:** install software with `apt`.
 - **Some kernel modules are blocked:**
   - KVM on AMD processors (QEMU, GNOME Boxes);
@@ -213,3 +221,5 @@ Security updates install themselves (unattended-upgrades), as on stock Ubuntu.
   kernel modules after a kernel update, and its translations.
 - **The NordVPN client has its data files.** v1.0 left out its server and
   country lists and its OpenVPN templates.
+- **The NordVPN client no longer starts by itself.** Its daemon is masked
+  until you turn it on (see [Turned off](#turned-off)).
