@@ -1109,6 +1109,13 @@ probe_public() {
         fi
     fi
 
+    # GROW_ROOT_UNIT needs growpart (cloud-guest-utils) and systemd's
+    # systemd-growfs-root.service; without both it would only fail at boot.
+    PUBLIC_GROW=0
+    if [ -x "$SRC/usr/bin/growpart" ] && [ -e "$SRC/usr/lib/systemd/system/systemd-growfs-root.service" ]; then
+        PUBLIC_GROW=1
+    fi
+
     public_filters_static
     for rule in ${rules[@]+"${rules[@]}"}; do
         PUBLIC_FILTERS=(--filter="$rule" "${PUBLIC_FILTERS[@]}")
@@ -1248,6 +1255,13 @@ report_public() {
         summary_row "" "  through /etc/hosts (no systemd-resolved stub, no nss-myhostname); apt install libnss-myhostname"
     fi
     summary_row "" "GNOME Initial Setup runs once, at the login screen (not again in the new session)"
+    if [ "$PUBLIC_GROW" = 1 ]; then
+        summary_row "" "the root grows to fill whatever disk the image is written to, at first boot (growpart,"
+        summary_row "" "  then systemd-growfs-root; the root is made without sparse_super2, which would stop it)"
+    else
+        summary_row "" "WARNING: the root will stay this size on a bigger disk: the source has no growpart"
+        summary_row "" "  (apt install cloud-guest-utils) or no systemd-growfs-root.service"
+    fi
     for row in ${PUBLIC_NETPLAN[@]+"${PUBLIC_NETPLAN[@]}"}; do
         summary_row "" "  $row -> ${row##*/}.backup (names this machine's interfaces)"
     done
@@ -1285,10 +1299,11 @@ hosts_stock() {
 #   with no 127.0.1.1 line (the owner has not named the machine yet) instead of
 #   the source's LAN map, a machine-id that makes the next boot a
 #   first boot, the netplan files naming this machine's interfaces set aside as
-#   *.yaml.backup, and GNOME Initial Setup run once rather than twice (see
-#   GIS_FIRST_LOGIN_DROPIN). A name of its own also takes PRETTY_HOSTNAME out of
+#   *.yaml.backup, GNOME Initial Setup run once rather than twice (see
+#   GIS_FIRST_LOGIN_DROPIN), and the root grown to fill its disk at first boot
+#   (GROW_ROOT_UNIT). A name of its own also takes PRETTY_HOSTNAME out of
 #   /etc/machine-info, which GNOME would otherwise go on showing as the device
-#   name. Reads MNT, HOSTNAME_NEW, PUBLIC, PUBLIC_NETPLAN.
+#   name. Reads MNT, HOSTNAME_NEW, PUBLIC, PUBLIC_NETPLAN, PUBLIC_GROW.
 write_identity() {
     local f
     if [ -n "$HOSTNAME_NEW" ]; then
@@ -1332,6 +1347,13 @@ write_identity() {
     sudo mkdir -p "$MNT${GIS_FIRST_LOGIN_DROPIN%/*}"
     printf '%s' "$GIS_FIRST_LOGIN_TEXT" | sudo tee "$MNT$GIS_FIRST_LOGIN_DROPIN" >/dev/null
     sudo chmod 644 "$MNT$GIS_FIRST_LOGIN_DROPIN"
+    [ "$PUBLIC_GROW" = 1 ] || return 0
+    info "First boot: the root grows to fill its disk (${GROW_ROOT_UNIT#/})."
+    printf '%s\n' "$GROW_ROOT_TEXT" | sudo tee "$MNT$GROW_ROOT_UNIT" >/dev/null
+    sudo chmod 644 "$MNT$GROW_ROOT_UNIT"
+    # The link "systemctl enable" would make.
+    sudo mkdir -p "$MNT/etc/systemd/system/sysinit.target.wants"
+    sudo ln -sfn "$GROW_ROOT_UNIT" "$MNT/etc/systemd/system/sysinit.target.wants/${GROW_ROOT_UNIT##*/}"
 }
 
 # GIS_FIRST_LOGIN_DROPIN — the account on a --public image is made by GNOME
@@ -1353,6 +1375,41 @@ GIS_FIRST_LOGIN_TEXT="# Written by install.sh --public: GNOME Initial Setup ran 
 ExecStart=
 ExecStart=/bin/sh -c '. /etc/os-release && mkdir -p \"\$\$1/gnome-initial-setup\" && touch \"\$\$1/gnome-initial-setup/upgrade-\$\${VERSION_ID}-done\" && printf yes > \"\$\$1/gnome-initial-setup-done\"' sh %E
 "
+
+# GROW_ROOT_UNIT — a --public image is written whole onto a disk of any size, so
+#   its first boot grows the root partition to the end of that disk (growpart,
+#   which also moves the backup GPT header there) and systemd-growfs-root then
+#   grows the mounted file system into it -- the Raspberry Pi OS arrangement,
+#   with the partition grown online rather than in the initramfs. That online
+#   growth is why the public root is made without sparse_super2: the kernel
+#   refuses to resize a mounted file system that has it. growpart exits 1 for
+#   NOCHANGE (no room after the root), which is not a failure. TMPDIR because
+#   /tmp may not be mounted yet; first-boot-complete.target, because the
+#   machine-id is committed there and a first boot cut short should try again.
+GROW_ROOT_UNIT=/etc/systemd/system/grow-root.service
+GROW_ROOT_TEXT=$(cat <<'EOF'
+# Written by install.sh --public: on the first boot, grow the root partition to
+# the end of its disk; systemd-growfs-root then grows the file system into it.
+[Unit]
+Description=Grow the root partition to fill its disk
+Documentation=man:growpart(1) man:systemd-growfs-root.service(8)
+ConditionFirstBoot=yes
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=systemd-growfs-root.service first-boot-complete.target shutdown.target
+Wants=systemd-growfs-root.service first-boot-complete.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=TMPDIR=/run
+ExecStart=/bin/sh -c 'p=$$(findmnt -nvo SOURCE /) && d=$$(lsblk -no PKNAME "$$p") && n=$$(cat "/sys/class/block/$${p##*/}/partition") || exit 1; growpart "/dev/$$d" "$$n"; [ $$? -le 1 ]'
+
+[Install]
+WantedBy=sysinit.target
+EOF
+)
 
 # -----------------------------------------------------------------------------
 # Mounts resolved at install time
@@ -3297,6 +3354,10 @@ verify_public() {
     no_host_keys() {
         [ -z "$(sudo find "$MNT/etc/ssh" -maxdepth 1 -name 'ssh_host_*' -print -quit 2>/dev/null)" ]
     }
+    grow_root_enabled() {
+        sudo test -s "$MNT$GROW_ROOT_UNIT" &&
+            sudo test -L "$MNT/etc/systemd/system/sysinit.target.wants/${GROW_ROOT_UNIT##*/}"
+    }
     no_unit_runs_as_them() {
         [ -n "$PUBLIC_WHO" ] || return 0
         ! sudo grep -rqE "^[[:space:]]*(User|Group)=($PUBLIC_WHO)[[:space:]]*$" "$MNT/etc/systemd/system"
@@ -3342,6 +3403,11 @@ verify_public() {
     vcheck "no SSH host key (the first boot makes them)" no_host_keys
     vcheck "no /etc/machine-info (its pretty hostname would name this machine)" sudo test ! -e "$MNT/etc/machine-info"
     vcheck "GNOME Initial Setup runs once ($GIS_FIRST_LOGIN_DROPIN)" sudo test -s "$MNT$GIS_FIRST_LOGIN_DROPIN"
+    if [ "$PUBLIC_GROW" = 1 ]; then
+        vcheck "the root grows to fill its disk at first boot ($GROW_ROOT_UNIT, enabled)" grow_root_enabled
+    fi
+    vcheck "the root has no sparse_super2 (the first boot grows it while mounted)" \
+        fs_lacks "$TGT_ROOT" sparse_super2
     vcheck "no unit in /etc/systemd/system runs as a removed account" no_unit_runs_as_them
     vcheck "fstab holds nothing but the target's own filesystems: nothing in /home, no disabled line" fstab_own_only
 }
@@ -3373,6 +3439,15 @@ verify_install() {
     }
     no_boot_entry() { ! fstab_mounts_boot "$1"; }
     root_label_is() { [ "$(sudo blkid -c /dev/null -s LABEL -o value "$1")" = "$2" ]; }
+    # fs_lacks <device> <feature>... -- the ext4 on <device> has none of them.
+    # A superblock that cannot be read is a failure, not an absence.
+    fs_lacks() {
+        local dev=$1 f x
+        shift
+        f=$(sudo dumpe2fs -h "$dev" 2>/dev/null | sed -n 's/^Filesystem features:[[:space:]]*//p')
+        [ -n "$f" ] || return 1
+        for x in "$@"; do [[ " $f " != *" $x "* ]] || return 1; done
+    }
 
     vcheck "fstab mounts / by the new root UUID"       sudo grep -qF "$NEW_UUID_ROOT" "$MNT/etc/fstab"
     if [ "$TGT_SEP_BOOT" -eq 1 ]; then
@@ -3459,6 +3534,16 @@ verify_install() {
     if [ -n "$TGT_ROOT_LABEL" ]; then
         vcheck "the root filesystem is labelled \"$ROOT_LABEL\"" \
             root_label_is "$TGT_ROOT" "$ROOT_LABEL"
+    fi
+    # What this run's mkfs turned off; mke2fs.conf turns both on, so leaving
+    # them out of -O once let them back in unnoticed.
+    if [ "$UPDATE" -eq 0 ] && [ "$MIGRATE_ROOT" -eq 1 ]; then
+        vcheck "the root filesystem has no orphan_file or metadata_csum_seed" \
+            fs_lacks "$TGT_ROOT" orphan_file metadata_csum_seed
+    fi
+    if [ "$UPDATE" -eq 0 ] && [ "$MIGRATE_BOOT" -eq 1 ]; then
+        vcheck "the /boot filesystem has no orphan_file or metadata_csum_seed" \
+            fs_lacks "$TGT_BOOT" orphan_file metadata_csum_seed
     fi
 
     # The mounts resolved at the gate: live in the target's fstab, naming the
@@ -3688,6 +3773,7 @@ PUBLIC_LEFTOVER_N=0           # ...and how many files that is in all
 PUBLIC_FILTERS=()
 PUBLIC_WHO=""                 # "name|uid|group..." -- a regex of who is removed
 PUBLIC_RESOLVER=""            # what answers for the hostname without /etc/hosts, if anything
+PUBLIC_GROW=""                # 1 = the root grows at first boot; 0 = the source cannot; "" = not read
 # The hostname this run stamps on the target: --hostname, else "ubuntu" under
 # --public, else -- under --update -- the one the target already wears
 # (probe_target_brand, before rsync overwrites it). Empty = the source's, left
@@ -3862,6 +3948,10 @@ Other:
                               out: a comment would still name your disks and
                               homes), and netplan files naming
                               this machine's interfaces become *.yaml.backup.
+                              Written whole onto a bigger disk (dd, GNOME
+                              Disks), the image grows its root to fill that
+                              disk at first boot (needs growpart, from
+                              cloud-guest-utils, on the source).
                               Files the copy would still carry that belong to
                               no account left REFUSE the run: the summary lists
                               them for --exclude-from. Needs a root this run
@@ -4058,7 +4148,8 @@ Examples:
      --exclude-from exclude-personal.txt
 
   # Public image to give away, built from this machine's own disk into a
-  # loop-attached file (truncate -s 28G public.img; losetup -fP --show ...):
+  # loop-attached file (truncate -s 24G public.img; losetup -fP --show ...);
+  # its root grows to fill whatever disk it is later written to:
   $0 --source /dev/nvme0n1 --target /dev/loop0 --public \\
      --exclude-from exclude-personal.txt
 
@@ -5127,8 +5218,9 @@ if [ $UPDATE -eq 0 ]; then
         run sudo wipefs -q -a "$TGT_BOOT"
         # A /boot holds a few dozen large files, so its inode table wants to
         # be dense (-i 32768) where the rootfs wants the opposite;
-        # sparse_super2 because GRUB's own drivers must read it.
-        run sudo mkfs.ext4 -vF -L boot -i 32768 -m 0 -E lazy_itable_init=0,lazy_journal_init=0 -O sparse_super2 "$TGT_BOOT"
+        # sparse_super2 because GRUB's own drivers must read it; the other two
+        # as for the root below.
+        run sudo mkfs.ext4 -vF -L boot -i 32768 -m 0 -E lazy_itable_init=0,lazy_journal_init=0 -O sparse_super2,^orphan_file,^metadata_csum_seed "$TGT_BOOT"
     fi
     if [ $MIGRATE_ROOT -eq 1 ]; then
         run sudo wipefs -q -a "$TGT_ROOT"
@@ -5151,7 +5243,14 @@ if [ $UPDATE -eq 0 ]; then
             TARGET_INODES=$(( CALC_INODES < MIN_INODES ? MIN_INODES : CALC_INODES ))
         fi
 
-        run sudo mkfs.ext4 -vF -m 0 -L "$ROOT_LABEL" -N "$TARGET_INODES" -E lazy_itable_init=0,lazy_journal_init=0 -O sparse_super2 "$TGT_ROOT"
+        # orphan_file and metadata_csum_seed are switched OFF by name, because
+        # 26.04's /etc/mke2fs.conf switches them on: leaving them out of -O is
+        # not enough. A --public root also goes without sparse_super2, since its
+        # first boot grows it while mounted and the kernel refuses that
+        # (ext4_resize_begin) on a sparse_super2 file system.
+        ROOT_FEATURES=sparse_super2,^orphan_file,^metadata_csum_seed
+        [ "$PUBLIC" -eq 0 ] || ROOT_FEATURES=^orphan_file,^metadata_csum_seed
+        run sudo mkfs.ext4 -vF -m 0 -L "$ROOT_LABEL" -N "$TARGET_INODES" -E lazy_itable_init=0,lazy_journal_init=0 -O "$ROOT_FEATURES" "$TGT_ROOT"
     fi
 elif [ -n "$TGT_ROOT_LABEL" ] && [ "$TGT_ROOT_LABEL_NOW" != "$ROOT_LABEL" ]; then
     # No mkfs under --update, so this is where a kept root filesystem gets its
@@ -5334,6 +5433,11 @@ if [ "$DRY_RUN" -eq 1 ]; then
     if [ "$PUBLIC" -eq 1 ]; then
         echo "[dry-run] would write hostname \"$HOSTNAME_NEW\", Ubuntu's stock /etc/hosts (no 127.0.1.1 line) and machine-id \"uninitialized\""
         echo "[dry-run] would write $GIS_FIRST_LOGIN_DROPIN (GNOME Initial Setup once, at the login screen)"
+        case "$PUBLIC_GROW" in
+            1) echo "[dry-run] would write and enable $GROW_ROOT_UNIT (the root grows to fill its disk at first boot)" ;;
+            0) echo "[dry-run] would NOT write $GROW_ROOT_UNIT: the source has no growpart or systemd-growfs-root" ;;
+            *) echo "[dry-run] would write $GROW_ROOT_UNIT if the source has growpart (not read here)" ;;
+        esac
         for f in ${PUBLIC_NETPLAN[@]+"${PUBLIC_NETPLAN[@]}"}; do
             echo "[dry-run] would rename $f to ${f##*/}.backup"
         done
