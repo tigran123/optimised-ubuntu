@@ -7,7 +7,7 @@ I have made the following optimisations:
 
   One machine here is the exception, and it is not about GRUB being able to *read* the kernel but about the BIOS being able to *reach* it: that BIOS cannot boot from NVMe at all, so its BIOS Boot partition, ESP and `/boot` sit on the SATA SSD (~530 MB/s) while `/` — everything the running system actually touches — lives on the NVMe (~2000 MB/s). `install.sh` supports that layout explicitly, with `--source-boot` / `--target-boot`; see below.
 
-* Disabled WiFi, printer and many other services by default (trivially enabled by commands like `sudo systemctl unmask wpa_supplicant ; sudo systemctl enable --now wpa_supplicant`, etc.
+* Disabled printing and many other services by default (trivially re-enabled by commands like `sudo systemctl unmask cups.service cups.socket cups.path ; sudo systemctl enable --now cups`, etc.). WiFi is not one of them: `wpa_supplicant` is merely disabled, so nothing starts it at boot, but NetworkManager starts it on demand through D-Bus whenever it finds a WiFi adapter -- so on a laptop WiFi just works, and on a desktop without one it never runs. To switch WiFi off for real, mask it: `sudo systemctl mask wpa_supplicant`.
 
 * Disabled auto-loading of kernel modules for ancient hardware, like serial port, parallel port, etc. Again, re-enabled by trivial editing of files in `/etc/modprobe.d` and remaking initrd
 

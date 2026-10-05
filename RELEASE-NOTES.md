@@ -34,8 +34,8 @@ Ubuntu release, and is not endorsed by Canonical (Ubuntu is their trademark).
 
 | File | |
 |---|---|
-| `Ubuntu-26-Public-v1.1.img.xz` | the image to write to a disk, 7.5 GB compressed (24 GiB written) |
-| `Ubuntu-26-Public-v1.1.vdi.xz` | the same system as a VirtualBox disk, 7.5 GB compressed, to try it in a virtual machine first ([below](#trying-it-in-virtualbox)) |
+| `Ubuntu-26-Public-v1.1.img.xz` | the image to write to a disk, 7.6 GB compressed (24 GiB written) |
+| `Ubuntu-26-Public-v1.1.vdi.xz` | the same system as a VirtualBox disk, 7.6 GB compressed, to try it in a virtual machine first ([below](#trying-it-in-virtualbox)) |
 | `*.sha256` | a checksum for each |
 
 You need only one of the two. Check the download before using it, by
