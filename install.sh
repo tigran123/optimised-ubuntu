@@ -771,19 +771,24 @@ swap_excludes_from_preview() {
 }
 
 # root_filters — every filter rule of the root transfer, in the order rsync must
-#   see them, into ROOT_FILTERS. The caches and the --public rules come FIRST:
-#   the first matching rule wins, and a "+" line in an --exclude-from file must
-#   re-include neither. Then that file, /boot whenever it is a filesystem of its
-#   own on either side, the live system's virtual and scratch directories, and
-#   the swap files. Built in one place for the Phase 3 rsync and the --public
+#   see them, into ROOT_FILTERS. The first matching rule wins, on each side, so
+#   the --preserve pairs lead: no "+" line in an --exclude-from file can send the
+#   source's copy, and no "-" line can purge the target's under
+#   --delete-excluded. The caches and the --public rules come next, for the same
+#   reason (--public refuses the --update that --preserve needs, so those two
+#   never meet). Then that file, /boot whenever it is a filesystem of its own on
+#   either side, the live system's virtual and scratch directories, and the
+#   swap files. Built in one place for the Phase 3 rsync and the --public
 #   ownership scan, so that what is checked is exactly what is copied.
 #   /boot takes TWO rules: "- /boot/" hides it from the sender, and only the
 #   receiver-side "P /boot/" stops --delete emptying the target's /boot, since
 #   --delete-excluded demotes unqualified rules to sender-side only. With /boot
-#   inside / on both sides it simply rides along. Reads CACHE_FILTERS,
-#   PUBLIC_FILTERS, EXCLUDE_FROM, TGT_SEP_BOOT, BOOT_PASS, SWAP_EXCLUDES.
+#   inside / on both sides it simply rides along. Reads PRESERVE_FILTERS,
+#   CACHE_FILTERS, PUBLIC_FILTERS, EXCLUDE_FROM, TGT_SEP_BOOT, BOOT_PASS,
+#   SWAP_EXCLUDES.
 root_filters() {
-    ROOT_FILTERS=(${CACHE_FILTERS[@]+"${CACHE_FILTERS[@]}"}
+    ROOT_FILTERS=(${PRESERVE_FILTERS[@]+"${PRESERVE_FILTERS[@]}"}
+                  ${CACHE_FILTERS[@]+"${CACHE_FILTERS[@]}"}
                   ${PUBLIC_FILTERS[@]+"${PUBLIC_FILTERS[@]}"})
     if [ -n "$EXCLUDE_FROM" ]; then ROOT_FILTERS+=(--exclude-from="$EXCLUDE_FROM"); fi
     if [ "$TGT_SEP_BOOT" -eq 1 ] || [ "$BOOT_PASS" -eq 1 ]; then
@@ -2522,8 +2527,9 @@ rewrite_fstab() {
 #   GRUB_DISTRIBUTOR, and the hostname it already wears, read through a
 #   transient read-only mount on MNT before rsync overwrites both files. Sets
 #   TGT_MODEL (empty if the mount fails or the "Desktop <brand> `( ." pattern is
-#   absent) and HOSTNAME_TGT (empty if there is no usable /etc/hostname). Runs
-#   under --dry-run too, so the summary can show what it would keep.
+#   absent) and HOSTNAME_TGT (empty if there is no usable /etc/hostname), and
+#   reads what --preserve keeps (probe_preserve). Runs under --dry-run too, so
+#   the summary can show what it would keep.
 probe_target_brand() {
     TGT_MODEL=""; HOSTNAME_TGT=""
     MOUNTS_DONE=1   # from here on cleanup() must sweep $MNT, interrupts included
@@ -2531,8 +2537,55 @@ probe_target_brand() {
         TGT_MODEL=$(sed -nE 's/^GRUB_DISTRIBUTOR="Desktop (.*) `\( \..*$/\1/p' \
                         "$MNT/etc/default/grub" 2>/dev/null | head -n 1) || TGT_MODEL=""
         HOSTNAME_TGT=$(hostname_from "$MNT")
+        probe_preserve
         sudo umount "$MNT" || true
     fi
+}
+
+# preserve_fingerprint <path> — one hash over every name, type, size, mtime,
+#   mode, owner and link target at and under <path> in the target root on MNT.
+#   Taken before the sync and again right after it, so verify_install() can tell
+#   that the rsync left a preserved path alone -- not just that it is still there.
+#   A path that has gone hashes as nothing, so it is verify_install() that says
+#   FAIL rather than pipefail ending the run halfway through Phase 3.
+preserve_fingerprint() {
+    { sudo find "$MNT$1" -printf '%P\t%y\t%s\t%T@\t%m\t%U\t%G\t%l\n' 2>/dev/null || true; } \
+        | LC_ALL=C sort | sha256sum | cut -d' ' -f1
+}
+
+# probe_preserve — on the target root probe_target_brand() has mounted read-only
+#   on MNT: whether each --preserve path is there (PRESERVE_STATE), its
+#   fingerprint (PRESERVE_BEFORE), and the hide + protect rule pair for each
+#   one present (PRESERVE_FILTERS). An absent path gets no rule, so the source's
+#   copy goes across: a first sync must not leave a clone with no network setup.
+#   The target's own fstab is walked with fstab_realpath() (FSTAB_TABLE made
+#   local, which that function then reads): a path the booted target binds in
+#   from elsewhere, or mounts from another filesystem, is kept only as the mount
+#   point the raw root filesystem holds, and PRESERVE_WHERE says so.
+probe_preserve() {
+    local p real
+    local FSTAB_TABLE=""
+    PRESERVE_FILTERS=()
+    [ ${#PRESERVE_PATHS[@]} -gt 0 ] || return 0
+    if [ -f "$MNT/etc/fstab" ]; then FSTAB_TABLE=$(fstab_mount_table "$MNT/etc/fstab"); fi
+    for p in "${PRESERVE_PATHS[@]}"; do
+        if sudo test -e "$MNT$p" || sudo test -L "$MNT$p"; then
+            PRESERVE_STATE[$p]=present
+            PRESERVE_BEFORE[$p]=$(preserve_fingerprint "$p")
+            PRESERVE_FILTERS+=(--filter="H $(rsync_pattern_escape "$p")"
+                               --filter="P $(rsync_pattern_escape "$p")")
+        else
+            PRESERVE_STATE[$p]=absent
+        fi
+        if real=$(fstab_realpath "$p"); then
+            if [ "$real" != "$p" ]; then
+                PRESERVE_WHERE[$p]="the target binds it in from $real, which is copied from the source as usual"
+            fi
+        else
+            PRESERVE_WHERE[$p]="it is on the filesystem the target mounts at ${real:-another mount point}, which this run does not copy"
+        fi
+    done
+    PRESERVE_PROBED=1
 }
 
 # hostname_from <root> — the static hostname a root filesystem carries: the
@@ -3623,6 +3676,12 @@ verify_install() {
     for unit in ${MASK_UNITS[@]+"${MASK_UNITS[@]}"}; do
         vcheck "$unit is masked (--mask)" unit_masked "$unit"
     done
+    local kept
+    for kept in ${PRESERVE_PATHS[@]+"${PRESERVE_PATHS[@]}"}; do
+        [ "${PRESERVE_STATE[$kept]:-}" = present ] || continue
+        vcheck "$kept is the target's own, untouched by the sync (--preserve)" \
+            [ "${PRESERVE_AFTER[$kept]:-}" = "${PRESERVE_BEFORE[$kept]}" ]
+    done
     if [ "$PUBLIC" -eq 1 ]; then verify_public; fi
 
     if [ "$fails" -gt 0 ]; then
@@ -3817,6 +3876,15 @@ HOSTNAME_TGT=""               # ...and the target's, under --update
 MASK_UNITS=()
 MASK_MISSING=()               # ...of which the source has no unit file
 MASK_PROBED=0                 # 0 = the source's units could not be read here
+# --preserve PATH: paths of the target's root filesystem that an --update leaves
+# as the target has them (probe_preserve, before the gate).
+PRESERVE_PATHS=()
+declare -A PRESERVE_STATE=()  # path -> present | absent (on the target, before the sync)
+declare -A PRESERVE_WHERE=()  # path -> where its data really is on the booted target
+declare -A PRESERVE_BEFORE=() # path -> fingerprint before the sync...
+declare -A PRESERVE_AFTER=()  # ...and right after it
+PRESERVE_FILTERS=()
+PRESERVE_PROBED=0             # 1 = the target root was read, so PRESERVE_STATE is real
 
 # Where rewrite_fstab()'s awk records what it changed, for the reports printed
 # right after. Global only so cleanup() can remove the directory if the run ends
@@ -3868,6 +3936,7 @@ while [ $# -gt 0 ]; do
         --public)         PUBLIC=1; shift ;;
         --hostname)       HOSTNAME_ARG="$2"; shift 2 ;;
         --mask)           MASK_UNITS+=("$2"); shift 2 ;;
+        --preserve)       PRESERVE_PATHS+=("$2"); shift 2 ;;
         --yes|-y)         ASSUME_YES=1; shift ;;
         -h|--help)
             cat <<USAGE
@@ -3956,6 +4025,19 @@ Other:
                               target: HTTP, compiled-JS and shader caches only,
                               all rebuilt on demand. The profile that matters
                               lives in ~/.config and is copied either way.
+  --preserve PATH             Under --update, leave PATH (a file or a whole
+                              directory) exactly as the TARGET has it: the
+                              source's copy is not sent, and the target's is
+                              not deleted. Repeatable. For a machine's own
+                              state, such as a laptop's network setup
+                              (/etc/netplan, /var/lib/NetworkManager). A path
+                              the target does not have yet is copied from the
+                              source as usual. Paths are in the target's root
+                              filesystem. Not for what a package owns (/usr,
+                              /var/lib/dpkg): the kept files would disagree with
+                              the packages around them. /, /boot, /etc/fstab and
+                              /etc/default/grub (and their parents) are refused,
+                              since this run rebuilds them from the source.
   --remap MOUNT=DEVICE        Point the target's fstab entry for MOUNT (/data,
                               say) at DEVICE instead of commenting it out because
                               the filesystem the source named will not be on this
@@ -4186,6 +4268,13 @@ Examples:
      --target-efi /dev/sde2 --target-root /dev/sde5 --update \\
      --yes --remap /data=/dev/sde4
 
+  # Refresh a laptop's clone of a desktop, keeping the laptop's own network
+  # setup -- its addresses and its saved Wi-Fi networks -- as it is:
+  $0 --source-efi /dev/sdd2 --source-root /dev/sdd3 \\
+     --target-efi /dev/sdb2 --target-root /dev/sdb3 --update \\
+     --preserve /etc/netplan --preserve /etc/NetworkManager/system-connections \\
+     --preserve /var/lib/NetworkManager
+
   # Impersonal clone: deploy minus the paths listed in exclude-personal.txt:
   $0 --image Ubuntu26-Portable-16GB.img --target /dev/sda \\
      --exclude-from exclude-personal.txt
@@ -4335,6 +4424,43 @@ for mask_unit in ${MASK_UNITS[@]+"${MASK_UNITS[@]}"}; do
     [[ $mask_unit =~ ^[A-Za-z0-9][A-Za-z0-9:_.@\\-]*\.(service|socket|timer|path|mount|automount|swap|target|slice)$ ]] || \
         die "--mask takes a systemd unit name, such as nordvpnd.service, got: $mask_unit"
 done
+# --preserve becomes an rsync rule pair, so each path is made canonical here: a
+# trailing slash or a doubled one would match nothing and keep nothing. Refused:
+# what this run rebuilds from the SOURCE after the copy (fstab, the GRUB
+# defaults), /boot, which must take the new kernels, and every parent of those
+# -- keeping /etc keeps the old fstab.
+if [ ${#PRESERVE_PATHS[@]} -gt 0 ]; then
+    [ $UPDATE -eq 1 ] || \
+        die "--preserve needs --update: without it the target root is reformatted, so there is nothing on it to preserve."
+    preserve_seen=" "
+    preserve_list=()
+    for preserve_path in "${PRESERVE_PATHS[@]}"; do
+        preserve_arg=$preserve_path
+        while [ "${preserve_path%/}" != "$preserve_path" ] && [ "$preserve_path" != / ]; do
+            preserve_path=${preserve_path%/}
+        done
+        [ "${preserve_path#/}" != "$preserve_path" ] || \
+            die "--preserve takes an absolute path in the target's root filesystem (e.g. /etc/netplan), got: $preserve_arg"
+        [ "$preserve_path" != / ] || die "--preserve / would keep the whole target as it is: that is not an --update."
+        case "$preserve_path/" in
+            *//*|*/./*|*/../*) die "--preserve: write the path plainly, with no empty, . or .. components, got: $preserve_arg" ;;
+        esac
+        [[ $preserve_path != *[[:cntrl:]]* ]] || die "--preserve: the path contains a control character: $preserve_arg"
+        case "$preserve_path" in
+            /boot|/boot/*)
+                die "--preserve $preserve_path is refused: /boot must take the source's new kernels and initramfs." ;;
+        esac
+        for preserve_owned in /etc/fstab /etc/default/grub; do
+            if [ "$preserve_path" = "$preserve_owned" ] || [ "${preserve_owned#"$preserve_path"/}" != "$preserve_owned" ]; then
+                die "--preserve $preserve_path is refused: this run rebuilds $preserve_owned from the source's copy, so the target's cannot be kept."
+            fi
+        done
+        [[ $preserve_seen == *" $preserve_path "* ]] && continue
+        preserve_seen+="$preserve_path "
+        preserve_list+=("$preserve_path")
+    done
+    PRESERVE_PATHS=("${preserve_list[@]}")
+fi
 
 # --public builds a fresh image and nothing else, so its contradictions are
 # refused rather than half-honoured: --update would sync onto a disk whose
@@ -4360,7 +4486,7 @@ fi
 # transient ro mounts the summary is built from; an image source in a dry run is
 # the one case that needs no root at all, having no loop device to read.
 if [ "$DRY_RUN" -eq 0 ] || \
-   { [ $UPDATE -eq 1 ] && { [ -z "$BRAND" ] || [ -z "$HOSTNAME_ARG" ]; }; } || \
+   { [ $UPDATE -eq 1 ] && { [ -z "$BRAND" ] || [ -z "$HOSTNAME_ARG" ] || [ ${#PRESERVE_PATHS[@]} -gt 0 ]; }; } || \
    [ -b "$SOURCE" ] || [ -b "$SRC_ROOT" ]; then
     sudo -v
 fi
@@ -4752,6 +4878,9 @@ fi
 if [ ${#MASK_UNITS[@]} -gt 0 ] && [ $MIGRATE_ROOT -eq 0 ]; then
     die "--mask needs a root filesystem this run writes, but --target-root ($TGT_ROOT) is the source's own: the units would be masked on the source itself."
 fi
+if [ ${#PRESERVE_PATHS[@]} -gt 0 ] && [ $MIGRATE_ROOT -eq 0 ]; then
+    die "--preserve has nothing to protect: --target-root ($TGT_ROOT) is the source's own, so it is not copied over and everything on it stays as it is."
+fi
 
 # An ESP this run does not format must already hold FAT, or Phase 3 fails on
 # the mount with the target half-written. --keep-efi, --update and an in-place
@@ -4866,12 +4995,18 @@ else
     BRAND_DISK=$(get_parent_disk "$TGT_ROOT")
 fi
 TGT_MODEL=""
-# --update keeps the target's hostname the same way, so one mount answers both.
-if [ $UPDATE -eq 1 ] && { [ -z "$BRAND" ] || [ -z "$HOSTNAME_ARG" ]; }; then
+# --update keeps the target's hostname the same way, and reads what --preserve
+# keeps, so one mount answers all three.
+if [ $UPDATE -eq 1 ] && { [ -z "$BRAND" ] || [ -z "$HOSTNAME_ARG" ] || [ ${#PRESERVE_PATHS[@]} -gt 0 ]; }; then
     # Often the first real media access (blkid is answered from cache), so a
     # spun-down disk pauses here -- say what we are waiting for.
     info "Reading the current GRUB brand and hostname off $TGT_ROOT (may need to spin the disk up)..."
     probe_target_brand
+fi
+# A path nobody looked at must not be reported as kept, nor its rule left out
+# and the source's copy sent over the target's.
+if [ ${#PRESERVE_PATHS[@]} -gt 0 ] && [ "$PRESERVE_PROBED" -eq 0 ]; then
+    die "--preserve needs to read the target's root filesystem, but $TGT_ROOT could not be mounted read-only here."
 fi
 if [ -n "$BRAND" ]; then
     TGT_MODEL="$BRAND"
@@ -5221,6 +5356,19 @@ if [ ${#MASK_UNITS[@]} -gt 0 ]; then
         summary_row "" "  whether the source has these units could not be read here"
     fi
 fi
+# --preserve: one row per path, saying whose copy the target ends up with.
+preserve_label="Preserve:"
+for preserve_path in ${PRESERVE_PATHS[@]+"${PRESERVE_PATHS[@]}"}; do
+    if [ "${PRESERVE_STATE[$preserve_path]:-}" = present ]; then
+        summary_row "$preserve_label" "$preserve_path  the target's own (the source's is not copied)"
+    else
+        summary_row "$preserve_label" "$preserve_path  not on the target -- copied from the source as usual"
+    fi
+    preserve_label=""
+    if [ -n "${PRESERVE_WHERE[$preserve_path]:-}" ]; then
+        summary_row "" "  WARNING: ${PRESERVE_WHERE[$preserve_path]}"
+    fi
+done
 if [ $PUBLIC -eq 1 ]; then report_public; fi
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "  (dry-run mode — destructive commands will be printed, not executed)"
@@ -5456,6 +5604,15 @@ if [ $MIGRATE_ROOT -eq 1 ]; then
     # first. --keep-cache is the one way to keep the caches: it empties the array.
     root_filters
     run sudo rsync "${RSYNC_OPTS[@]}" "${ROOT_FILTERS[@]}" "$SRC/" "$MNT/"
+    # What --preserve kept, measured NOW: Phase 4 legitimately rewrites some of
+    # it later (write_identity on a preserved /etc/hosts), and only the rsync's
+    # hands are being checked.
+    if [ "$DRY_RUN" -eq 0 ]; then
+        for preserve_path in ${PRESERVE_PATHS[@]+"${PRESERVE_PATHS[@]}"}; do
+            [ "${PRESERVE_STATE[$preserve_path]:-}" = present ] || continue
+            PRESERVE_AFTER[$preserve_path]=$(preserve_fingerprint "$preserve_path")
+        done
+    fi
     # Reads the sizes/labels of files under $SRC, so likewise real runs only.
     if [ "$DRY_RUN" -eq 0 ]; then rebuild_swapfiles; fi
     # ...and the swap files belonging on a filesystem resolved at the gate,

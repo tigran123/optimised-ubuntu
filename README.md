@@ -212,4 +212,28 @@ Whether the clone then has swap at all depends on `/data` itself: if that partit
 
 A **browser cache** is dropped by default. `~/.cache/google-chrome` holds nothing but `Default/Cache` (the HTTP cache), `Default/Code Cache` (compiled JavaScript) and a GPU shader cache — 948 MB in 21,539 files here, all of which Chrome rebuilds on demand. Passwords, cookies, bookmarks and extensions live in `~/.config/google-chrome`, which is copied like anything else, so nothing is lost by leaving the cache behind. It is found the same way as everything else about the source's layout — through its `fstab`, so a bound `~/.cache` is followed to the path the transfer really carries — and it is dropped with an rsync `H` (hide) rule rather than an `--exclude`, because an exclude also *protects* the receiver's copy: on an `--update` re-sync the stale cache already on the target is deleted too. `--keep-cache` copies them instead.
 
+**A machine's own state** can be kept across an `--update` with `--preserve PATH` (repeatable). The case it was written for is a laptop running a clone of a desktop. Each re-sync used to overwrite the laptop's `/etc/netplan/*.yaml` with the desktop's static addresses. `--delete` also removed its saved Wi-Fi networks, which NetworkManager on Ubuntu stores as `/etc/netplan/90-NM-<uuid>.yaml` and which the desktop does not have. Naming a path tells the root transfer to leave the target's copy exactly as it is:
+
+```bash
+./install.sh --source-efi /dev/sdd2 --source-root /dev/sdd3 \
+             --target-bios-boot /dev/sdb1 --target-efi /dev/sdb2 \
+             --target-root /dev/sdb3 --update \
+             --preserve /etc/netplan --preserve /etc/NetworkManager/system-connections \
+             --preserve /var/lib/NetworkManager
+```
+
+How it works:
+
+- Each path gets an rsync hide rule (the source's copy is not sent) and a protect rule (`--delete` leaves the target's alone). Both come first, so nothing in an `--exclude-from` file can override them.
+- A path the target does not have yet gets no rules. The source's copy goes across, so the first sync of a new clone still has a working network.
+- The summary says, for each path, whose copy the target will end up with. `verify_install()` checks that the rsync left each preserved path exactly as it found it.
+- Paths are in the target's root filesystem. The summary warns about one the target binds in from elsewhere, because only the mount point would be kept.
+
+It is not automatic, the way the hostname is. The same `--update` also refreshes clones of the *same* machine, and those should receive a changed netplan. Refused:
+
+- `/`, `/boot` and everything under it.
+- `/etc/fstab` and `/etc/default/grub`, which this run rebuilds from the source's copy, and their parents, such as `/etc`.
+
+Do not preserve anything a package owns (`/usr`, `/var/lib/dpkg`): the kept files would no longer match the packages around them.
+
 Always preview a run with `--dry-run` first; it prints every destructive command instead of executing it. See `./install.sh --help` for the full set of options.
