@@ -3348,8 +3348,15 @@ create_efi_entry() {
 }
 
 run_chroot_block() {
+    # --make-slave: a plain bind of a shared mount joins its peer group, so the
+    # /dev/pts bind on $MNT/dev propagates back onto the host's /dev/pts and
+    # into the chroot of any concurrent run. Two runs at once stacked copies
+    # around the host's own /dev/pts, which every open terminal holds, and the
+    # kernel then refused to unmount either tree, ever. A slave sends nothing
+    # back, yet still passes its unmounts on to the copies sandboxed services
+    # hold; --make-private would leave the target mounted inside each of them.
     for i in /dev /dev/pts /proc /sys /run; do
-        sudo mount --bind "$i" "$MNT$i"
+        sudo mount --bind --make-slave "$i" "$MNT$i"
     done
 
     # --public: the accounts go by the target's own userdel, which also takes
@@ -3746,6 +3753,8 @@ SRC_AUTO=0
 LOOP_ATTACHED=0
 MOUNTS_DONE=0
 CLEANED=0
+# A tree umount_tree() gave up on: the run then fails instead of saying "Done".
+TEARDOWN_FAILED=0
 # "This target keeps /boot inside /", said explicitly (see --no-target-boot).
 NO_TGT_BOOT=0
 
@@ -4520,22 +4529,32 @@ run() {
 # Recursively unmount one tree, waiting out stragglers. Ctrl+C kills the rsync
 # client at once, but the writer can sit in uninterruptible sleep while the
 # kernel flushes dirty pages to a slow target, and the tree stays busy until
-# that returns -- so retry rather than leave the target mounted.
+# that returns -- so retry rather than leave the target mounted. But not for
+# ever: a tree held by something that never lets go (a shell cd'd into it, a
+# propagated mount) once hung two concurrent runs here for good, silently. So
+# give up after 5 minutes, saying what is still mounted; the caller sets
+# TEARDOWN_FAILED.
 umount_tree() {
-    local dir="$1" err waited=0
+    local dir="$1" err limit=300 start=$SECONDS waited=0
     while findmnt -n "$dir" >/dev/null 2>&1; do
         if err=$(sudo env LC_ALL=C umount -R -q "$dir" 2>&1); then break; fi
         case "$err" in
         *busy*)
-            if [ "$waited" -eq 0 ]; then
-                waited=1
-                echo "$dir is busy (an interrupted rsync stays until its in-flight writes are flushed) -- waiting to unmount..."
+            if [ $((SECONDS - start)) -lt "$limit" ]; then
+                if [ "$waited" -eq 0 ]; then
+                    waited=1
+                    echo "$dir is busy -- waiting up to $((limit / 60)) min to unmount it (an interrupted rsync stays until its in-flight writes are flushed)..."
+                fi
+                sleep 2
+                continue
             fi
-            sleep 2 ;;
-        *)  # Not something waiting can fix — report it and give up on this tree.
-            [ -n "$err" ] && echo "$err" >&2
-            return 1 ;;
+            echo "Error: $dir is still busy after $((limit / 60)) min -- giving up on it. What holds it is not a flushing write: a process using it (\"sudo fuser -vm $dir\" names one), or a copy of one of its mounts elsewhere." >&2 ;;
+        *)  [ -n "$err" ] && echo "$err" >&2 ;;
         esac
+        echo "Still mounted:" >&2
+        findmnt -R -o TARGET,SOURCE,FSTYPE,PROPAGATION "$dir" >&2 || true
+        echo "Unmount it by hand once that is gone: sudo umount -R $dir" >&2
+        return 1
     done
     return 0
 }
@@ -4547,8 +4566,8 @@ cleanup() {
     # abort it halfway and leave the target mounted.
     trap '' HUP INT TERM
     if [ "$MOUNTS_DONE" -eq 1 ]; then
-        umount_tree "$SRC" || true
-        umount_tree "$MNT" || true
+        umount_tree "$SRC" || TEARDOWN_FAILED=1
+        umount_tree "$MNT" || TEARDOWN_FAILED=1
     fi
     remap_close   # a filesystem opened to look inside, or to write a swap file
     if [ "$LOOP_ATTACHED" -eq 1 ]; then
@@ -5747,8 +5766,9 @@ cleanup   # also runs from the EXIT trap on any earlier failure
 # GRUB reads two filesystems at boot: the ESP, for the menu and its modules, and
 # whichever holds /boot, for the kernel. Ask GRUB's own drivers now that both
 # are unmounted and consistent. Advisory: a failure means the disk will not
-# boot, but nothing on it is wrong to fix.
-if [ "$DRY_RUN" -eq 0 ] && command -v grub-fstest >/dev/null 2>&1; then
+# boot, but nothing on it is wrong to fix. Not over a tree teardown left
+# mounted, whose block device need not hold what was written yet.
+if [ "$DRY_RUN" -eq 0 ] && [ "$TEARDOWN_FAILED" -eq 0 ] && command -v grub-fstest >/dev/null 2>&1; then
     if sudo grub-fstest "$TGT_EFI" ls /boot/grub/grub.cfg >/dev/null 2>&1; then
         echo "  [PASS] GRUB can read its menu at /boot/grub/grub.cfg on the ESP $TGT_EFI."
     else
@@ -5773,7 +5793,13 @@ fi
 # Last of all, and only now: the disk is verified, unmounted and readable by
 # GRUB, so this machine can be pointed at it. Writes nothing to the disk -- a
 # Boot#### variable in the firmware of the machine this script is running on.
+# A tree teardown left mounted does not stop it: the disk passed verification,
+# and the read-back skipped above is only advisory anyway.
 create_efi_entry
+
+if [ "$TEARDOWN_FAILED" -eq 1 ]; then
+    die "the target is written and verified, but teardown left a tree mounted (above), so GRUB's read-back probes were skipped. Unmount it by hand."
+fi
 
 if [ $UNIFIED_TARGET -eq 1 ]; then
     if [ $UPDATE -eq 1 ]; then
